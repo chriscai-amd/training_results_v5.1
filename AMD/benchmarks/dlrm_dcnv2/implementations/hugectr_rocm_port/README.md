@@ -41,27 +41,33 @@ remaining blocker for matching NVIDIA's full-batch (55,296) configuration:
    different DCN-v2 numerical formulation. Single-GPU FP16 and 8-GPU FP32
    are unaffected.
 
-3. *Per-GPU batch ≥ 2048 NaN — narrowed to MultiCross forward path itself*:
-   With every gradient-side mitigation enabled (`HCTR_DISABLE_BGRADA=1`,
-   `HCTR_DISABLE_BIAS=1`, `HCTR_OPTIMIZER=sgd`, `LR=1e-9`, `scaler=1` →
-   essentially frozen weights), the **forward pass** of 8 × MI350X FP16
-   + 1-layer DCN-v2 still reports an extreme loss that scales with global
-   batch:
+3. *Per-GPU batch ≥ 2048 NaN — narrowed to a MultiCross-specific bug
+   that survives between iterations*: With every gradient-side mitigation
+   enabled (`HCTR_DISABLE_BGRADA=1`, `HCTR_DISABLE_BIAS=1`,
+   `HCTR_OPTIMIZER=sgd`, `LR=1e-9`, `scaler=1` → essentially frozen
+   weights), iter-1 forward output is finite at all batch sizes but
+   iter ≥ 2 NaNs at per-GPU batch ≥ 2048:
 
-   | Global batch (per-GPU) | Sharding | Iter-1 loss with frozen weights |
-   |---|---|---|
-   | 8192 (1024) | round_robin | 3.18 (high but stable) |
-   | 16384 (2048) | round_robin | NaN |
-   | 32768 (4096) | round_robin | NaN |
-   | 55296 (6912) | auto | 3.07 (high), NaN at iter 2 |
-   | 32768 (4096) | round_robin, **InnerProduct subst (no MultiCross)** | **0.84 (normal)**, stable 10+ iters |
+   | Global batch (per-GPU) | Sharding | Iter-1 loss (frozen) | Iter ≥ 2 |
+   |---|---|---|---|
+   | 8192  (1024) | round_robin | 3.18 *(= 8 × 0.4, OK)* | stable |
+   | 16384 (2048) | round_robin | 1.41 *(= 8 × 0.18, OK)* | NaN |
+   | 32768 (4096) | round_robin | — | NaN |
+   | 55296 (6912) | auto | 3.07 *(= 8 × 0.38, OK)* | NaN |
+   | 16384 (2048) | round_robin, **InnerProduct subst (no MultiCross)** | 2.31 *(= 8 × 0.29, OK)* | **stable 10+ iters** |
+   | 32768 (4096) | round_robin, **InnerProduct subst (no MultiCross)** | 0.84 *(= 8 × 0.10, OK)* | **stable 10+ iters** |
 
-   The InnerProduct-substitute control proves the embedding all-to-all,
-   data reader, bottom MLP, top MLP, and BCE loss path are all fine at
-   the largest batch. The bug is **MultiCross-specific** and lives in
-   the `MultiCrossLayer<__half>::fprop` GEMM-or-elementwise chain — not
-   in any wgrad/optimiser path (those are bypassed in the frozen-weight
-   test).
+   *(The "high" iter-1 losses are simply HugeCTR's multi-GPU loss display
+   summing per-rank BCE; per-rank loss is normal random-init ~0.2-0.4 in
+   all cases.)*
+
+   The control InnerProduct-substitute experiment at the same batch sizes
+   stays stable for 10+ iters even with frozen weights. So the embedding
+   all-to-all, data reader, bottom MLP, top MLP, and BCE loss path all
+   behave correctly at the largest batches. The bug is
+   **MultiCross-specific**: bprop must be writing inf/NaN into some
+   buffer that is read by the next iter's fprop, since iter-1 forward is
+   fine but iter-2 NaNs even with effectively zero weight updates.
 
    **Diagnostic env knobs** added to `fused_gemm_functors.cu` and the
    driver script for further bisection:
