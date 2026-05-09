@@ -11,7 +11,9 @@ This is a research / port branch, **not an official MLPerf submission**.
 | Configuration | Throughput | Notes |
 |---|---|---|
 | 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | **3.89-6.59 M samples/sec** | exact NVIDIA MLPerf model graph |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, **per-GPU batch ≤ 1024** | **3.05 M samples/sec** | converges 80+ iters with WARP_SIZE / FP16-clamp fixes (see "Open work" for the larger-batch limitation) |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 4096 | **1.91 M samples/sec** | converges ~180 iters then NaN; loss 0.277 → 0.224 |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 2048 | 0.99 M samples/sec | converges ~90 iters then NaN; loss 0.261 → 0.201 |
+| 8 × MI350X, FP16 mixed, real DCN-v2 (1 layer), batch 8192 | similar throughput | converges ~30 iters with WARP_SIZE / FP16-clamp fixes |
 | 8 × MI350X, FP16 mixed (scaler 16348), InnerProduct-substitute interaction | **12.29 M samples/sec** | MLPs+optimizer match; substitute for cross net |
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
