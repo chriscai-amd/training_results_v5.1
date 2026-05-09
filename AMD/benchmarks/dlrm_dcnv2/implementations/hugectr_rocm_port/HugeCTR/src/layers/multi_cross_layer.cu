@@ -35,6 +35,31 @@
 #include <utils.hpp>
 #include <vector>
 
+namespace HugeCTR {
+
+// ROCm port: NaN/inf clamp kernel for FP16 MultiCross intermediates.
+// Replaces NaN with 0 and clamps to ±FP16 max so a single bad element
+// doesn't poison subsequent iterations.
+__global__ void clamp_fp16_kernel(__half* x, size_t n) {
+  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float v = __half2float(x[i]);
+  if (!isfinite(v)) v = 0.0f;
+  constexpr float kFp16Max = 65504.0f;
+  if (v > kFp16Max) v = kFp16Max;
+  else if (v < -kFp16Max) v = -kFp16Max;
+  x[i] = __float2half(v);
+}
+
+void launch_fp16_clamp_half(__half* x, size_t n, hipStream_t s) {
+  if (n == 0 || x == nullptr) return;
+  constexpr int kBlock = 256;
+  size_t grid = (n + kBlock - 1) / kBlock;
+  clamp_fp16_kernel<<<grid, kBlock, 0, s>>>(x, n);
+}
+
+}  // namespace HugeCTR
+
 /** Overload of built-in atomicAdd for support on Pascal architectures */
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 600 && __CUDA_ARCH__ < 700
 
@@ -682,6 +707,24 @@ void MultiCrossForwardFunctorv2<T>::operator()(
     fused_matrix_elementwise_dot_add<T>(
         layer_output_tensors[i], layer_hidden_tensors[i], input_tensor,
         i == 0 ? input_tensor : layer_output_tensors[i - 1], stream);
+    // ROCm port: clamp NaN / inf in the per-layer fprop output. At per-GPU
+    // batch >= 2048 with 8x MI350X FP16, one of the intermediate tensors
+    // (XU, layer_hidden, or layer_output) sometimes lands a NaN/inf which
+    // poisons next-iter fprop. Sanitising layer_output here breaks the
+    // poisoning chain. (Container-only hack -- a proper fix needs FP32
+    // staging buffers in MultiCrossLayer<__half>.)
+    if constexpr (std::is_same<T, __half>::value) {
+      static const bool kEnableClamp = []() {
+        const char* env = std::getenv("HCTR_MC_CLAMP_FP16");
+        return !env || env[0] != '0';  // default ON
+      }();
+      if (kEnableClamp) {
+        __half* out = reinterpret_cast<__half*>(layer_output_tensors[i].template data<T>());
+        const auto& shape = layer_output_tensors[i].shape();
+        size_t total = static_cast<size_t>(shape.size(0)) * shape.size(1);
+        launch_fp16_clamp_half(out, total, stream);
+      }
+    }
   }
 }
 

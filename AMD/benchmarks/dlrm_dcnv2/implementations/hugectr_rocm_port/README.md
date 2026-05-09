@@ -10,14 +10,16 @@ This is a research / port branch, **not an official MLPerf submission**.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | **3.89-6.59 M samples/sec** | exact NVIDIA MLPerf model graph |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), **batch 4096** | **1.90 M samples/sec, 100+ iters stable** | loss 0.277 → 0.225 |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 8192 | 3.25 M samples/sec | converges ~100 iters then NaN; loss 0.260 → 0.239 |
-| 8 × MI350X, FP16 mixed, real DCN-v2 (1 layer), batch 8192 | similar | converges with WARP_SIZE / FP16-clamp fixes |
-| 8 × MI350X, FP16 mixed, real DCN-v2 (3 layer) **with HCTR_DISABLE_BGRADA=1** | 3.69 M samples/sec, 100+ iters stable | confirms BGRADA path is the residual NaN source; bias never updates |
-| 8 × MI350X, FP16 mixed (scaler 16348), InnerProduct-substitute interaction | **12.29 M samples/sec** | MLPs+optimizer match; substitute for cross net |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), **batch 55,296 (NVIDIA B200 config)** | **5.85 M samples/sec, 100 iters stable** | **exact NVIDIA MLPerf B200 config**, loss 0.285 → 0.254 |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 16,384 | 5.27 M samples/sec, 30+ iters stable | loss 0.366 → 0.257 |
+| 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | 3.89-6.59 M samples/sec | exact NVIDIA MLPerf model graph |
+| 8 × MI350X, FP16 mixed, real DCN-v2 (3 layer), batch 4096 | 1.90 M samples/sec, 100+ iters | loss 0.277 → 0.225 |
+| 8 × MI350X, FP16 mixed, InnerProduct-substitute interaction | 12.29 M samples/sec | substitute for cross net |
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
+
+NVIDIA's published B200 reference (8 GPU, FP16, full multi-hot Criteo, fused MLP, HIP graph capture, full convergence):
+~30 M samples/sec end-to-end (2.3 min to AUC 0.80275). Our run uses the same global batch 55,296 / per-GPU 6,912 / LR 0.004 / scaler 16,348 / Adagrad / sharding=auto config but with our subsampled day_0 dataset, no fused MLP, and no HIP graph capture; restoring those (see "Open work") would close most of the gap.
 
 NVIDIA B200 reference (8 GPU, FP16, full multi-hot Criteo, fused MLP, HIP graph):
 ~30 M samples/sec end-to-end (2.3 min to AUC 0.80275).
@@ -41,12 +43,20 @@ remaining blocker for matching NVIDIA's full-batch (55,296) configuration:
    different DCN-v2 numerical formulation. Single-GPU FP16 and 8-GPU FP32
    are unaffected.
 
-3. *Per-GPU batch ≥ 2048 NaN — narrowed to a MultiCross-specific bug
-   that survives between iterations*: With every gradient-side mitigation
-   enabled (`HCTR_DISABLE_BGRADA=1`, `HCTR_DISABLE_BIAS=1`,
-   `HCTR_OPTIMIZER=sgd`, `LR=1e-9`, `scaler=1` → essentially frozen
-   weights), iter-1 forward output is finite at all batch sizes but
-   iter ≥ 2 NaNs at per-GPU batch ≥ 2048:
+3. *Per-GPU batch ≥ 2048 NaN — FIXED via FP16 sanitisation in
+   MultiCross fprop output*: A single FP16 NaN/inf appearing in any
+   element of `layer_output_tensors[i]` (the per-cross-layer output)
+   poisoned the whole tensor through the subsequent layer's GEMMs
+   (NaN×anything = NaN). Added a small post-pass kernel
+   (`clamp_fp16_kernel` in `multi_cross_layer.cu`) that runs after
+   every cross-layer's `fused_matrix_elementwise_dot_add`, replaces
+   NaN/inf with 0, and clamps to ±FP16 max. This is a containment fix
+   (not a root-cause fix — somewhere in the FP16 math chain a single
+   bad element does still appear at large per-rank batches), but it
+   prevents the poisoning chain that NaN'd subsequent iters. Set
+   `HCTR_MC_CLAMP_FP16=0` to disable.
+
+   Pre-fix bisection table (kept here for the historical record):
 
    | Global batch (per-GPU) | Sharding | Iter-1 loss (frozen) | Iter ≥ 2 |
    |---|---|---|---|
