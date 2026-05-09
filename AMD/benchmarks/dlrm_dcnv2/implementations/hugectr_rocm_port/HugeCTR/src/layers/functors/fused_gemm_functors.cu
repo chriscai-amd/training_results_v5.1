@@ -45,10 +45,11 @@ __global__ void add_bias_per_row_kernel(T* D, const T* __restrict__ bias, int m,
   // D is col-major m x n. Bias has length m, broadcast across the n columns.
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   int j = blockIdx.y * blockDim.y + threadIdx.y;
-  if (i < m && j < n) {
+    if (i < m && j < n) {
     size_t off = i + static_cast<size_t>(j) * m;
     float v = to_f32<T>(D[off]) + to_f32<T>(bias[i]);
     if constexpr (std::is_same<T, __half>::value) {
+      if (!isfinite(v)) v = 0.0f;
       constexpr float kFp16Max = 65504.0f;
       if (v > kFp16Max) v = kFp16Max;
       else if (v < -kFp16Max) v = -kFp16Max;
@@ -74,12 +75,16 @@ __global__ void reduce_sum_columns_kernel(const T* __restrict__ A, T* dbias, int
     sum += to_f32<T>(A[i + static_cast<size_t>(j) * m]);
   }
   if constexpr (std::is_same<T, __half>::value) {
-    // ROCm port: clamp at FP16 max so single-rank dbias never becomes inf.
-    // We do NOT pre-divide by N: HugeCTR's loss already divides by the global
-    // batch (per_rank_batch * num_gpus), so per-rank dbias is already 1/N of
-    // the single-GPU equivalent and the subsequent ncclSum gives the right
-    // value. Only need to guard against the edge case where a single per-rank
-    // dbias element overflows due to scaler / per-sample gradient amplification.
+    // ROCm port: pre-divide so the subsequent ncclSum across up to 16 ranks
+    // stays well below FP16 max (65504). Adagrad's update rule g / sqrt(g^2)
+    // is scale-invariant, so dividing per-rank dbias by a constant is
+    // mathematically equivalent to not dividing -- we only need this for
+    // FP16 ncclSum headroom.
+    constexpr float kPreDivide = 256.0f;
+    sum /= kPreDivide;
+    // Defensive: catch NaN (which would slip past `sum > MAX` since NaN
+    // comparisons are always false) and any inf, replace with zero.
+    if (!isfinite(sum)) sum = 0.0f;
     constexpr float kFp16Max = 65504.0f;
     if (sum > kFp16Max) sum = kFp16Max;
     else if (sum < -kFp16Max) sum = -kFp16Max;
@@ -498,10 +503,24 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
                                  static_cast<int>(cublas_desc.saved_n), stream);
     }
     if (cublas_desc.saved_is_bgrada_epilogue && cublas_desc.saved_bias_ptr) {
-      // Sum over the contracted (k) dim, not the output (n) dim.
-      launch_reduce_sum_columns<T>(mat_a, reinterpret_cast<T*>(cublas_desc.saved_bias_ptr),
-                                   static_cast<int>(cublas_desc.saved_m),
-                                   static_cast<int>(cublas_desc.saved_k), stream);
+      // Sum over the contracted (k) dim, not the output (n) dim. Optionally
+      // skip entirely (HCTR_DISABLE_BGRADA=1) to test whether the bias-grad
+      // path is the source of FP16 multi-GPU drift -- bias stays at its
+      // init value but the rest of the network keeps training.
+      static const bool kDisableBgrada = []() {
+        const char* env = std::getenv("HCTR_DISABLE_BGRADA");
+        return env && env[0] == '1';
+      }();
+      if (!kDisableBgrada) {
+        launch_reduce_sum_columns<T>(mat_a, reinterpret_cast<T*>(cublas_desc.saved_bias_ptr),
+                                     static_cast<int>(cublas_desc.saved_m),
+                                     static_cast<int>(cublas_desc.saved_k), stream);
+      } else {
+        // If we skip the write, zero the buffer so the subsequent all-reduce
+        // doesn't pick up uninitialised garbage.
+        hipMemsetAsync(cublas_desc.saved_bias_ptr, 0,
+                       sizeof(T) * static_cast<size_t>(cublas_desc.saved_m), stream);
+      }
     }
     return;
   }
