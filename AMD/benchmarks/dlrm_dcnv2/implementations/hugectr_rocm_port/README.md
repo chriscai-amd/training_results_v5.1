@@ -41,25 +41,44 @@ remaining blocker for matching NVIDIA's full-batch (55,296) configuration:
    different DCN-v2 numerical formulation. Single-GPU FP16 and 8-GPU FP32
    are unaffected.
 
-3. *Per-GPU batch ≥ 2048 NaN — root cause not yet pinned down*: With both
-   `HCTR_DISABLE_BGRADA=1` and `HCTR_DISABLE_BIAS=1` (skip bias add in fprop
-   AND bias-grad in bprop, which together remove every MultiCross bias-related
-   path), 8 × MI350X FP16 + 1-layer DCN-v2 + global batch 55,296 still
-   reports `iter-1 loss = 3.07` (vs ~0.69 expected at random init) and
-   NaNs at iter 2 — even with `LR=1e-9` (essentially frozen weights) and
-   `scaler=1`. So the bug is in MultiCross's plain-GEMM or element-wise
-   forward path itself, not in the bias-gradient handling. The same model
-   works at batch ≤ 4096 (per-GPU 512). Pure InnerProduct substitute at
-   batch 55,296 works perfectly (12.1 M sps, loss 0.283 → 0.235), so the
-   embedding all-to-all and the rest of the network are fine. Diagnosis
-   needs per-tensor max-abs instrumentation through `MultiCrossLayer<half>::fprop`
-   to find which intermediate first becomes inf at per-GPU batch ≥ 2048.
+3. *Per-GPU batch ≥ 2048 NaN — narrowed to MultiCross forward path itself*:
+   With every gradient-side mitigation enabled (`HCTR_DISABLE_BGRADA=1`,
+   `HCTR_DISABLE_BIAS=1`, `HCTR_OPTIMIZER=sgd`, `LR=1e-9`, `scaler=1` →
+   essentially frozen weights), the **forward pass** of 8 × MI350X FP16
+   + 1-layer DCN-v2 still reports an extreme loss that scales with global
+   batch:
 
-   **Diagnostic env knobs** added to `fused_gemm_functors.cu` for further
-   bisection: `HCTR_DISABLE_BGRADA=1` (zero out bias-grad), `HCTR_DISABLE_BIAS=1`
-   (skip post-pass bias add). With these set, MultiCross stays NaN-free at
-   batch 8192 / per-GPU 1024 (where the BGRADA-related fixes alone are
-   sufficient), but not yet at higher batches.
+   | Global batch (per-GPU) | Sharding | Iter-1 loss with frozen weights |
+   |---|---|---|
+   | 8192 (1024) | round_robin | 3.18 (high but stable) |
+   | 16384 (2048) | round_robin | NaN |
+   | 32768 (4096) | round_robin | NaN |
+   | 55296 (6912) | auto | 3.07 (high), NaN at iter 2 |
+   | 32768 (4096) | round_robin, **InnerProduct subst (no MultiCross)** | **0.84 (normal)**, stable 10+ iters |
+
+   The InnerProduct-substitute control proves the embedding all-to-all,
+   data reader, bottom MLP, top MLP, and BCE loss path are all fine at
+   the largest batch. The bug is **MultiCross-specific** and lives in
+   the `MultiCrossLayer<__half>::fprop` GEMM-or-elementwise chain — not
+   in any wgrad/optimiser path (those are bypassed in the frozen-weight
+   test).
+
+   **Diagnostic env knobs** added to `fused_gemm_functors.cu` and the
+   driver script for further bisection:
+   - `HCTR_DISABLE_BGRADA=1` — memset bias-grad to 0 (no BGRADA write)
+   - `HCTR_DISABLE_BIAS=1` — skip the post-pass BIAS add in fprop
+   - `HCTR_DCN_NUM_LAYERS=N` — run with N MultiCross layers (default 3)
+   - `HCTR_DCN_PROJ_DIM=D` — projection dim (default 512)
+   - `HCTR_OPTIMIZER=sgd|adagrad` — switch optimiser
+
+   **Where to look next**: per-tensor max-abs instrumentation through
+   `MultiCrossLayer<__half>::fprop` (the `XU`, `XUV+b`, and
+   `fused_matrix_elementwise_dot_add` outputs) to identify which
+   intermediate first overflows at per-GPU batch ≥ 2048. Since the
+   bug is purely in fprop with frozen weights, an isolated unit test
+   that drives MultiCross directly with synthetic FP16 inputs at the
+   failing per-rank batch sizes should reproduce it without the full
+   training loop.
 
 ## What's in this directory
 
