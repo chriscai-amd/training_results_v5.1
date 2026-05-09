@@ -11,9 +11,10 @@ This is a research / port branch, **not an official MLPerf submission**.
 | Configuration | Throughput | Notes |
 |---|---|---|
 | 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | **3.89-6.59 M samples/sec** | exact NVIDIA MLPerf model graph |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 4096 | **1.91 M samples/sec** | converges ~180 iters then NaN; loss 0.277 → 0.224 |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 2048 | 0.99 M samples/sec | converges ~90 iters then NaN; loss 0.261 → 0.201 |
-| 8 × MI350X, FP16 mixed, real DCN-v2 (1 layer), batch 8192 | similar throughput | converges ~30 iters with WARP_SIZE / FP16-clamp fixes |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), **batch 4096** | **1.90 M samples/sec, 100+ iters stable** | loss 0.277 → 0.225 |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 8192 | 3.25 M samples/sec | converges ~100 iters then NaN; loss 0.260 → 0.239 |
+| 8 × MI350X, FP16 mixed, real DCN-v2 (1 layer), batch 8192 | similar | converges with WARP_SIZE / FP16-clamp fixes |
+| 8 × MI350X, FP16 mixed, real DCN-v2 (3 layer) **with HCTR_DISABLE_BGRADA=1** | 3.69 M samples/sec, 100+ iters stable | confirms BGRADA path is the residual NaN source; bias never updates |
 | 8 × MI350X, FP16 mixed (scaler 16348), InnerProduct-substitute interaction | **12.29 M samples/sec** | MLPs+optimizer match; substitute for cross net |
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
