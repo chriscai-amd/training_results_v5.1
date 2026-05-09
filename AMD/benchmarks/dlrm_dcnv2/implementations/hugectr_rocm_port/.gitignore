@@ -1,0 +1,27 @@
+# Build artefacts (rebuilt in container; not in git).
+build/
+build_rocm72/
+*.o
+*.so
+*.a
+
+# Python / pytest caches.
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Editor / IDE.
+.vscode/
+.idea/
+*.swp
+
+# Hipify backups (only useful at hipify time, regeneratable from upstream).
+*.prehip
+hipify_*.log
+
+# Run-time artefacts.
+*.log
+core
+core.*
