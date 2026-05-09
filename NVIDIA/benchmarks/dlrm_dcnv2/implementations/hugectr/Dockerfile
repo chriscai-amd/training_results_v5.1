@@ -29,6 +29,12 @@ ARG TARGETARCH
 ARG GIT_COMMIT_ID
 ENV GIT_COMMIT_ID=$GIT_COMMIT_ID
 
+# Cluster egress only allows HTTPS; rewrite Ubuntu apt sources from http→https
+# before any apt-get update.
+RUN find /etc/apt -type f \( -name '*.sources' -o -name '*.list' \) -print -exec \
+        sed -i -e 's|http://archive\.ubuntu\.com|https://archive.ubuntu.com|g' \
+               -e 's|http://security\.ubuntu\.com|https://security.ubuntu.com|g' {} +
+
 RUN apt-get update -y && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         clang-format \
