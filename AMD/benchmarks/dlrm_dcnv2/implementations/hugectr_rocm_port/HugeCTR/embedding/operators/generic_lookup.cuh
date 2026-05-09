@@ -22,13 +22,13 @@
 
 #define EV_NUM 32
 #define WGRAD_REDUCE_BLOCK_SIZE 64
-// ROCm port: see common.hpp. AMD wave64 hardware needs WARP_SIZE=64 so that
-// lane partitioning matches what warpReduceSum / __shfl_*_sync actually do.
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
-#define WARP_SIZE 64
-#else
+// ROCm port: keep WARP_SIZE=32 here. The embedding lookup kernels in this
+// translation unit use WARP_SIZE for tiling but tested fine on wave64; an
+// experimental switch to 64 caused multi-GPU FP16 to NaN at large batches
+// (batch >= 55296). Only common.hpp's WARP_SIZE was actually fixing a
+// concrete bug (matrix_pair_mul_kernel cross-row contamination in
+// multi_cross_layer.cu).
 #define WARP_SIZE 32
-#endif
 #define MAX_BLOKC_SIZE_PER_SM 2048
 
 namespace embedding {

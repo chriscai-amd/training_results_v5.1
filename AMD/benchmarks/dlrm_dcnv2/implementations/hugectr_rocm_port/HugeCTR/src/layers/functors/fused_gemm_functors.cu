@@ -498,9 +498,15 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
           HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
     }
     if (cublas_desc.saved_is_bias_epilogue && cublas_desc.saved_bias_ptr) {
-      launch_add_bias_per_row<T>(mat_d, reinterpret_cast<const T*>(cublas_desc.saved_bias_ptr),
-                                 static_cast<int>(cublas_desc.saved_m),
-                                 static_cast<int>(cublas_desc.saved_n), stream);
+      static const bool kDisableBias = []() {
+        const char* env = std::getenv("HCTR_DISABLE_BIAS");
+        return env && env[0] == '1';
+      }();
+      if (!kDisableBias) {
+        launch_add_bias_per_row<T>(mat_d, reinterpret_cast<const T*>(cublas_desc.saved_bias_ptr),
+                                   static_cast<int>(cublas_desc.saved_m),
+                                   static_cast<int>(cublas_desc.saved_n), stream);
+      }
     }
     if (cublas_desc.saved_is_bgrada_epilogue && cublas_desc.saved_bias_ptr) {
       // Sum over the contracted (k) dim, not the output (n) dim. Optionally

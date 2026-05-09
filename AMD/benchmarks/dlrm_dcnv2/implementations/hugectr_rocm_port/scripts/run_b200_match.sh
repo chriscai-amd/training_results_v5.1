@@ -60,7 +60,7 @@ python3 train.py \
     --memory_cap_for_embedding "$MEM_CAP" \
     --disable_algorithm_search \
     --gen_loss_summary \
-    --optimizer adagrad \
+    --optimizer "${HCTR_OPTIMIZER:-adagrad}" \
     $PRECISION_FLAGS 2>&1 | tee /tmp/b200match.log
 
 echo ""

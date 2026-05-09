@@ -23,8 +23,9 @@ NVIDIA B200 reference (8 GPU, FP16, full multi-hot Criteo, fused MLP, HIP graph)
 ~30 M samples/sec end-to-end (2.3 min to AUC 0.80275).
 
 **Open: 8 × MI350X with FP16 + real MultiCross at per-rank batch ≥ 2048
-still NaNs after a few iters.** Two contributing root causes have been
-identified and partially fixed:
+still NaNs after a few iters.** Bisection (2026-05-09) localised three
+contributing root causes; the first two have been fixed, the third is the
+remaining blocker for matching NVIDIA's full-batch (55,296) configuration:
 1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
    but AMD MI350X has wavefront size 64. This caused row-cross-contamination
    in MultiCross's bprop kernels (`matrix_pair_mul_kernel`,
@@ -34,10 +35,31 @@ identified and partially fixed:
    batch worth of FP16 values which can exceed FP16 max (65,504) at large
    batches; the in-FP16 `ncclSum` all-reduce then propagates inf/NaN.
    Mitigated in `HugeCTR/src/layers/functors/fused_gemm_functors.cu` by
-   FP32-accumulation + clamp on the BGRADA store. This unblocks per-GPU
-   batches up to ~1024 but a complete fix requires either a FP32 wgrad
-   all-reduce (HugeCTR-side change) or a different DCN-v2 numerical
-   formulation. Single-GPU FP16 and 8-GPU FP32 are unaffected.
+   FP32-accumulation + pre-divide /256 + isfinite() guard + clamp on the
+   BGRADA store. This unblocks per-GPU batches up to ~1024 but a complete
+   fix requires either a FP32 wgrad all-reduce (HugeCTR-side change) or a
+   different DCN-v2 numerical formulation. Single-GPU FP16 and 8-GPU FP32
+   are unaffected.
+
+3. *Per-GPU batch ≥ 2048 NaN — root cause not yet pinned down*: With both
+   `HCTR_DISABLE_BGRADA=1` and `HCTR_DISABLE_BIAS=1` (skip bias add in fprop
+   AND bias-grad in bprop, which together remove every MultiCross bias-related
+   path), 8 × MI350X FP16 + 1-layer DCN-v2 + global batch 55,296 still
+   reports `iter-1 loss = 3.07` (vs ~0.69 expected at random init) and
+   NaNs at iter 2 — even with `LR=1e-9` (essentially frozen weights) and
+   `scaler=1`. So the bug is in MultiCross's plain-GEMM or element-wise
+   forward path itself, not in the bias-gradient handling. The same model
+   works at batch ≤ 4096 (per-GPU 512). Pure InnerProduct substitute at
+   batch 55,296 works perfectly (12.1 M sps, loss 0.283 → 0.235), so the
+   embedding all-to-all and the rest of the network are fine. Diagnosis
+   needs per-tensor max-abs instrumentation through `MultiCrossLayer<half>::fprop`
+   to find which intermediate first becomes inf at per-GPU batch ≥ 2048.
+
+   **Diagnostic env knobs** added to `fused_gemm_functors.cu` for further
+   bisection: `HCTR_DISABLE_BGRADA=1` (zero out bias-grad), `HCTR_DISABLE_BIAS=1`
+   (skip post-pass bias add). With these set, MultiCross stays NaN-free at
+   batch 8192 / per-GPU 1024 (where the BGRADA-related fixes alone are
+   sufficient), but not yet at higher batches.
 
 ## What's in this directory
 
