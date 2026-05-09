@@ -465,8 +465,8 @@ else:
         layer_type=hugectr.Layer_t.MultiCross,
         bottom_names=["concat1"],
         top_names=["interaction1"],
-        projection_dim=512,
-        num_layers=3,
+        projection_dim=int(os.environ.get("HCTR_DCN_PROJ_DIM", "512")),
+        num_layers=int(os.environ.get("HCTR_DCN_NUM_LAYERS", "3")),
         compute_config=compute_config,
     ))
 # Top MLP: 1024 -> 1024 -> 512 -> 256 -> 1, last layer linear (no ReLU).

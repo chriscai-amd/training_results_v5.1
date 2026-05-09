@@ -63,7 +63,19 @@ namespace HugeCTR {
 #define HUGECTR_VERSION_MINOR 3
 #define HUGECTR_VERSION_PATCH 0
 
+// ROCm port: AMD MI350X (gfx950) has wavefront size 64. Several upstream
+// HugeCTR kernels (e.g. matrix_pair_mul_kernel, row_scaling_sum_kernel in
+// multi_cross_layer.cu) partition work across `WARP_SIZE` lanes and then
+// reduce with warpReduceSum, which uses the hw warpSize. With WARP_SIZE=32
+// on wave64 hardware, lanes 0..31 and 32..63 of the same wave end up
+// computing partial sums for *different* output rows but get reduced
+// together -- causing cross-row contamination in the bprop. Set it to the
+// hw wave size on AMD.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
+#define WARP_SIZE 64
+#else
 #define WARP_SIZE 32
+#endif
 
 enum class Check_t { Sum, None, Unknown };
 

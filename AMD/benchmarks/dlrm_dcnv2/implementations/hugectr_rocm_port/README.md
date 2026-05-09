@@ -11,16 +11,30 @@ This is a research / port branch, **not an official MLPerf submission**.
 | Configuration | Throughput | Notes |
 |---|---|---|
 | 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | **3.89-6.59 M samples/sec** | exact NVIDIA MLPerf model graph |
-| 8 × MI350X, FP16 mixed (scaler 16348), InnerProduct-substitute interaction | **12.29 M samples/sec** | MLPs+optimizer match; substitute for cross net while FP16+8GPU MultiCross is debugged |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, **per-GPU batch ≤ 1024** | **3.05 M samples/sec** | converges 80+ iters with WARP_SIZE / FP16-clamp fixes (see "Open work" for the larger-batch limitation) |
+| 8 × MI350X, FP16 mixed (scaler 16348), InnerProduct-substitute interaction | **12.29 M samples/sec** | MLPs+optimizer match; substitute for cross net |
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
 
 NVIDIA B200 reference (8 GPU, FP16, full multi-hot Criteo, fused MLP, HIP graph):
 ~30 M samples/sec end-to-end (2.3 min to AUC 0.80275).
 
-The cross-section that's still open: 8 × MI350X with FP16 + real MultiCross
-NaNs at iter ≤ 2; FP32 multi-GPU and FP16 single-GPU both work, so the bug is
-in the FP16-multi-GPU intersection (likely a wgrad-allreduce numerical issue).
+**Open: 8 × MI350X with FP16 + real MultiCross at per-rank batch ≥ 2048
+still NaNs after a few iters.** Two contributing root causes have been
+identified and partially fixed:
+1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
+   but AMD MI350X has wavefront size 64. This caused row-cross-contamination
+   in MultiCross's bprop kernels (`matrix_pair_mul_kernel`,
+   `row_scaling_sum_kernel`). Fixed in `HugeCTR/include/common.hpp` and
+   `HugeCTR/embedding/operators/generic_lookup.cuh`.
+2. *FP16 BGRADA overflow*: The MultiCross bias-gradient kernel sums per-rank
+   batch worth of FP16 values which can exceed FP16 max (65,504) at large
+   batches; the in-FP16 `ncclSum` all-reduce then propagates inf/NaN.
+   Mitigated in `HugeCTR/src/layers/functors/fused_gemm_functors.cu` by
+   FP32-accumulation + clamp on the BGRADA store. This unblocks per-GPU
+   batches up to ~1024 but a complete fix requires either a FP32 wgrad
+   all-reduce (HugeCTR-side change) or a different DCN-v2 numerical
+   formulation. Single-GPU FP16 and 8-GPU FP32 are unaffected.
 
 ## What's in this directory
 

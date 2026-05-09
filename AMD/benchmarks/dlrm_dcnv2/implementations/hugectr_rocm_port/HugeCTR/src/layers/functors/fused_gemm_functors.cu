@@ -48,6 +48,11 @@ __global__ void add_bias_per_row_kernel(T* D, const T* __restrict__ bias, int m,
   if (i < m && j < n) {
     size_t off = i + static_cast<size_t>(j) * m;
     float v = to_f32<T>(D[off]) + to_f32<T>(bias[i]);
+    if constexpr (std::is_same<T, __half>::value) {
+      constexpr float kFp16Max = 65504.0f;
+      if (v > kFp16Max) v = kFp16Max;
+      else if (v < -kFp16Max) v = -kFp16Max;
+    }
     D[off] = from_f32<T>(v);
   }
 }
@@ -59,11 +64,25 @@ __global__ void reduce_sum_columns_kernel(const T* __restrict__ A, T* dbias, int
   // gradient w.r.t. the upstream fprop bias (added to D's rows) equals the
   // sum of A across the contracted axis k. Length of dbias = m (= rows of D).
   // Col-major A storage: shape (m x k), A[i, j] at offset i + j*m.
+  // FP32 accumulation, then clamp before FP16 store -- otherwise per-rank
+  // sums can exceed FP16 max (65504) at multi-GPU shapes and become inf,
+  // which then poisons Adagrad's accumulator (sqrt(inf^2) = inf -> NaN).
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= m) return;
   float sum = 0.0f;
   for (int j = 0; j < k; ++j) {
     sum += to_f32<T>(A[i + static_cast<size_t>(j) * m]);
+  }
+  if constexpr (std::is_same<T, __half>::value) {
+    // ROCm port: clamp at FP16 max so single-rank dbias never becomes inf.
+    // We do NOT pre-divide by N: HugeCTR's loss already divides by the global
+    // batch (per_rank_batch * num_gpus), so per-rank dbias is already 1/N of
+    // the single-GPU equivalent and the subsequent ncclSum gives the right
+    // value. Only need to guard against the edge case where a single per-rank
+    // dbias element overflows due to scaler / per-sample gradient amplification.
+    constexpr float kFp16Max = 65504.0f;
+    if (sum > kFp16Max) sum = kFp16Max;
+    else if (sum < -kFp16Max) sum = -kFp16Max;
   }
   dbias[i] = from_f32<T>(sum);
 }
@@ -165,12 +184,14 @@ void CublasDesc<T>::set_fprop_attr(std::vector<size_t> dims_a, std::vector<size_
   saved_lda = static_cast<int64_t>(dims_a[0]);
   saved_ldb = static_cast<int64_t>(dims_b[0]);
   saved_ldc = static_cast<int64_t>(cublas_rows_c);
-  // Only DEFAULT epilogues are guaranteed to take the fallback. BIAS works
-  // through hipBLASLt for the shapes we hit in practice (single-GPU MultiCross
-  // verified). If hipBLASLt later returns 0 candidates for a BIAS shape, the
-  // use_default_algo branch in operator() triggers the fallback (with the
-  // saved bias_ptr below, so bias is still applied correctly).
-  saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT);
+  // ROCm port: route BIAS through our fallback (hipblasGemmEx FP32 accum +
+  // post-pass bias-add kernel) instead of hipBLASLt's BIAS epilogue. The
+  // hipBLASLt 1.2 BIAS path on gfx950 appears to do FP16 accumulation in some
+  // kernel variants, which causes 8-GPU FP16 MultiCross to NaN at per-rank
+  // batch >= 1024 when the upstream gradient grows past FP16 range. Plain
+  // gemmEx + manual FP32 add doesn't have this issue.
+  saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_BIAS);
   saved_bias_ptr = const_cast<T*>(bias_ptr);
   saved_is_bias_epilogue = (bias_ptr != nullptr) && (act == Activation_t::None);
   saved_is_bgrada_epilogue = false;
@@ -255,10 +276,13 @@ void CublasDesc<T>::set_bprop_attr(std::vector<size_t> dims_a, std::vector<size_
   saved_lda = static_cast<int64_t>(dims_a[0]);
   saved_ldb = static_cast<int64_t>(dims_b[0]);
   saved_ldc = static_cast<int64_t>(cublas_rows_c);
-  // Only DEFAULT epilogue takes the fallback. BGRADA goes via hipBLASLt;
-  // if hipBLASLt has no kernel, the use_default_algo branch falls back and
-  // applies the bias gradient via reduce_sum_columns_kernel below.
-  saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT);
+  // ROCm port: route BGRADA through our fallback (hipblasGemmEx FP32 accum +
+  // post-pass column-sum kernel) instead of hipBLASLt's BGRADA epilogue --
+  // same reason as the fprop BIAS path: hipBLASLt 1.2 / gfx950 appears to
+  // accumulate the bias gradient in FP16 for some kernel variants, which
+  // overflows for the multi-GPU MultiCross shapes (per-rank batch >= 1024).
+  saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_BGRADA);
   saved_bias_ptr = dbias_ptr;
   saved_is_bias_epilogue = false;
   saved_is_bgrada_epilogue = (epilogue == HIPBLASLT_EPILOGUE_BGRADA);

@@ -22,7 +22,13 @@
 
 #define EV_NUM 32
 #define WGRAD_REDUCE_BLOCK_SIZE 64
+// ROCm port: see common.hpp. AMD wave64 hardware needs WARP_SIZE=64 so that
+// lane partitioning matches what warpReduceSum / __shfl_*_sync actually do.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIP_PLATFORM_HCC__)
+#define WARP_SIZE 64
+#else
 #define WARP_SIZE 32
+#endif
 #define MAX_BLOKC_SIZE_PER_SM 2048
 
 namespace embedding {
