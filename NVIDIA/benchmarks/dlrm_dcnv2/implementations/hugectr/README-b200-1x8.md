@@ -311,26 +311,41 @@ only ~14 % of GPU time; embedding lookup + sort + comm dominate.
 
 ## 8. Comparison vs published MLPerf v5.1 numbers
 
-Reference: <https://developer.nvidia.com/deep-learning-performance-training-inference/training>
+References:
+- [NVIDIA Deep Learning Performance Hub](https://developer.nvidia.com/deep-learning-performance-training-inference/training) (TTT)
+- [MLPerf 5.1-0040 raw logs (G894-AD1, 10 runs)][gigares] (throughput from `tracked_stats`)
 
 ```
-System          GPUs       MLPerf-ID  TTT (min)  TTT (sec)  est. throughput
-────────────────────────────────────────────────────────────────────────────
-G894-AD1        8 × B200   5.1-0040     2.3        138       ~22.8 M samples/s
-Tyche           8 × GB200  5.1-0066     2.2        132       ~23.9 M samples/s
-SRS-GB200-NVL72 64×GB200   5.0-0087    0.7         42       ~75   M samples/s
-ours (best)     8 × B200   —            —          —          13.6 M samples/s steady
-                                                              (config_b200_1x8_round_robin)
+System          GPUs       MLPerf-ID  TTT (min)  throughput (M samples/s)
+─────────────────────────────────────────────────────────────────────────
+G894-AD1        8 × B200   5.1-0040     2.3       23.02 ± 0.06   (mean of 10 runs, range 22.93–23.13)
+Tyche           8 × GB200  5.1-0066     2.2       ~24    *est.   (TTT-derived)
+SRS-GB200-NVL72 64×GB200   5.0-0087     0.7      ~75    *est.   (TTT-derived)
+ours (best)     8 × B200   —            —        13.57           steady-state, config_b200_1x8_round_robin
 ```
+
+The G894-AD1 throughput numbers above are not estimates — they come from
+the `MLLOG.tracked_stats.throughput` event written by `LoggingCallback.
+on_training_end` in each of the 10 published `result_N.txt` logs. All 10
+runs were `status: success` (hit AUC ≥ 0.80275); convergence happened
+between 0.70 and 0.90 of one epoch (median 0.75), and per-run throughput
+agreed to within ±0.4 %.
+
+| metric                           | reference (8 × B200, 5.1-0040) | ours          |
+| -------------------------------- | ------------------------------ | ------------- |
+| total throughput (M samples/s)   | 23.02                          | 13.57         |
+| per-GPU throughput (M samples/s) | 2.88                           | 1.70          |
+| % of reference                   | 100 %                          | **59.0 %**    |
 
 The reference G894-AD1 (8 × B200, MLPerf 5.1-0040) uses a config file
 [`config_G894-AD1_1x8x6912.sh`][gigact] that is **identical** to ours in
 every DL hyperparameter (batch size 55 296, LR 0.004, mixed precision,
 scaler 16348, `SHARDING_PLAN=auto`, `MEM_COMM_BW_RATIO=9`,
-`DP_SHARDING_THRESHOLD=0.008`). The ~1.7× gap is therefore _not_ from
+`DP_SHARDING_THRESHOLD=0.008`). The 1.70× gap is therefore _not_ from
 training hyperparameters.
 
 [gigact]: https://github.com/mlcommons/training_results_v5.1/blob/main/GigaComputing/benchmarks/dlrm_dcnv2/implementations/B200/hugectr/config_G894-AD1_1x8x6912.sh
+[gigares]: https://github.com/mlcommons/training_results_v5.1/tree/main/GigaComputing/results/G894-AD1_hugectr/dlrm_dcnv2
 
 What we tuned and what closed the gap:
 
@@ -349,7 +364,7 @@ Combined improvement vs original 100-iter measurement: **+318 %**
 (3.24 M → 13.6 M samples/s). Combined improvement vs the auto-sharding
 optimized baseline: **+7 %**.
 
-Remaining ~1.7× gap to MLPerf 5.1-0040 is most plausibly due to:
+Remaining 1.70× gap to MLPerf 5.1-0040 is most plausibly due to:
 
 1. **10 % subsampled data** (HF mirror) distorts the auto-planner cost model
    and the cuda-graph-captured embedding access pattern. The reference uses
