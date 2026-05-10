@@ -23,6 +23,58 @@
 
 namespace HugeCTR {
 
+// ROCm port: per-device hipblasHandle cache for the GemmFunctor fallback.
+// Created on demand, but pre-warmed by CublasAlgo<T>::init_algorithm at
+// compile time so the cache is populated BEFORE any HIP graph capture
+// starts (hipblasCreate is illegal during graph capture). Set in fp16
+// path; see operator() for the consumer.
+static std::array<hipblasHandle_t, 16> g_handle_cache{};
+static std::mutex g_handle_mu;
+
+// Pre-warm handles for *every* visible device on the first call. Graph
+// capture starts later (during fprop/bprop), so as long as init_algorithm
+// has run at compile time we can be sure all device handles are populated
+// by the time the captured fallback path needs them.
+static void prewarm_all_blas_handles_once() {
+  static std::once_flag flag;
+  std::call_once(flag, []() {
+    int n_devs = 0;
+    if (hipGetDeviceCount(&n_devs) != hipSuccess) return;
+    int saved_dev = -1;
+    hipGetDevice(&saved_dev);
+    std::lock_guard<std::mutex> lk(g_handle_mu);
+    for (int d = 0; d < n_devs && d < static_cast<int>(g_handle_cache.size()); ++d) {
+      if (g_handle_cache[d] != nullptr) continue;
+      if (hipSetDevice(d) != hipSuccess) continue;
+      hipblasHandle_t h = nullptr;
+      if (hipblasCreate(&h) == HIPBLAS_STATUS_SUCCESS) {
+        g_handle_cache[d] = h;
+      }
+    }
+    if (saved_dev >= 0) hipSetDevice(saved_dev);
+  });
+}
+
+static hipblasHandle_t get_or_create_blas_handle_for_current_device() {
+  prewarm_all_blas_handles_once();
+  int dev_id = -1;
+  HCTR_LIB_THROW(hipGetDevice(&dev_id));
+  std::lock_guard<std::mutex> lk(g_handle_mu);
+  if (dev_id >= 0 && dev_id < static_cast<int>(g_handle_cache.size()) &&
+      g_handle_cache[dev_id] != nullptr) {
+    return g_handle_cache[dev_id];
+  }
+  // Last-resort: create one for an unexpected device (won't be reached during
+  // graph capture if prewarm covered everything).
+  hipblasHandle_t h = nullptr;
+  HCTR_LIB_THROW(hipblasCreate(&h));
+  if (dev_id >= 0 && dev_id < static_cast<int>(g_handle_cache.size())) {
+    g_handle_cache[dev_id] = h;
+  }
+  return h;
+}
+
+
 // ROCm port: post-GEMM epilogue kernels used by the GemmFunctor fallback when
 // hipBLASLt has no kernel for our shape/epilogue (MultiCross v2 needs BIAS at
 // fprop and BGRADA at bprop). The plain hipblasGemmEx path runs first; these
@@ -339,6 +391,11 @@ void CublasAlgo<T>::init_algorithm(const CublasDesc<T>& cublas_desc,
       cublas_desc.cublas_mat_c_desc, cublas_preference, kHeuristicRequest,
       heuristic_results, &returned_res);
 
+  // ROCm port: pre-warm the per-device hipblasHandle cache so fallback
+  // GemmFunctor calls never need to hipblasCreate during HIP graph capture
+  // (which would fail).
+  (void)get_or_create_blas_handle_for_current_device();
+
   if (st == HIPBLAS_STATUS_SUCCESS && returned_res > 0) {
     algo = heuristic_results[0].algo;
     use_default_algo = false;
@@ -452,26 +509,11 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
               " Add a dedicated kernel path for the missing epilogue, or keep"
               " InnerProduct-based MLP layers (which avoid the fused functor).");
     }
-    // Per-device handle cache. Multi-GPU runs spawn one OMP thread per device,
-    // so a thread_local handle would bind to whichever device the thread first
-    // touched -- racy. Cache by current device instead.
-    int dev_id = -1;
-    HCTR_LIB_THROW(hipGetDevice(&dev_id));
-    static std::array<hipblasHandle_t, 16> handle_cache{};
-    static std::mutex handle_mu;
-    hipblasHandle_t blas_handle = nullptr;
-    {
-      std::lock_guard<std::mutex> lk(handle_mu);
-      if (dev_id >= 0 && dev_id < static_cast<int>(handle_cache.size()) &&
-          handle_cache[dev_id] != nullptr) {
-        blas_handle = handle_cache[dev_id];
-      } else {
-        HCTR_LIB_THROW(hipblasCreate(&blas_handle));
-        if (dev_id >= 0 && dev_id < static_cast<int>(handle_cache.size())) {
-          handle_cache[dev_id] = blas_handle;
-        }
-      }
-    }
+    // Per-device handle cache (g_handle_cache) is pre-warmed by
+    // CublasAlgo<T>::init_algorithm at compile time, so this lookup never
+    // needs to call hipblasCreate during fprop/bprop -- which is critical
+    // because hipblasCreate is illegal during HIP graph capture.
+    hipblasHandle_t blas_handle = get_or_create_blas_handle_for_current_device();
     HCTR_LIB_THROW(hipblasSetStream(blas_handle, stream));
     // Use hipblasGemmEx so the FP16 path also gets FP32 accumulation
     // (hipblasHgemm accumulates in FP16 -> overflow/NaN at non-trivial scale).

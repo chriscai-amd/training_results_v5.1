@@ -310,14 +310,14 @@ solver = hugectr.CreateSolver(
     use_mixed_precision=args.use_mixed_precision,
     enable_tf32_compute=args.enable_tf32_compute,
     scaler=args.scaler,
-    # ROCm port: HIP graph capture amplifies any single hipblasLt fallback into
-    # a deterministic crash (the captured graph re-runs the same broken algo
-    # forever). Disable graph capture & inter-iter overlap until we have a
-    # reliable hipBLASLt heuristic for the MultiCross bprop GEMM shape.
-    use_cuda_graph=os.environ.get("HCTR_USE_CUDA_GRAPH", "0") == "1",
+    # ROCm port: HIP graph capture works as of 2026-05-09 with the
+    # pre-warmed hipblasHandle cache + FP16 clamp in MultiCross fprop.
+    # Default graph capture and intra/inter iter overlap to ON to match
+    # NVIDIA's submission. Override via HCTR_USE_CUDA_GRAPH=0 / etc.
+    use_cuda_graph=os.environ.get("HCTR_USE_CUDA_GRAPH", "1") == "1",
     gen_loss_summary=args.gen_loss_summary,
-    train_intra_iteration_overlap=False,
-    train_inter_iteration_overlap=False,
+    train_intra_iteration_overlap=os.environ.get("HCTR_INTRA_OVERLAP", "1") == "1",
+    train_inter_iteration_overlap=os.environ.get("HCTR_INTER_OVERLAP", "1") == "1",
     eval_intra_iteration_overlap=False,
     eval_inter_iteration_overlap=True,
     all_reduce_algo=hugectr.AllReduceAlgo.NCCL,
@@ -404,9 +404,10 @@ compute_config = hugectr.DenseLayerComputeConfig(
     fuse_wb=False,
 )
 
-# HugeCTR ROCm port: replace fused Layer_t.MLP with InnerProduct+ReLU stack.
-# The fused MLP needs a hipBLASLt heuristic that satisfies our requested
-# RELU_AUX epilogue + matrix layout combo; ROCm 7.2.1 reports NOT_SUPPORTED.
+# HugeCTR ROCm port: HCTR_USE_FUSED_MLP=1 enables the fused Layer_t.MLP
+# (matches NVIDIA's submission). Default 0 because earlier ROCm 7.2 builds
+# couldn't satisfy the RELU_AUX epilogue heuristic; with the
+# fused_gemm_functors fallback in place this may now work.
 def _add_mlp_stack(top, bot, hidden_dims, last_act=True):
     cur = bot
     for i, h in enumerate(hidden_dims):
@@ -425,16 +426,23 @@ def _add_mlp_stack(top, bot, hidden_dims, last_act=True):
             cur = relu
         else:
             cur = fc
-    # Rename the final tensor to match upstream `top_names` contract.
     return cur
 
-mlp1_out = _add_mlp_stack("mlp1", "dense", [512, 256, 128], last_act=True)
-# Make alias `mlp1` -> the actual final tensor name via a Reshape (no-op flatten).
-model.add(hugectr.DenseLayer(
-    layer_type=hugectr.Layer_t.Reshape,
-    bottom_names=[mlp1_out], top_names=["mlp1"],
-    leading_dim=128,
-))
+if os.environ.get("HCTR_USE_FUSED_MLP", "0") == "1":
+    model.add(hugectr.DenseLayer(
+        layer_type=hugectr.Layer_t.MLP,
+        bottom_names=["dense"], top_names=["mlp1"],
+        num_outputs=[512, 256, 128],
+        act_type=hugectr.Activation_t.Relu,
+        compute_config=compute_config,
+    ))
+else:
+    mlp1_out = _add_mlp_stack("mlp1", "dense", [512, 256, 128], last_act=True)
+    model.add(hugectr.DenseLayer(
+        layer_type=hugectr.Layer_t.Reshape,
+        bottom_names=[mlp1_out], top_names=["mlp1"],
+        leading_dim=128,
+    ))
 model.add(
     hugectr.DenseLayer(
         layer_type=hugectr.Layer_t.Concat,
@@ -469,13 +477,23 @@ else:
         num_layers=int(os.environ.get("HCTR_DCN_NUM_LAYERS", "3")),
         compute_config=compute_config,
     ))
-# Top MLP: 1024 -> 1024 -> 512 -> 256 -> 1, last layer linear (no ReLU).
-mlp2_out = _add_mlp_stack("mlp2", "interaction1", [1024, 1024, 512, 256], last_act=True)
-model.add(hugectr.DenseLayer(
-    layer_type=hugectr.Layer_t.InnerProduct,
-    bottom_names=[mlp2_out], top_names=["mlp2"],
-    num_output=1,
-))
+if os.environ.get("HCTR_USE_FUSED_MLP", "0") == "1":
+    model.add(hugectr.DenseLayer(
+        layer_type=hugectr.Layer_t.MLP,
+        bottom_names=["interaction1"], top_names=["mlp2"],
+        num_outputs=[1024, 1024, 512, 256, 1],
+        activations=[hugectr.Activation_t.Relu, hugectr.Activation_t.Relu,
+                     hugectr.Activation_t.Relu, hugectr.Activation_t.Relu,
+                     hugectr.Activation_t.Non],
+        compute_config=compute_config,
+    ))
+else:
+    mlp2_out = _add_mlp_stack("mlp2", "interaction1", [1024, 1024, 512, 256], last_act=True)
+    model.add(hugectr.DenseLayer(
+        layer_type=hugectr.Layer_t.InnerProduct,
+        bottom_names=[mlp2_out], top_names=["mlp2"],
+        num_output=1,
+    ))
 model.add(
     hugectr.DenseLayer(
         layer_type=hugectr.Layer_t.BinaryCrossEntropyLoss,
