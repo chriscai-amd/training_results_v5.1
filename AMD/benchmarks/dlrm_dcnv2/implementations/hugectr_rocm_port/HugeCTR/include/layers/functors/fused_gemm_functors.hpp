@@ -54,6 +54,16 @@ struct CublasDesc {
   void* saved_bias_ptr = nullptr;
   bool saved_is_bias_epilogue = false;     // BIAS epilogue (post-GEMM bias add)
   bool saved_is_bgrada_epilogue = false;   // BGRADA epilogue (post-GEMM bias gradient)
+  // ROCm port: support hipBLASLt's RELU_AUX / DRELU / DRELU_BGRAD epilogues
+  // in our hipblasGemmEx fallback. Required for Layer_t.MLP (fused MLP).
+  // Mask layout follows cuBLASLt convention: bit-packed, column-major,
+  // ceil(m/8) bytes per column, padded to saved_aux_ld bytes per column.
+  // bit (i, j) = 1 iff D[i, j] was strictly positive at fprop time.
+  void* saved_aux_ptr = nullptr;
+  size_t saved_aux_ld = 0;
+  bool saved_is_relu_aux_epilogue = false;       // fprop: 130 / 134 (RELU_AUX[+BIAS])
+  bool saved_is_drelu_epilogue = false;          // bprop: 136 (DRELU)
+  bool saved_is_drelu_bgrad_epilogue = false;    // bprop: 152 (DRELU + BGRAD)
 
   void set_fprop_attr(std::vector<size_t> dims_a, std::vector<size_t> dims_b,
                       hipblasOperation_t op_a, hipblasOperation_t op_b, hipblasLtOrder_t order,

@@ -110,6 +110,97 @@ __global__ void add_bias_per_row_kernel(T* D, const T* __restrict__ bias, int m,
   }
 }
 
+// ROCm port: cuBLASLt-compatible bit-packed RELU mask helpers.
+// Mask is column-major; byte offset (i_row, j_col) = (i_row >> 3) + j_col * aux_ld
+// bit within byte = i_row & 7
+// aux_ld is in BYTES (typically 128-byte aligned).
+
+// fprop kernel: applies bias (already in D), then computes mask and ReLU.
+// Each thread handles one byte (8 row positions in one column).
+__global__ void fprop_relu_aux_kernel(__half* D, uint8_t* aux, int m, int n, int aux_ld) {
+  int byte_i = blockIdx.x * blockDim.x + threadIdx.x;     // byte index within column
+  int j = blockIdx.y * blockDim.y + threadIdx.y;          // column
+  int max_byte = (m + 7) / 8;
+  if (byte_i >= max_byte || j >= n) return;
+  uint8_t mask = 0;
+  int base_i = byte_i * 8;
+  constexpr float kFp16Max = 65504.0f;
+  #pragma unroll
+  for (int b = 0; b < 8; ++b) {
+    int i = base_i + b;
+    if (i >= m) break;
+    size_t off = static_cast<size_t>(i) + static_cast<size_t>(j) * m;
+    float v = __half2float(D[off]);
+    // Sanitize: NaN -> 0, clamp magnitude to FP16 range.
+    if (!isfinite(v)) v = 0.0f;
+    else if (v > kFp16Max) v = kFp16Max;
+    else if (v < -kFp16Max) v = -kFp16Max;
+    if (v > 0.0f) {
+      mask |= static_cast<uint8_t>(1u << b);
+      D[off] = __float2half(v);
+    } else {
+      D[off] = __float2half(0.0f);
+    }
+  }
+  aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld] = mask;
+}
+
+// bprop kernel: applies the saved RELU mask to GEMM output D, optionally
+// computing dbias as the column-sum of the masked D.
+// Indexing: for each output row i, walk all n columns reading the
+// corresponding mask bit, multiplying D[i, j] by it, optionally summing
+// into dbias[i].
+template <bool ComputeBgrad>
+__global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
+                                   int m, int n, int aux_ld) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= m) return;
+  int byte_i = i >> 3;
+  int bit_i = i & 7;
+  uint8_t bit_mask = static_cast<uint8_t>(1u << bit_i);
+  float sum = 0.0f;
+  for (int j = 0; j < n; ++j) {
+    uint8_t mask_byte = aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld];
+    bool nonneg = (mask_byte & bit_mask) != 0;
+    size_t off = static_cast<size_t>(i) + static_cast<size_t>(j) * m;
+    float v = __half2float(D[off]);
+    if (!nonneg) {
+      v = 0.0f;
+      D[off] = __float2half(0.0f);
+    }
+    if (ComputeBgrad) sum += v;
+  }
+  if (ComputeBgrad) {
+    if (!isfinite(sum)) sum = 0.0f;
+    constexpr float kFp16Max = 65504.0f;
+    if (sum > kFp16Max) sum = kFp16Max;
+    else if (sum < -kFp16Max) sum = -kFp16Max;
+    dbias[i] = __float2half(sum);
+  }
+}
+
+inline void launch_fprop_relu_aux(__half* D, uint8_t* aux, int m, int n, int aux_ld,
+                                  hipStream_t stream) {
+  if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
+  int max_byte = (m + 7) / 8;
+  dim3 block(8, 16, 1);
+  dim3 grid((max_byte + 7) / 8, (n + 15) / 16, 1);
+  fprop_relu_aux_kernel<<<grid, block, 0, stream>>>(D, aux, m, n, aux_ld);
+}
+
+inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
+                               int m, int n, int aux_ld, bool compute_bgrad,
+                               hipStream_t stream) {
+  if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
+  constexpr int kBlock = 256;
+  size_t grid = (m + kBlock - 1) / kBlock;
+  if (compute_bgrad && dbias) {
+    bprop_drelu_kernel<true><<<grid, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld);
+  } else {
+    bprop_drelu_kernel<false><<<grid, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld);
+  }
+}
+
 template <typename T>
 __global__ void reduce_sum_columns_kernel(const T* __restrict__ A, T* dbias, int m, int k) {
   // BGRADA semantics: dbias is the sum over the GEMM's contracted dimension
@@ -241,17 +332,25 @@ void CublasDesc<T>::set_fprop_attr(std::vector<size_t> dims_a, std::vector<size_
   saved_lda = static_cast<int64_t>(dims_a[0]);
   saved_ldb = static_cast<int64_t>(dims_b[0]);
   saved_ldc = static_cast<int64_t>(cublas_rows_c);
-  // ROCm port: route BIAS through our fallback (hipblasGemmEx FP32 accum +
-  // post-pass bias-add kernel) instead of hipBLASLt's BIAS epilogue. The
-  // hipBLASLt 1.2 BIAS path on gfx950 appears to do FP16 accumulation in some
-  // kernel variants, which causes 8-GPU FP16 MultiCross to NaN at per-rank
-  // batch >= 1024 when the upstream gradient grows past FP16 range. Plain
-  // gemmEx + manual FP32 add doesn't have this issue.
+  // ROCm port: route BIAS / RELU_AUX[+BIAS] through our fallback. hipBLASLt
+  // 1.2 / gfx950 either has no kernel or accumulates in FP16 for these
+  // shapes; gemmEx + manual post-pass keeps everything in FP32 accumulation.
   saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT) ||
-                            (epilogue == HIPBLASLT_EPILOGUE_BIAS);
+                            (epilogue == HIPBLASLT_EPILOGUE_BIAS) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_RELU) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_RELU_BIAS) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_RELU_AUX) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_RELU_AUX_BIAS);
   saved_bias_ptr = const_cast<T*>(bias_ptr);
   saved_is_bias_epilogue = (bias_ptr != nullptr) && (act == Activation_t::None);
   saved_is_bgrada_epilogue = false;
+  saved_is_relu_aux_epilogue = (act != Activation_t::None) && (mask_out_ptr != nullptr);
+  saved_aux_ptr = static_cast<void*>(mask_out_ptr);
+  saved_aux_ld = saved_is_relu_aux_epilogue
+                     ? ((static_cast<size_t>(cublas_rows_c) - 1) / 128 + 1) * 128
+                     : 0;
+  saved_is_drelu_epilogue = false;
+  saved_is_drelu_bgrad_epilogue = false;
 }
 
 template <typename T>
@@ -333,16 +432,24 @@ void CublasDesc<T>::set_bprop_attr(std::vector<size_t> dims_a, std::vector<size_
   saved_lda = static_cast<int64_t>(dims_a[0]);
   saved_ldb = static_cast<int64_t>(dims_b[0]);
   saved_ldc = static_cast<int64_t>(cublas_rows_c);
-  // ROCm port: route BGRADA through our fallback (hipblasGemmEx FP32 accum +
-  // post-pass column-sum kernel) instead of hipBLASLt's BGRADA epilogue --
-  // same reason as the fprop BIAS path: hipBLASLt 1.2 / gfx950 appears to
-  // accumulate the bias gradient in FP16 for some kernel variants, which
-  // overflows for the multi-GPU MultiCross shapes (per-rank batch >= 1024).
+  // ROCm port: route BGRADA / DRELU / DRELU_BGRAD through our fallback for
+  // the same reasons as the fprop side -- hipBLASLt 1.2 / gfx950 either
+  // lacks a kernel or has FP16-accum precision issues for our shapes.
   saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT) ||
-                            (epilogue == HIPBLASLT_EPILOGUE_BGRADA);
+                            (epilogue == HIPBLASLT_EPILOGUE_BGRADA) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_DRELU) ||
+                            (epilogue == HIPBLASLT_EPILOGUE_DRELU_BGRAD);
   saved_bias_ptr = dbias_ptr;
   saved_is_bias_epilogue = false;
   saved_is_bgrada_epilogue = (epilogue == HIPBLASLT_EPILOGUE_BGRADA);
+  saved_is_relu_aux_epilogue = false;
+  saved_is_drelu_epilogue = (epilogue == HIPBLASLT_EPILOGUE_DRELU);
+  saved_is_drelu_bgrad_epilogue = (epilogue == HIPBLASLT_EPILOGUE_DRELU_BGRAD);
+  saved_aux_ptr = mask_in_ptr ? const_cast<T*>(mask_in_ptr) : nullptr;
+  // For DRELU{,_BGRAD}, mask_in_ld matches what fprop wrote.
+  saved_aux_ld = (saved_is_drelu_epilogue || saved_is_drelu_bgrad_epilogue)
+                     ? ((static_cast<size_t>(cublas_rows_c) - 1) / 128 + 1) * 128
+                     : 0;
 }
 
 template <typename T>
@@ -499,15 +606,16 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
     const bool fallback_can_emulate =
         cublas_desc.saved_epilogue_is_plain ||
         cublas_desc.saved_is_bias_epilogue ||
-        cublas_desc.saved_is_bgrada_epilogue;
+        cublas_desc.saved_is_bgrada_epilogue ||
+        cublas_desc.saved_is_relu_aux_epilogue ||
+        cublas_desc.saved_is_drelu_epilogue ||
+        cublas_desc.saved_is_drelu_bgrad_epilogue;
     if (!fallback_can_emulate) {
       HCTR_OWN_THROW(
           Error_t::WrongInput,
-          std::string("GemmFunctor fallback hit non-DEFAULT/BIAS/BGRADA epilogue ") +
+          std::string("GemmFunctor fallback hit unsupported epilogue ") +
               std::to_string(static_cast<int>(cublas_desc.epilogue)) +
-              " (mask/aux/relu); plain hipblasGemmEx cannot emulate this."
-              " Add a dedicated kernel path for the missing epilogue, or keep"
-              " InnerProduct-based MLP layers (which avoid the fused functor).");
+              "; plain hipblasGemmEx cannot emulate this.");
     }
     // Per-device handle cache (g_handle_cache) is pre-warmed by
     // CublasAlgo<T>::init_algorithm at compile time, so this lookup never
@@ -548,6 +656,37 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
         launch_add_bias_per_row<T>(mat_d, reinterpret_cast<const T*>(cublas_desc.saved_bias_ptr),
                                    static_cast<int>(cublas_desc.saved_m),
                                    static_cast<int>(cublas_desc.saved_n), stream);
+      }
+    }
+    // ROCm port: RELU_AUX[+BIAS] fprop fused MLP path. Bias was already added
+    // above by the BIAS post-pass kernel (when saved_is_bias_epilogue is true),
+    // so here we just need to compute the mask and apply ReLU. Only valid for
+    // FP16 currently (Layer_t.MLP is __half-only in HugeCTR).
+    if constexpr (std::is_same<T, __half>::value) {
+      if (cublas_desc.saved_is_relu_aux_epilogue && cublas_desc.saved_aux_ptr) {
+        launch_fprop_relu_aux(reinterpret_cast<__half*>(mat_d),
+                              reinterpret_cast<uint8_t*>(cublas_desc.saved_aux_ptr),
+                              static_cast<int>(cublas_desc.saved_m),
+                              static_cast<int>(cublas_desc.saved_n),
+                              static_cast<int>(cublas_desc.saved_aux_ld), stream);
+      }
+      if (cublas_desc.saved_is_drelu_epilogue && cublas_desc.saved_aux_ptr) {
+        launch_bprop_drelu(reinterpret_cast<__half*>(mat_d),
+                           reinterpret_cast<const uint8_t*>(cublas_desc.saved_aux_ptr),
+                           nullptr,
+                           static_cast<int>(cublas_desc.saved_m),
+                           static_cast<int>(cublas_desc.saved_n),
+                           static_cast<int>(cublas_desc.saved_aux_ld),
+                           /*compute_bgrad=*/false, stream);
+      }
+      if (cublas_desc.saved_is_drelu_bgrad_epilogue && cublas_desc.saved_aux_ptr) {
+        launch_bprop_drelu(reinterpret_cast<__half*>(mat_d),
+                           reinterpret_cast<const uint8_t*>(cublas_desc.saved_aux_ptr),
+                           reinterpret_cast<__half*>(cublas_desc.saved_bias_ptr),
+                           static_cast<int>(cublas_desc.saved_m),
+                           static_cast<int>(cublas_desc.saved_n),
+                           static_cast<int>(cublas_desc.saved_aux_ld),
+                           /*compute_bgrad=*/cublas_desc.saved_bias_ptr != nullptr, stream);
       }
     }
     if (cublas_desc.saved_is_bgrada_epilogue && cublas_desc.saved_bias_ptr) {
