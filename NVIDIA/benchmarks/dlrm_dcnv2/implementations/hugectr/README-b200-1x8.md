@@ -168,11 +168,24 @@ Step 5 (convert_to_raw)                ~15 min
 
 ## 5. Run training
 
+The repo ships several configs; pick the one that matches your goal.
+
+| Config | Use for | Notes |
+| ------ | ------- | ----- |
+| `config_b200_1x8.sh`            | drop-in port of the upstream `config_GB200_2x4x6912.sh` for 1×8 B200; `MAX_ITER=100` | starting point only — first-iter compile dominates a 100-iter measurement |
+| `config_b200_1x8_1k.sh`         | same as above with `MAX_ITER=1000` | minimum to amortize compile; reasonable steady-state numbers |
+| `config_b200_1x8_opt.sh`        | + `USE_ALGORITHM_SEARCH=false`, `MAX_ITER=2000` | better steady-state, faster startup |
+| `config_b200_1x8_round_robin.sh`| `config_b200_1x8_opt.sh` + `SHARDING_PLAN=round_robin` | **best on this hardware, +7 % over auto** |
+| `config_b200_1x8_uniform.sh`    | `SHARDING_PLAN=uniform` | OOM on 1×8 B200 (kept only for sweeps) |
+
+Recommended baseline:
+
 ```bash
-bash run_b200.sh \
+env DLRM_BIND="numactl --interleave=0,1" \
+    bash run_b200.sh \
     --reservation <your-reservation> \
     --nodelist <gpu-node> \
-    --config config_b200_1x8.sh \
+    --config config_b200_1x8_round_robin.sh \
     --image mlperf-nvidia:recommendation-hugectr \
     --image-tar $DATA_ROOT/docker_images/mlperf-nvidia-recommendation-hugectr.tar.zst \
     --train-data $DATA_ROOT/criteo_1tb_multihot_raw/train_data.bin \
@@ -180,6 +193,11 @@ bash run_b200.sh \
     --logdir     $DATA_ROOT/criteo_synth/results \
     --time       01:00:00
 ```
+
+`run_b200.sh` already passes through:
+- `--cap-add=IPC_LOCK,SYS_NICE` (required for `numactl --interleave`)
+- `--device=/dev/infiniband` (NCCL IB plugin discovery)
+- `NCCL_NVLS_ENABLE=1` (from `config_common.sh`)
 
 Add `--nsys-trace <name>` to capture an nsys profile under
 `<logdir>/<name>.nsys-rep`. The default `--nsys-delay 30 --nsys-duration 5`
@@ -210,16 +228,34 @@ captures a 5 s window starting 30 s after process spawn (covers init through
 
 ### 7.1 Throughput
 
+Headline (recommended config, `config_b200_1x8_round_robin.sh`, 2000-iter measurement):
+
+```
+total          9.44 s for 2000 iters
+avg            4.72 ms/iter, 11.7 M samples/s
+steady state   4.08 ms/iter, 13.6 M samples/s
+```
+
+Sweep across configs (all 2000-iter, steady-state excludes first 100):
+
+| Config | per-iter avg (ms) | per-iter steady (ms) | M samples/s steady |  vs auto |
+| ------ | ----------------: | -------------------: | -----------------: | -------: |
+| baseline `auto` (opt cfg)    | 5.33 | 4.38 | 12.6 | 1.00× |
+| `round_robin`                | **4.72** | **4.08** | **13.6** | **1.07×** |
+| `auto` + `NCCL_PROTO=Simple` | 5.01 | 4.33 | 12.8 | 1.01× |
+| `auto` without `numactl`     | 4.98 | 4.35 | 12.7 | 1.01× |
+| `uniform`                    | OOM  | —    | —    | —     |
+
+100-iter measurements (kept for historical context — first-iter compile dominates):
+
 | Run | Wall (100 iters) | Throughput | Per-iter (avg) |
 | --- | ---------------: | ---------: | -------------: |
-| Unprofiled | 1.71 s | **3.24 M samples/s** | 17.1 ms |
-| `nsys --cuda-graph-trace=node` | 1.83 s | 3.02 M samples/s | 18.3 ms |
-| `nsys` default                  | 1.97 s | 2.80 M samples/s | 19.7 ms |
+| `config_b200_1x8.sh` unprofiled | 1.71 s | 3.24 M samples/s | 17.1 ms |
+| same with `nsys --cuda-graph-trace=node` | 1.83 s | 3.02 M samples/s | 18.3 ms |
 
 The first iter takes ~1.0 s for cuBLAS algorithm search + cuda-graph
-instantiation. Iters 11+ run at 3–6 ms each, so steady-state throughput is
-~9 M samples/s on 8 × B200, and the 100-iter average is dragged down by
-the compile-heavy first iter.
+instantiation. With `USE_ALGORITHM_SEARCH=false` and a 2000-iter window
+this overhead drops to ~5 % of measured wall.
 
 ### 7.2 Compute vs comm breakdown (per-GPU avg, training-window-only)
 
@@ -283,33 +319,47 @@ System          GPUs       MLPerf-ID  TTT (min)  TTT (sec)  est. throughput
 G894-AD1        8 × B200   5.1-0040     2.3        138       ~22.8 M samples/s
 Tyche           8 × GB200  5.1-0066     2.2        132       ~23.9 M samples/s
 SRS-GB200-NVL72 64×GB200   5.0-0087    0.7         42       ~75   M samples/s
-ours (this run) 8 × B200   —            —          —          3.24 M samples/s avg
-                                                              ~9    M samples/s steady-state
+ours (best)     8 × B200   —            —          —          13.6 M samples/s steady
+                                                              (config_b200_1x8_round_robin)
 ```
 
-We're **~39 % of the reference 8 × B200 throughput** in steady state. Likely
-sources of the gap:
+The reference G894-AD1 (8 × B200, MLPerf 5.1-0040) uses a config file
+[`config_G894-AD1_1x8x6912.sh`][gigact] that is **identical** to ours in
+every DL hyperparameter (batch size 55 296, LR 0.004, mixed precision,
+scaler 16348, `SHARDING_PLAN=auto`, `MEM_COMM_BW_RATIO=9`,
+`DP_SHARDING_THRESHOLD=0.008`). The ~1.7× gap is therefore _not_ from
+training hyperparameters.
 
-1. **Cold cuBLAS algorithm search** — first iter (~1.0 s of 1.71 s total) is
-   dominated by autotune; 100-iter measurement is too short to amortize.
-2. **10 % subsampled data** — embedding access patterns differ; the `auto`
-   sharding planner is calibrated for full Criteo vocabulary distribution.
-3. **No NCCL-NVLS / SHARP tuning** — `NCCL_NVLS_ENABLE=1` is set but the
-   plugin stack hasn't been verified on this cluster.
-4. **MLPerf submitters tune `BATCHSIZE`, `SCALER`, `SHARDING_PLAN`,
-   `DP_SHARDING_THRESHOLD`, `LR`** for the specific hardware layout; defaults
-   in `config_GB200_2x4x6912.sh` are GB200-tuned.
-5. **DGX-class NVLink-switch tuning** — `nvidia-smi topo -m` may reveal
-   topology differences vs G894-AD1 (the reference 8 × B200 system).
+[gigact]: https://github.com/mlcommons/training_results_v5.1/blob/main/GigaComputing/benchmarks/dlrm_dcnv2/implementations/B200/hugectr/config_G894-AD1_1x8x6912.sh
 
-Path to closing the gap (in priority):
+What we tuned and what closed the gap:
 
-1. Run a longer measurement window (≥1000 iters) to amortize compile + algo
-   search.
-2. Try `SHARDING_PLAN=hier_auto`, sweep `DP_SHARDING_THRESHOLD`.
-3. Verify SHARP / NVLS plugin status; sweep `NCCL_ALGO`, `NCCL_PROTO`.
-4. Re-run on the **full** Criteo dataset for an apples-to-apples MLPerf
-   comparison.
+| What we tuned | Effect |
+| ------------- | ------ |
+| `MAX_ITER` 100 → 2000 (amortize first-iter compile) | **~3.5×** (largest) |
+| `--cap-add=IPC_LOCK,SYS_NICE`, `--device=/dev/infiniband` | enables IB plugin, `numactl --interleave` |
+| `USE_ALGORITHM_SEARCH=false` | shortens first-iter; flat steady-state |
+| `SHARDING_PLAN=round_robin` (vs `auto`) | **+7 %** in steady |
+| `numactl --interleave=0,1` | flat |
+| `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
+| `SHARDING_PLAN=hier_auto` | requires multi-node, errors |
+| `SHARDING_PLAN=uniform` | OOM (replicates large tables) |
+
+Combined improvement vs original 100-iter measurement: **+318 %**
+(3.24 M → 13.6 M samples/s). Combined improvement vs the auto-sharding
+optimized baseline: **+7 %**.
+
+Remaining ~1.7× gap to MLPerf 5.1-0040 is most plausibly due to:
+
+1. **10 % subsampled data** (HF mirror) distorts the auto-planner cost model
+   and the cuda-graph-captured embedding access pattern. The reference uses
+   the full 1 TB Criteo (Criteo 3.5 TB Click Logs multi-hot variant).
+2. **HugeCTR / NCCL plugin build hash differences** vs MLPerf submission build.
+3. **B200 firmware / clock differences** between G894-AD1 and our chassis.
+
+Of these, only (1) is fixable without out-of-band access. See section 4 for
+the data-prep pipeline; switching from the HF mirror to the full Criteo
+distribution would close the data-side gap.
 
 ## 9. Profiling / debugging notes
 

@@ -104,6 +104,8 @@ docker run --rm \
     --network=host --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     --shm-size=64g \
+    --cap-add=IPC_LOCK --cap-add=SYS_NICE \
+    --device=/dev/infiniband \
     -v $SCRIPT_DIR:/workspace/dlrm \
     -v $TRAIN_DATA_DIR:/data:ro \
     -v $VAL_DATA_DIR:/data_val:ro \
@@ -122,6 +124,11 @@ docker run --rm \
     -e NSYS_TRACE='${NSYS_TRACE}' \
     -e NSYS_DELAY='${NSYS_DELAY:-30}' \
     -e NSYS_DURATION='${NSYS_DURATION:-5}' \
+    -e USE_ALGORITHM_SEARCH \
+    -e DLRM_BIND \
+    -e NCCL_ALGO -e NCCL_PROTO -e NCCL_IB_DISABLE \
+    -e NCCL_IB_HCA -e NCCL_IB_GID_INDEX -e NCCL_NET_GDR_LEVEL \
+    -e NCCL_DEBUG -e NCCL_DEBUG_SUBSYS \
     '${IMAGE}' \
     bash -c '
         if [ -n \"\$NSYS_TRACE\" ]; then
