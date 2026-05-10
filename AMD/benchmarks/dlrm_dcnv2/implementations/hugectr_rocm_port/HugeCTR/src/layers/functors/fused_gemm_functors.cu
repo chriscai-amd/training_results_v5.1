@@ -145,21 +145,21 @@ __global__ void fprop_relu_aux_kernel(__half* D, uint8_t* aux, int m, int n, int
   aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld] = mask;
 }
 
-// bprop kernel: applies the saved RELU mask to GEMM output D, optionally
-// computing dbias as the column-sum of the masked D.
-// Indexing: for each output row i, walk all n columns reading the
-// corresponding mask bit, multiplying D[i, j] by it, optionally summing
-// into dbias[i].
-template <bool ComputeBgrad>
+// bprop kernel: applies the saved RELU mask to D in-place; optionally
+// computes dbias = column-sum of masked D.
+// One block per row i; threads in the block cooperatively walk columns
+// (coalesced reads across threadIdx.x), then a shared-memory reduction
+// produces the final dbias[i] in O(log blockDim.x).
+template <bool ComputeBgrad, int kBlock>
 __global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
                                    int m, int n, int aux_ld) {
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.x;
   if (i >= m) return;
   int byte_i = i >> 3;
   int bit_i = i & 7;
   uint8_t bit_mask = static_cast<uint8_t>(1u << bit_i);
   float sum = 0.0f;
-  for (int j = 0; j < n; ++j) {
+  for (int j = threadIdx.x; j < n; j += kBlock) {
     uint8_t mask_byte = aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld];
     bool nonneg = (mask_byte & bit_mask) != 0;
     size_t off = static_cast<size_t>(i) + static_cast<size_t>(j) * m;
@@ -171,11 +171,22 @@ __global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
     if (ComputeBgrad) sum += v;
   }
   if (ComputeBgrad) {
-    if (!isfinite(sum)) sum = 0.0f;
-    constexpr float kFp16Max = 65504.0f;
-    if (sum > kFp16Max) sum = kFp16Max;
-    else if (sum < -kFp16Max) sum = -kFp16Max;
-    dbias[i] = __float2half(sum);
+    __shared__ float partial[kBlock];
+    partial[threadIdx.x] = sum;
+    __syncthreads();
+    // Tree reduction within block.
+    for (int s = kBlock / 2; s > 0; s >>= 1) {
+      if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      float s = partial[0];
+      if (!isfinite(s)) s = 0.0f;
+      constexpr float kFp16Max = 65504.0f;
+      if (s > kFp16Max) s = kFp16Max;
+      else if (s < -kFp16Max) s = -kFp16Max;
+      dbias[i] = __float2half(s);
+    }
   }
 }
 
@@ -192,12 +203,12 @@ inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
                                int m, int n, int aux_ld, bool compute_bgrad,
                                hipStream_t stream) {
   if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
+  // One block per row, kBlock threads/block cooperatively walk the n cols.
   constexpr int kBlock = 256;
-  size_t grid = (m + kBlock - 1) / kBlock;
   if (compute_bgrad && dbias) {
-    bprop_drelu_kernel<true><<<grid, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld);
+    bprop_drelu_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld);
   } else {
-    bprop_drelu_kernel<false><<<grid, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld);
+    bprop_drelu_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld);
   }
 }
 

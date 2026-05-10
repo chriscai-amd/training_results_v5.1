@@ -51,8 +51,15 @@ _DEFAULT_TABLE_SIZE_ARRAY = [
 ]
 _DEFAULT_MULTI_HOT_SIZES = [3, 2, 1, 2, 6, 1, 1, 1, 1, 7, 3, 8, 1, 6, 9, 5, 1, 1, 1, 12, 100, 27, 10, 3, 1, 1]
 if os.environ.get("HCTR_USE_SUBSAMPLED_CRITEO", "0") == "1":
-    # Our preprocessed day_0 binary is single-hot per slot.
-    MULTI_HOT_SIZES = [1] * 26
+    # ROCm port: synthetic multi-hot binary (criteo_npy_to_hugectr_bin_mh.py)
+    # uses NVIDIA's MULTI_HOT_SIZES expansion (sum=130 keys/row, 576-B record);
+    # synthetic single-hot binary (criteo_npy_to_hugectr_bin.py) uses 1 key
+    # per slot (sum=26, 160-B record). Pick by env knob; default = single-hot
+    # for backward compat with the older runs.
+    if os.environ.get("HCTR_USE_MULTI_HOT", "0") == "1":
+        MULTI_HOT_SIZES = _DEFAULT_MULTI_HOT_SIZES
+    else:
+        MULTI_HOT_SIZES = [1] * 26
     _slot_floor = _i("HCTR_SLOT_SIZE", 65536)
     if os.environ.get("HCTR_USE_REAL_TABLE_SIZES", "0") == "1":
         # Clamp real B200 sizes to >= slot_floor: our preprocessor hashed every

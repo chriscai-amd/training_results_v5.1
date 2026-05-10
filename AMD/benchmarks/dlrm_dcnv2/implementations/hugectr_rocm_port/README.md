@@ -10,41 +10,47 @@ This is a research / port branch, **not an official MLPerf submission**.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, batch 55,296, **HIP graph + intra/inter overlap on** | **6.26 M samples/sec, 100 iters stable** | **closest to NVIDIA's published B200 config** |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, batch 55,296, HIP graph on, no overlap | 6.09 M samples/sec, 100 iters | |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, batch 55,296, no HIP graph | 5.85 M samples/sec, 100 iters | |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 16,384 | 5.27 M samples/sec, 30+ iters stable | loss 0.366 → 0.257 |
+| 8 × MI350X, FP16 mixed, real DCN-v2, **MULTI-HOT** (130 keys/row, 576 B), batch 55,296 | **4.10 M samples/sec, 100 iters stable** | **apples-to-apples NVIDIA B200 config** |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, single-hot, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters stable | (single-hot is ~5× less embedding work than NVIDIA's multi-hot) |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, single-hot, batch 55,296, HIP graph, no overlap | 6.09 M samples/sec, 100 iters | |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, single-hot, batch 55,296, no HIP graph | 5.85 M samples/sec, 100 iters | |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 16,384 | 5.27 M samples/sec, 30+ iters | loss 0.366 → 0.257 |
 | 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | 3.89-6.59 M samples/sec | exact NVIDIA MLPerf model graph |
 | 8 × MI350X, FP16 mixed, real DCN-v2 (3 layer), batch 4096 | 1.90 M samples/sec, 100+ iters | loss 0.277 → 0.225 |
-| 8 × MI350X, FP16 mixed, InnerProduct-substitute interaction | 12.29 M samples/sec | substitute for cross net |
+| 1 × MI350X, FP16 mixed, real DCN-v2 + Layer_t.MLP fused MLP, batch 8192 | 0.24 M samples/sec, loss 3.23 → 0.245 | new DRELU_BGRAD fallback works at 1 GPU; multi-GPU collapses (correctness bug) |
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
 
 NVIDIA's published B200 reference (8 GPU, FP16, full multi-hot Criteo,
 fused MLP, HIP graph): ~30 M samples/sec end-to-end (2.3 min to AUC
-0.80275). Our run uses the same global batch 55,296 / per-GPU 6,912 /
-LR 0.004 / scaler 16,348 / Adagrad / sharding=auto config and now also
-HIP graph + intra/inter overlap; we still differ in the dense MLP
-(unfused vs fused) and the dataset (single-hot subsample vs full multi-hot).
-Restoring those would close most of the remaining ~4.8× gap.
+0.80275). With the multi-hot data path enabled (`HCTR_USE_MULTI_HOT=1`)
+we now use NVIDIA's exact data shape — 130 keys/row, 576 B/record,
+26 multi-hot slots — and get **4.10 M samples/sec apples-to-apples**.
 
-### Gap analysis: ours (6.26 M sps) vs NVIDIA (~30 M sps) ≈ 4.8×
+### Gap analysis: 4.10 M sps (apples-to-apples) vs ~30 M sps ≈ 7.3×
 
 Roughly attributable to:
 - **Unfused MLP** (Layer_t.MLP fused GEMM+ReLU+bias+RELU_AUX — we
-  substitute InnerProduct stack): ~1.3-1.5× headroom. Blocked on adding
-  DRELU_BGRAD (epilogue 152) emulation to the fallback. Try with
-  `HCTR_USE_FUSED_MLP=1` to see the exact error.
-- **Single-hot dataset vs multi-hot 130-index records**: ~1.3× headroom.
-  Just preprocessing work (run NVIDIA's
-  `materialize_synthetic_multihot_dataset.py` + `convert_to_raw.py`).
+  substitute InnerProduct stack): ~1.5-2× headroom. Implementation
+  in this branch (set `HCTR_USE_FUSED_MLP=1`) — emulates RELU_AUX /
+  DRELU / DRELU_BGRAD epilogues with cuBLASLt-format bit-packed mask.
+  Single-GPU works (loss 3.23 → 0.245); multi-GPU loss collapses to
+  log(2)·2, indicating a correctness bug in the bgrad kernel under
+  cross-rank gradient AllReduce. Investigation continues.
 - **No multi-node fabric scaling**: NVIDIA's 8 GPU result is on 2 nodes
   × 4 GPU with NVLink/NVSwitch fabric. Our 8 GPU are inside one node
   with xGMI. Probably a wash given the per-node-vs-cross-node tradeoff.
 - **Hardware difference**: B200 HBM3e + 5th-gen Tensor Cores vs MI350X
   HBM3 + MFMA — at this tensor-density compute the per-GPU peak FLOPs
-  are similar but B200 has higher HBM bandwidth. Probably ~1.2× of the
-  remaining headroom.
+  are similar but B200 has higher HBM bandwidth. Probably ~2-3× of the
+  remaining headroom (multi-hot is heavily embedding-bandwidth-bound).
+- **Real multi-hot Criteo vs synthetic expansion of day_0**: NVIDIA uses
+  the full 4.2 B-row Meta multi-hot dataset (mlperf reference), we
+  synthesise 21 M rows of multi-hot from our existing day_0 single-hot
+  via per-offset prime mixing (see
+  `runtime_test/criteo_npy_to_hugectr_bin_mh.py`). Same record format
+  (576 B), same slot cardinalities, same MULTI_HOT_SIZES — just much
+  less data and a less natural distribution.
 
 ### Status of the per-rank batch ≥ 2048 NaN (now FIXED)
 1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
@@ -172,6 +178,33 @@ docker run --rm --network=host \
 ```
 
 Switch to FP16 mixed by setting `HCTR_PRECISION_FLAGS="--use_mixed_precision --scaler 16348"`.
+
+### Run with NVIDIA's multi-hot data shape (apples-to-apples, 576 B/record)
+
+First synthesize multi-hot from your existing single-hot Criteo day_0 NumPy:
+
+```bash
+python3 runtime_test/criteo_npy_to_hugectr_bin_mh.py \
+    --npy-dir /path/to/criteo_npy \
+    --out-dir /path/to/criteo_hugectr_bin_mh \
+    --day day_0 --train-frac 0.95
+```
+
+This produces 21 M rows of 576-B multi-hot records (~20 GB) using NVIDIA's
+default `MULTI_HOT_SIZES = [3,2,1,2,6,...,1,1]` (sum=130 keys/row).
+
+Then add `-e HCTR_USE_MULTI_HOT=1` to the docker invocation above. The
+`run_b200_match.sh` script picks `/criteo/hugectr_bin_mh` automatically.
+
+### Run with the new fused MLP path (single-GPU only; multi-GPU has bug)
+
+Add `-e HCTR_USE_FUSED_MLP=1`. This switches all dense MLPs from the
+InnerProduct + ReLU stack back to NVIDIA's `Layer_t.MLP` and routes
+the RELU_AUX / DRELU / DRELU_BGRAD epilogues through our new fallback
+kernels in `HugeCTR/src/layers/functors/fused_gemm_functors.cu`.
+1 × MI350X works (loss 3.23 → 0.245 over 20 iters at batch 8192).
+8 × MI350X collapses to log(2)·2 — the bgrad gradient appears not to
+cross-rank reduce correctly under our DRELU mask emulation. Open work.
 
 ## Key ROCm port changes (vs upstream HugeCTR)
 
