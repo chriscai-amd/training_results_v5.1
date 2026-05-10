@@ -10,7 +10,9 @@ This is a research / port branch, **not an official MLPerf submission**.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), **batch 55,296 (NVIDIA B200 config)** | **5.85 M samples/sec, 100 iters stable** | **exact NVIDIA MLPerf B200 config**, loss 0.285 → 0.254 |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, batch 55,296, **HIP graph + intra/inter overlap on** | **6.26 M samples/sec, 100 iters stable** | **closest to NVIDIA's published B200 config** |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, batch 55,296, HIP graph on, no overlap | 6.09 M samples/sec, 100 iters | |
+| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, batch 55,296, no HIP graph | 5.85 M samples/sec, 100 iters | |
 | 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 16,384 | 5.27 M samples/sec, 30+ iters stable | loss 0.366 → 0.257 |
 | 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | 3.89-6.59 M samples/sec | exact NVIDIA MLPerf model graph |
 | 8 × MI350X, FP16 mixed, real DCN-v2 (3 layer), batch 4096 | 1.90 M samples/sec, 100+ iters | loss 0.277 → 0.225 |
@@ -18,16 +20,33 @@ This is a research / port branch, **not an official MLPerf submission**.
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
 
-NVIDIA's published B200 reference (8 GPU, FP16, full multi-hot Criteo, fused MLP, HIP graph capture, full convergence):
-~30 M samples/sec end-to-end (2.3 min to AUC 0.80275). Our run uses the same global batch 55,296 / per-GPU 6,912 / LR 0.004 / scaler 16,348 / Adagrad / sharding=auto config but with our subsampled day_0 dataset, no fused MLP, and no HIP graph capture; restoring those (see "Open work") would close most of the gap.
+NVIDIA's published B200 reference (8 GPU, FP16, full multi-hot Criteo,
+fused MLP, HIP graph): ~30 M samples/sec end-to-end (2.3 min to AUC
+0.80275). Our run uses the same global batch 55,296 / per-GPU 6,912 /
+LR 0.004 / scaler 16,348 / Adagrad / sharding=auto config and now also
+HIP graph + intra/inter overlap; we still differ in the dense MLP
+(unfused vs fused) and the dataset (single-hot subsample vs full multi-hot).
+Restoring those would close most of the remaining ~4.8× gap.
 
-NVIDIA B200 reference (8 GPU, FP16, full multi-hot Criteo, fused MLP, HIP graph):
-~30 M samples/sec end-to-end (2.3 min to AUC 0.80275).
+### Gap analysis: ours (6.26 M sps) vs NVIDIA (~30 M sps) ≈ 4.8×
 
-**Open: 8 × MI350X with FP16 + real MultiCross at per-rank batch ≥ 2048
-still NaNs after a few iters.** Bisection (2026-05-09) localised three
-contributing root causes; the first two have been fixed, the third is the
-remaining blocker for matching NVIDIA's full-batch (55,296) configuration:
+Roughly attributable to:
+- **Unfused MLP** (Layer_t.MLP fused GEMM+ReLU+bias+RELU_AUX — we
+  substitute InnerProduct stack): ~1.3-1.5× headroom. Blocked on adding
+  DRELU_BGRAD (epilogue 152) emulation to the fallback. Try with
+  `HCTR_USE_FUSED_MLP=1` to see the exact error.
+- **Single-hot dataset vs multi-hot 130-index records**: ~1.3× headroom.
+  Just preprocessing work (run NVIDIA's
+  `materialize_synthetic_multihot_dataset.py` + `convert_to_raw.py`).
+- **No multi-node fabric scaling**: NVIDIA's 8 GPU result is on 2 nodes
+  × 4 GPU with NVLink/NVSwitch fabric. Our 8 GPU are inside one node
+  with xGMI. Probably a wash given the per-node-vs-cross-node tradeoff.
+- **Hardware difference**: B200 HBM3e + 5th-gen Tensor Cores vs MI350X
+  HBM3 + MFMA — at this tensor-density compute the per-GPU peak FLOPs
+  are similar but B200 has higher HBM bandwidth. Probably ~1.2× of the
+  remaining headroom.
+
+### Status of the per-rank batch ≥ 2048 NaN (now FIXED)
 1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
    but AMD MI350X has wavefront size 64. This caused row-cross-contamination
    in MultiCross's bprop kernels (`matrix_pair_mul_kernel`,
