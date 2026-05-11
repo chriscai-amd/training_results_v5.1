@@ -107,11 +107,19 @@ Roughly attributable to (and what we are doing about each):
     compounded across ranks via Adagrad + NCCL all-reduce of dbias.
     Now correctness ✓ on 8 GPU multi-hot at NVIDIA's batch (loss
     0.285 → 0.264 over 100 iters, 4.61 M sps).
-  - **Why still slower than InnerProduct stack**: my emulation chains
-    `hipblasGemmEx` + 3 separate post-pass kernels per layer, adding
-    kernel-launch overhead that the InnerProduct path doesn't pay.
-    A real single-kernel fused GEMM+bias+ReLU+aux is needed to actually
-    *gain* perf — that's the next major work item.
+  - **Post-pass fusion (this branch)**: bias + ReLU + bit-packed mask
+    write are now fused into a single `fprop_bias_relu_aux_kernel` —
+    cuts one launch per FC fprop, +16 % throughput on the fused-MLP
+    path at the AMD sweet-spot batch (5.07 → 5.88 M sps).
+  - **Why still slower than InnerProduct stack** (5.88 vs 7.28 M sps
+    at sweet-spot batch): the launch-count math now favours fused-MLP
+    only marginally. The remaining gap is in bprop, where my
+    `bprop_drelu_kernel<true>` does a per-row column scan to compute
+    bgrad (stride-`m` reads, no vectorisation). InnerProduct's bprop
+    instead uses 3 well-tuned `hipblasGemmEx` calls (separate
+    bgrad-via-identity-vector, wgrad, dgrad) that hit hipBLASLt's
+    optimised paths. Closing the rest needs a real fused HIP/MFMA
+    bprop kernel that uses MFMA + LDS reductions for the bgrad sum.
 
 - **No multi-node fabric scaling**: NVIDIA's 8 GPU result is on 2 nodes
   × 4 GPU with NVLink/NVSwitch fabric. Our 8 GPU are inside one node
