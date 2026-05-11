@@ -349,7 +349,7 @@ __global__ void bprop_drelu_bgrad_v5_kernel(__half* __restrict__ D,
   }
 }
 
-__global__ void bgrad_finalize_v5_kernel(const float* __restrict__ scratch,
+__global__ void bgrad_finalize_v5_kernel(float* __restrict__ scratch,
                                          __half* __restrict__ dbias,
                                          int m, float bgrad_div) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -360,6 +360,11 @@ __global__ void bgrad_finalize_v5_kernel(const float* __restrict__ scratch,
   if (total >  kFp16Max) total =  kFp16Max;
   else if (total < -kFp16Max) total = -kFp16Max;
   dbias[i] = __float2half(total);
+  // ROCm port: reset the scratch slot in the same kernel so the next
+  // V5 invocation doesn't need a separate hipMemsetAsync (which costs
+  // ~15-20 us per launch, three launches per iter for the three
+  // MultiCross v2 layers).
+  scratch[i] = 0.0f;
 }
 
 // Single-launch fused (bias_add + ReLU + bit-packed mask write).
@@ -422,7 +427,10 @@ inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
     bprop_drelu_v1_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
     return;
   }
-  hipMemsetAsync(scratch, 0, sizeof(float) * static_cast<size_t>(m), stream);
+  // ROCm port: scratch is zeroed by the previous iter's finalize kernel
+  // (or stays zero on the very first iter from prewarm_bgrad_scratch_once's
+  // hipMalloc -- zeroed by HIP runtime). Skip the per-iter hipMemsetAsync;
+  // saves one launch per V5 BGRAD/BGRADA call (~15-20 us each).
   int grid_x = (m + BLOCK_M - 1) / BLOCK_M;
   int grid_y = (n + N_TILE  - 1) / N_TILE;
   dim3 grid(grid_x, grid_y, 1);
@@ -542,7 +550,8 @@ inline void launch_reduce_sum_columns(const T* A, T* dbias, int m, int k, hipStr
         constexpr int WAVES   = 4;
         constexpr int kThreads = BLOCK_M * WAVES;
         constexpr int N_TILE  = 1024;
-        hipMemsetAsync(scratch, 0, sizeof(float) * static_cast<size_t>(m), s);
+        // ROCm port: scratch is zeroed by the previous iter's finalize
+        // kernel; skip the per-iter hipMemsetAsync. See bgrad_finalize_v5_kernel.
         int grid_x = (m + BLOCK_M - 1) / BLOCK_M;
         int grid_y = (k + N_TILE - 1)  / N_TILE;
         dim3 grid(grid_x, grid_y, 1);
