@@ -629,9 +629,16 @@ Ruled out by direct measurement
                                                        branch — non-perf path)
   ├── NCCL plugin path                               (RDMA Plugin v9 + SHARP CollNet v9 loaded
                                                        at runtime; identical to upstream image)
-  └── NCCL algorithm selection at runtime            (`NCCL_DEBUG=TUNING` confirms NVLS proto
+  ├── NCCL algorithm selection at runtime            (`NCCL_DEBUG=TUNING` confirms NVLS proto
                                                        SIMPLE on 32 channels for the 30 MB
                                                        AllReduce; max parallelism, no fallback)
+  └── NCCL version regression                        (side-loaded 2.25.1 / 2.29.7 / 2.30.4
+                                                       from NVIDIA's CUDA apt repo into the
+                                                       container — all three measure within
+                                                       ±10 µs at steady-state, including the
+                                                       2.29.7 Blackwell tuning and the
+                                                       2.29+ "CE collectives + CUDA graphs"
+                                                       hang/perf fix)
 
 Remaining candidate (un-disproven)
   └── system-level scheduling / single-iter latency
@@ -642,10 +649,12 @@ Remaining candidate (un-disproven)
        ├── NCCL & plugin stack: identical inside the container
        │   (NCCL 2.25.1+cuda12.8, RDMA Plugin v9, SHARP CollNet v9,
        │    NVLS multicast on 32 channels, GDR=1; AllReduce 30 MB runs
-       │    on NVLS proto SIMPLE — exactly what reference would). The
-       │    bus-bw we measure (alltoall 214 GB/s @8.6 MB, all_reduce
-       │    390 GB/s @40 MB) is mid-range B200 NVLink, ~38 % of
-       │    theoretical peak.
+       │    on NVLS proto SIMPLE — exactly what reference would). Also
+       │    tested side-loading NCCL 2.29.7-1+cuda12.9 (Blackwell tuning,
+       │    "CE collectives + cudaGraph" fix) and 2.30.4-1+cuda12.9
+       │    (latest) — both flat. The bus-bw we measure (alltoall
+       │    214 GB/s @8.6 MB, all_reduce 390 GB/s @40 MB) is mid-range
+       │    B200 NVLink, ~38 % of theoretical peak.
        │
        ├── Host CPU & launch latency: reference is dual Intel Xeon 6960P
        │   on a bare-metal G894-AD1 chassis; ours is a single AMD EPYC
