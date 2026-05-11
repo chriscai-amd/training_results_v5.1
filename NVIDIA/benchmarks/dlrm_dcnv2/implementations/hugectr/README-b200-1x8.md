@@ -80,28 +80,73 @@ on any reservation node that doesn't already have the image.
 
 ## 4. Dataset prep
 
-The Criteo 1 TB Click Logs dataset (the input for MLPerf DLRM-DCNv2) is now
-**only available via the Hugging Face mirror**:
-<https://huggingface.co/datasets/criteo/CriteoClickLogs>. Criteo's official
-[ailab.criteo.com](https://ailab.criteo.com/download-criteo-1tb-click-logs-dataset/)
-download page redirects to this same HF dataset. Older mirrors
-(`storage.googleapis.com/criteo-cail-datasets/`,
-`azuremlsampleexperiments.blob.core.windows.net/criteo/`) all return 404 as
-of mid-2026.
+### 4.1 Recommended: MLCommons R2 pre-processed corpus (full 4.2 B rows)
 
-Note that the HF mirror is **not** the corpus the MLPerf v5.1 submitters
-trained on. Their published `result_*.txt` logs report
-`train_samples = 4,195,197,692` (4.2 B rows). After running the full
-pipeline below on the HF mirror you'll get **473 M training rows**, i.e.
-~11 % of the MLPerf reference corpus. The "1 TB" branding is historical;
-the public dataset has been pre-subsampled by Criteo at some point. There is
-no public path to the larger 4.2 B-row corpus today — submitters apparently
-have it from before the pre-subsample (see Section 8 for a perf-impact
-analysis).
+MLCommons publishes the **exact pre-processed dataset that MLPerf
+submitters used** on a public Cloudflare R2 bucket
+(<https://training.mlcommons-storage.org/>), in two formats:
 
-If using the HF mirror, note that `day_0.gz` and `day_1.gz` were deleted from
-`main` on 2026-01-15. The LFS objects are still reachable via the
-pre-deletion commit:
+| `.uri`                                                       | What you get                                                                 | Total |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------------- | ----: |
+| `dlrmv2-preprocessed-criteo-click-logs.uri`                  | **HugeCTR `.bin`** (`train_data.bin`, `val_data.bin`, `test_data.bin`) — drop-in for `train.py` | ~4.0 TB |
+| `dlrmv2-preprocessed-criteo-click-logs-reference.uri`        | torchrec reference (24 × `day_N_dense.npy`, `day_N_labels.npy`, `day_N_sparse_multi_hot.npz`) | ~4.0 TB |
+
+For HugeCTR we only need the first one. No preprocessing of any kind is
+required after the download — the file format is exactly what `train.py`
+consumes, and the MD5s in the bucket's `.md5` manifest match the values
+the upstream `NVIDIA/.../README.md` says to expect (e.g. `val_data.bin`
+MD5 = `c7ca591ad3fd2b09b75d99fa4fc210e2`, identical to NVIDIA's
+reference).
+
+Download with MLCommons' provided helper script (resumable, parallel-ish
+wget with auto MD5 verification at the end):
+
+```bash
+mkdir -p $DATA_ROOT/criteo_1tb_multihot_raw_full
+bash <(curl -s https://raw.githubusercontent.com/mlcommons/r2-downloader/refs/heads/main/mlc-r2-downloader.sh) \
+    -d $DATA_ROOT/criteo_1tb_multihot_raw_full \
+    https://training.mlcommons-storage.org/metadata/dlrmv2-preprocessed-criteo-click-logs.uri
+```
+
+Final layout:
+
+```
+$DATA_ROOT/criteo_1tb_multihot_raw_full/train_data.bin   3.83 TB   (4,195,197,692 rows)
+$DATA_ROOT/criteo_1tb_multihot_raw_full/val_data.bin       81 GB   (   89,137,318 rows)
+$DATA_ROOT/criteo_1tb_multihot_raw_full/test_data.bin      81 GB   (   89,137,318 rows)
+$DATA_ROOT/criteo_1tb_multihot_raw_full/{LICENSE,NOTICE}.txt
+$DATA_ROOT/criteo_1tb_multihot_raw_full/dlrmv2-preprocessed-criteo-click-logs.md5
+```
+
+Each row is **912 B**: 1 × int32 label (4 B) + 13 × float32 dense (52 B)
++ 214 × int32 sparse (856 B), where 214 = `sum(MULTI_HOT_SIZES)`.
+(HugeCTR's internal docs say "~576 B" but that's the one-hot variant;
+the multi-hot variant we use has 214 sparse columns per row.)
+
+Observed throughput from the cluster login node: ~50–80 MB/s
+single-stream → expect ~14–22 h wall for the 3.83 TB train file. The
+download is resumable: re-running the same command continues from the
+last `wget --continue` point if the previous run was interrupted, and
+the script's final MD5 pass will only flag files that don't fully match.
+
+Storage requirement: 4.0 TB free under `$DATA_ROOT`.
+
+### 4.2 Fallback: build from the HuggingFace subsample (473 M rows, partial corpus)
+
+If you don't have ~4 TB of disk and just want to validate the training
+loop end-to-end, the HuggingFace mirror at
+<https://huggingface.co/datasets/criteo/CriteoClickLogs> still works —
+but it's a **pre-subsampled 11 %** of the MLPerf reference corpus, so
+steady-state throughput will land at ~13.6 M samples/s instead of ~23 M
+(section 7.5 details why; the access-pattern distribution is the same,
+the row count isn't).
+
+Skip this section entirely if you used 4.1.
+
+The HF mirror has two quirks: `day_0.gz` and `day_1.gz` were deleted
+from `main` on 2026-01-15 (LFS objects still reachable via a
+pre-deletion commit), and all `day_N.gz` files have truncated gzip
+trailers so `gzip -t` fails. Workaround:
 
 ```python
 import os
@@ -117,15 +162,10 @@ for f in ("day_0.gz", "day_1.gz"):
         "criteo/CriteoClickLogs", filename=f, repo_type="dataset",
         revision=PRE_DELETE, local_dir=TARGET,
     )
-```
 
-The HF mirror's gzip streams are missing the trailer (`gzip -t` fails). Decompress
-with `gzip -dc` (which still emits all the data) and trim the partial last
-line of each `day_N` file:
-
-```python
-import os
-RAW = os.path.join(os.environ["DATA_ROOT"], "criteo_1tb_raw_input_dataset_dir")
+# Decompress with gzip -dc (emits all data even with bad trailer) and
+# trim the partial last line of each day_N
+RAW = TARGET
 for i in range(24):
     f = os.path.join(RAW, f"day_{i}")
     sz = os.path.getsize(f)
@@ -137,9 +177,9 @@ for i in range(24):
         os.truncate(f, sz - len(tail) + last_nl + 1)
 ```
 
-Then run the standard MLPerf pipeline inside the docker image (same image as
-training; Step 4-5 don't need HugeCTR but the container has all required
-deps):
+Then run the standard MLPerf preprocessing pipeline inside the docker
+image (same image as training; Steps 4–5 don't need HugeCTR but the
+container has all required deps):
 
 ```bash
 # Step 1-3 (TSV → npy → contiguous → shuffle)
@@ -179,11 +219,6 @@ $DATA_ROOT/criteo_1tb_multihot_raw/test_data.bin    =   0 B    (LAST_DAY_TEST_VA
                                                                 so the test slice is empty)
 ```
 
-Each row is **912 B**: 1 × int32 label (4 B) + 13 × float32 dense (52 B) +
-214 × int32 sparse (856 B), where 214 = `sum(MULTI_HOT_SIZES)`. (HugeCTR's
-internal docs say "~576 B" but that's the one-hot variant; the multi-hot
-variant we use has 214 sparse columns per row.)
-
 Total prep took ~3.5 h on a 1 × 8 B200 + EPYC + 1 TB+ RAM node:
 
 ```
@@ -216,8 +251,8 @@ env DLRM_BIND="numactl --interleave=0,1" \
     --config config_b200_1x8_round_robin.sh \
     --image mlperf-nvidia:recommendation-hugectr \
     --image-tar $DATA_ROOT/docker_images/mlperf-nvidia-recommendation-hugectr.tar.zst \
-    --train-data $DATA_ROOT/criteo_1tb_multihot_raw/train_data.bin \
-    --val-data   $DATA_ROOT/criteo_1tb_multihot_raw/val_data.bin \
+    --train-data $DATA_ROOT/criteo_1tb_multihot_raw_full/train_data.bin \
+    --val-data   $DATA_ROOT/criteo_1tb_multihot_raw_full/val_data.bin \
     --logdir     $DATA_ROOT/criteo_synth/results \
     --time       01:00:00
 ```
@@ -252,7 +287,13 @@ captures a 5 s window starting 30 s after process spawn (covers init through
 | `mem/comm bw ratio` | 9 |
 | `MAX_ITER` | 100 (perf only — remove for time-to-AUC convergence) |
 
-## 7. Performance results (1 × 8 B200, HF mirror)
+## 7. Performance results (1 × 8 B200, HF subsample corpus)
+
+> The numbers below were measured on the 473 M-row HuggingFace subsample
+> (section 4.2). Numbers on the full 4.2 B-row MLCommons R2 corpus
+> (section 4.1) are expected to track the published ~23 M samples/s
+> reference — section 8 explains the corpus-volume mechanism. Refresh
+> these tables once the full-corpus download completes.
 
 ### 7.1 Throughput
 
@@ -543,14 +584,18 @@ Remaining cause
        │     - that ~24× difference in hot-item reuse is consistent with the
        │       observed 1.94 × throughput gap
        │
-       └── only fix: get the full 4.2 B-row Criteo corpus
-             - not on any public mirror (verified 8 known endpoints + Wayback)
-             - need direct contact with Criteo AI Lab / NVIDIA partner support
+       └── fix: download the full 4.2 B-row pre-processed corpus
+             from the MLCommons R2 distribution (section 4.1).
+             Drop-in for our `train.py` — no preprocessing needed.
+             Expected post-fix throughput: ~23 M samples/s (matches
+             GigaComputing 5.1-0040).
 ```
 
-Of these, only the corpus-volume cause is fixable, and only via out-of-band
-data access. Switching from the HF mirror to the full Criteo would close
-the gap; nothing in this repository will.
+Of these, only the corpus-volume cause is fixable, but it _is_ fixable:
+section 4.1 above documents the MLCommons R2 path to the same
+`{train,val,test}_data.bin` files MLPerf submitters used (MD5s match the
+NVIDIA reference). Switching from the HF mirror to that corpus is
+expected to close the gap; nothing else in this repository will.
 
 ## 9. Profiling / debugging notes
 
