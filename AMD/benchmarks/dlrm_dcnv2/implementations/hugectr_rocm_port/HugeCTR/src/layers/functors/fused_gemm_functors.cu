@@ -422,9 +422,74 @@ inline void launch_add_bias_per_row(T* D, const T* bias, int m, int n, hipStream
   add_bias_per_row_kernel<T><<<grid, block, 0, s>>>(D, bias, m, n);
 }
 
+// V5-style BGRADA kernel: 2D tile (BLOCK_M=64 rows x N_TILE=1024 cols/block).
+// Lane in wave = row in stripe -> coalesced 128-byte loads of A[i + j*m].
+// Per-wave partial sums combined in shared mem, then atomicAdd into the
+// per-device pre-allocated FP32 scratch buffer. Finalize kernel divides
+// (FP16 ncclSum headroom) + clamps + casts to FP16 dbias.
+template <int BLOCK_M, int WAVES_PER_BLOCK>
+__global__ void bgrada_v5_kernel(const __half* __restrict__ A,
+                                 float* __restrict__ scratch_fp32,
+                                 int m, int k, int n_tile) {
+  int wave_id = threadIdx.x / BLOCK_M;
+  int lane    = threadIdx.x % BLOCK_M;
+  int i = blockIdx.x * BLOCK_M + lane;
+  if (i >= m) return;
+
+  int j_block_start = blockIdx.y * n_tile;
+  int j_block_end   = j_block_start + n_tile;
+  if (j_block_end > k) j_block_end = k;
+  int span = (j_block_end - j_block_start + WAVES_PER_BLOCK - 1) / WAVES_PER_BLOCK;
+  int j_start = j_block_start + wave_id * span;
+  int j_end   = j_start + span;
+  if (j_end > j_block_end) j_end = j_block_end;
+
+  float sum = 0.0f;
+  for (int j = j_start; j < j_end; ++j) {
+    sum += __half2float(A[static_cast<size_t>(i) + static_cast<size_t>(j) * m]);
+  }
+  __shared__ float wave_sums[WAVES_PER_BLOCK][BLOCK_M];
+  wave_sums[wave_id][lane] = sum;
+  __syncthreads();
+  if (wave_id == 0) {
+    float total = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < WAVES_PER_BLOCK; ++w) total += wave_sums[w][lane];
+    atomicAdd(&scratch_fp32[i], total);
+  }
+}
+
 template <typename T>
 inline void launch_reduce_sum_columns(const T* A, T* dbias, int m, int k, hipStream_t s) {
   if (m == 0 || dbias == nullptr) return;
+  // FP16 path: use V5-style 2D tile + scratch + finalize, same as the
+  // bprop_drelu_bgrad path. FP32 path keeps the legacy per-row kernel
+  // (FP32 doesn't have the FP16-overflow issue and the path is rare).
+  if constexpr (std::is_same<T, __half>::value) {
+    if (m <= kBgradScratchMaxM) {
+      float* scratch = get_bgrad_scratch_for_current_device();
+      if (scratch) {
+        constexpr int BLOCK_M = 64;
+        constexpr int WAVES   = 4;
+        constexpr int kThreads = BLOCK_M * WAVES;
+        constexpr int N_TILE  = 1024;
+        hipMemsetAsync(scratch, 0, sizeof(float) * static_cast<size_t>(m), s);
+        int grid_x = (m + BLOCK_M - 1) / BLOCK_M;
+        int grid_y = (k + N_TILE - 1)  / N_TILE;
+        dim3 grid(grid_x, grid_y, 1);
+        bgrada_v5_kernel<BLOCK_M, WAVES><<<grid, kThreads, 0, s>>>(
+            reinterpret_cast<const __half*>(A), scratch, m, k, N_TILE);
+        constexpr int kFinBlk = 256;
+        int fin_grid = (m + kFinBlk - 1) / kFinBlk;
+        // Reuse the V5 finalize kernel with the same 256.0f pre-divide as
+        // the legacy reduce_sum_columns_kernel for FP16 ncclSum headroom.
+        bgrad_finalize_v5_kernel<<<fin_grid, kFinBlk, 0, s>>>(
+            scratch, reinterpret_cast<__half*>(dbias), m, 256.0f);
+        return;
+      }
+    }
+  }
+  // Legacy fallback: per-row scan.
   dim3 block(256, 1, 1);
   dim3 grid((m + 255) / 256, 1, 1);
   reduce_sum_columns_kernel<T><<<grid, block, 0, s>>>(A, dbias, m, k);
