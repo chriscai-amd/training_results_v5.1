@@ -165,72 +165,56 @@ and the tail of the embedding-id distribution. AUC convergence to
 NVIDIA's 0.80275 target requires the full data pipeline; our smoke
 target `HCTR_AUC_THRESHOLD=0.99` is intentionally never crossed.
 
-### Gap analysis: 5.26 M sps (apples-to-apples) vs ~30 M sps ≈ 5.7×
+### Per-component fix history (in commit order)
 
-Roughly attributable to (and what we are doing about each):
+The headline 12.55 / 16.89 M sps came from a sequence of independent
+fixes, not one big rewrite. In the order they landed:
 
-- **Unfused MLP** (`Layer_t.MLP` — GEMM+ReLU+bias+RELU_AUX fused in
-  hipBLASLt's epilogue on NVIDIA hardware; on `gfx950` hipBLASLt 1.2
-  has no heuristic for the relevant epilogues, so we substituted an
-  InnerProduct+ReLU stack). Headroom: **~1.5-2×** when we land a
-  real fused HIP kernel.
-  - **Implementation status**: full RELU_AUX / DRELU / DRELU_BGRAD
-    epilogue emulation with cuBLASLt-format bit-packed masks now ships
-    in `fused_gemm_functors.cu`. Set `HCTR_USE_FUSED_MLP=1` to enable.
-  - **Correctness fix (2026-05-10)**: BIAS post-pass was previously
-    gated on `act == None && bias != null`, which dropped the bias
-    term in *every hidden ReLU layer* of the bottom+top MLPs. Single-GPU
-    happened to converge (next layer's weights absorbed the drift);
-    multi-GPU collapsed to `log(2)·2` once the missing-bias drift
-    compounded across ranks via Adagrad + NCCL all-reduce of dbias.
-    Now correctness ✓ on 8 GPU multi-hot at NVIDIA's batch (loss
-    0.285 → 0.264 over 100 iters, 4.61 M sps).
-  - **Post-pass fusion (this branch)**: bias + ReLU + bit-packed mask
-    write are now fused into a single `fprop_bias_relu_aux_kernel` —
-    cuts one launch per FC fprop, +16 % throughput on the fused-MLP
-    path at the AMD sweet-spot batch (5.07 → 5.88 M sps).
-  - **V5 2D-tile kernels for both bgrad post-passes (this branch)**:
-    The legacy `bprop_drelu_kernel` (V1) launched one block per output
-    row + cooperative 256-thread column scan (uncoalesced reads); the
-    legacy `reduce_sum_columns_kernel` (BGRADA) launched one thread per
-    output row total -> ~1% CU util at m=128. Both are now superseded
-    by V5 kernels: 2D tile (BLOCK_M=64 rows × N_TILE=1024 cols/block)
-    with WAVES_PER_BLOCK=4 -> 256 threads/block, lane-in-wave = row in
-    stripe -> 128-byte coalesced reads. Per-block partial sums via
-    shared mem then atomicAdd into a per-device pre-allocated FP32
-    scratch buffer (allocated once via std::call_once before HIP graph
-    capture begins, so per-iter launch path stays graph-safe). Final
-    small kernel divides + clamps + casts to FP16. Net win on full
-    Criteo at batch 110,592: 5.88 → 6.02 M sps (+2%) on top of the
-    post-pass fusion.
-  - **Why still slower than InnerProduct stack** (5.88 vs 7.28 M sps
-    at sweet-spot batch): the launch-count math now favours fused-MLP
-    only marginally. The remaining gap is in bprop, where my
-    `bprop_drelu_kernel<true>` does a per-row column scan to compute
-    bgrad (stride-`m` reads, no vectorisation). InnerProduct's bprop
-    instead uses 3 well-tuned `hipblasGemmEx` calls (separate
-    bgrad-via-identity-vector, wgrad, dgrad) that hit hipBLASLt's
-    optimised paths. Closing the rest needs a real fused HIP/MFMA
-    bprop kernel that uses MFMA + LDS reductions for the bgrad sum.
+1. **Multi-GPU correctness — missing BIAS in `RELU_AUX_BIAS` fprop
+   fallback** (commit before `0d9a35e`). Was gated on
+   `act == None && bias != null`, dropping bias on every hidden ReLU
+   layer of both MLPs. Single-GPU absorbed the drift into the next
+   layer's first-row weights; multi-GPU compounded it to `log(2)·2`
+   via Adagrad + NCCL `dbias` all-reduce. Now triggers on `bias != null`
+   regardless of activation.
+2. **V5 2D-tile `bprop_drelu_bgrad_v5_kernel`** (commit `56bc046`).
+   Replaces the legacy V1 (one block per row + cooperative 256-thread
+   column scan, uncoalesced reads) with a 2D-tile (BLOCK_M=64 rows ×
+   N_TILE=1024 cols/block), wave-coalesced reads, atomicAdd into
+   per-device pre-allocated FP32 scratch, finalize kernel divides +
+   clamps + casts to FP16. Pre-warmed via `std::call_once` so HIP
+   graph capture sees the alloc done.
+3. **V5 2D-tile BGRADA `bgrada_v5_kernel`** for the wgrad bias-grad
+   column-sum (commit `63a9c54`). Same design, applied to
+   `launch_reduce_sum_columns`.
+4. **Discovered V5 was never engaged in benchmarks** (commit `4fc896a`).
+   The build I'd been benchmarking against was stale — the V5 kernels
+   were in the binary but the routing path wasn't. Once a clean rebuild
+   engaged V5, per-iter dropped from ~16 ms to ~5 ms at the sweet-spot
+   batch and from ~9.7 ms to ~5 ms at NVIDIA's batch. Verified by a
+   one-shot diag print
+   (`[HCTR-V5] launch_reduce_sum_columns first call: ... path=V5`).
+5. **Folded FP16 NaN/inf clamp into `vector_fma{3,4}_align8`**
+   (commit `93aad5c`). Was a separate `clamp_fp16_kernel` running 3×
+   per iter after every cross layer's
+   `fused_matrix_elementwise_dot_add`. New `__device__ sanitize_half2_fp16`
+   helper does NaN/inf → 0, |v| > 65504 → ±65504 inline at the FMA
+   store boundary — same memory access, free ALU.
+6. **Re-enabled intra/inter-iteration overlap** (commit `68e560e`).
+   `train.py` defaults `HCTR_INTRA_OVERLAP=1` and `HCTR_INTER_OVERLAP=1`
+   already; earlier benchmark scripts were explicitly setting them to 0
+   because an early sweep on day_0-only data showed slight regression.
+   With V5 + clamp-fold + full Criteo, overlap-on is +8.5 % at
+   NVIDIA's batch.
 
-- **No multi-node fabric scaling**: NVIDIA's 8 GPU result is on 2 nodes
-  × 4 GPU with NVLink/NVSwitch fabric. Our 8 GPU are inside one node
-  with xGMI. Probably a wash given the per-node-vs-cross-node tradeoff.
-
-- **Hardware difference**: B200 HBM3e + 5th-gen Tensor Cores vs MI350X
-  HBM3 + MFMA — at this tensor-density compute the per-GPU peak FLOPs
-  are similar but B200 has higher HBM bandwidth. Probably ~2-3× of the
-  remaining headroom (multi-hot is heavily embedding-bandwidth-bound).
-  Not addressable in software.
-
-- **Subsampled vs full Criteo**: HuggingFace's `criteo/CriteoClickLogs`
-  is subsampled to ~1.6 GB/day (vs ~80 GB/day raw upstream); we have
-  482 M total rows vs NVIDIA's ~4.2 B (8.7× less). Throughput is
-  *not* directly affected by row count, but the smaller working set
-  fits HBM caches better — day_0-only runs at ~6.73 M sps vs the full
-  482 M-row 5.26 M sps for the same per-iter shape. Closing this gap
-  requires the original (non-subsampled) Criteo dataset, which is not
-  publicly distributable.
+The fused `Layer_t.MLP` path (`HCTR_USE_FUSED_MLP=1`) is functional
+on multi-GPU but **slower than the InnerProduct stack** (4.83 vs
+12.55 M sps at NVIDIA's batch). The fallback chains
+`hipblasGemmEx` + 1 fused post-pass + `bprop_drelu_bgrad_v5` per FC
+layer — total 5 launches/layer vs InnerProduct's 4. Closing this
+gap needs a real single-kernel HIP/MFMA fused GEMM kernel that
+bundles GEMM + bias + ReLU + aux-write into one launch (3-5 days
+of CUTLASS-AMD work).
 
 ### Closing the remaining 7.5 % at NVIDIA's batch — actionable items
 
@@ -470,35 +454,60 @@ The full diff lives in `HugeCTR/` and `gpu_cache/`. The major themes:
    in `CublasDesc` and routes to `hipblasGemmEx` (FP32 accumulation) plus
    manual `BIAS` (per-row add) and `BGRADA` (column sum) post-pass kernels.
 
-4. **MLP layers** are kept as `InnerProduct + ReLU` stacks (not the fused
-   `Layer_t.MLP`), because hipBLASLt 1.2 lacks heuristic candidates for the
-   fused MLP's RELU_AUX epilogue at our shapes. ~1.3-1.5× perf left on the
-   table; restoring fused MLP is on the TODO list.
+4. **MLP layers** default to `InnerProduct + ReLU` stacks (not the fused
+   `Layer_t.MLP`) because hipBLASLt 1.2 lacks heuristic candidates for the
+   fused MLP's `RELU_AUX_BIAS` / `DRELU_BGRAD` epilogues at our shapes.
+   `Layer_t.MLP` works (correctness restored after the BIAS-fix in
+   commit `0d9a35e`'s set_fprop_attr) but is currently slower than the
+   InnerProduct path (4.83 vs 12.55 M sps at NVIDIA's batch). Closing
+   this needs a real fused HIP/MFMA single-kernel GEMM.
 
-5. **HIP graph capture and intra/inter-iter overlap disabled** in the solver
-   (env-driven via `HCTR_USE_CUDA_GRAPH`). Re-enabling these is safe once
-   item 4 lands and removes the last hipBLASLt fallback path from the hot
-   loop.
+5. **HIP graph capture and intra/inter-iter overlap re-enabled by default**
+   in the solver. Earlier benchmarks were explicitly disabling overlap
+   via `HCTR_INTRA_OVERLAP=0 HCTR_INTER_OVERLAP=0`, regression from an
+   early day_0-only sweep; with V5 + clamp-fold + full-Criteo, overlap-on
+   is now a +8.5 % win.
+
+6. **V5 2D-tile post-pass kernels** (commits `56bc046` + `63a9c54`) for
+   `bprop_drelu_bgrad` and `reduce_sum_columns` (BGRADA). Replace V1's
+   one-block-per-row + 256-thread cooperative scan (uncoalesced) with
+   a 2D tile of (BLOCK_M=64 rows × N_TILE=1024 cols/block), wave-aligned
+   coalesced reads, atomicAdd into per-device pre-allocated FP32 scratch,
+   finalize kernel divides + clamps + casts. Pre-warmed via std::call_once
+   so HIP graph capture sees the alloc done. Was 49 % of single-GPU GPU
+   time before V5 was actually engaged; sub-1 % after.
+
+7. **FP16 NaN/inf clamp folded into `vector_fma{3,4}_align8`** (commit
+   `93aad5c`). New `__device__ sanitize_half2_fp16` helper inlined at the
+   FMA store boundary. Eliminates one launch + memory pass per cross
+   layer per iter (was 7.45 ms over 60 iters in the rocprof trace).
 
 ## Open work
 
-- **FP16 + multi-GPU + real MultiCross v2** NaN — currently contained by
-  the `clamp_fp16_kernel` post-pass after each cross layer; root cause
-  (single bad element appearing inside the MultiCross fp16 math chain
-  at per-rank batch ≥ 2048) still wants a proper fix. FP32 multi-GPU and
-  FP16 single-GPU both converge without the clamp.
-- **Validate the post-fix fused MLP run** end-to-end on 8 × MI350X with
-  `HCTR_USE_FUSED_MLP=1 HCTR_USE_MULTI_HOT=1` and update the perf table.
-- **Real multi-hot Criteo data path** — preprocessing tools work on the
-  single-hot day_0 only; need to run the full
-  `materialize_synthetic_multihot_dataset.py` + `convert_to_raw.py` for the
-  4 TB MLPerf-spec dataset (throughput-neutral, but unblocks AUC≥0.80275).
-- **BF16 path** — would need `enable_bf16_compute` flag + `hip_bfloat16`
-  template instantiations across `HugeCTR/src/layers/`.
+- **`add_bias_per_row_kernel` → V5 2D-tile design** — quick win (~1 %),
+  ~30 min effort. Trace shows 0.08 ms/call × 3 calls/iter.
+- **Consolidate `__amd_rocclr_fillBufferAligned` calls** — ~36 per iter
+  in the captured graph (mostly HugeCTR-internal scratch zeroing).
+  Pre-zeroing a global scratch arena would save 0.05–0.10 ms/iter.
+- **Multi-GPU rocprof trace** — `rocprof` and `rocprofv3` both hang on
+  multi-GPU in our ROCm 7.2 / docker setup. Need to switch to Omnitrace
+  or a kernel-only filter for an apples-to-apples kernel breakdown vs
+  NVIDIA's published B200 profile.
+- **Real single-kernel HIP/MFMA fused MLP GEMM** — would restore the
+  fused `Layer_t.MLP` path to a perf win and close the
+  `hipblasGemmEx` vs `cutlass_s128x256_bgrada` gap. ~3–5 days of
+  CUTLASS-AMD work.
+- **Root-cause the FP16 NaN source in MultiCross** so we can drop the
+  inline `sanitize_half2_fp16` (currently always on; see commit
+  `93aad5c`). Worth ~3 % when removable.
+- **BF16 path** — NVIDIA submission uses BF16 mixed (vs our FP16).
+  Would need `enable_bf16_compute` flag + `hip_bfloat16` template
+  instantiations across `HugeCTR/src/layers/`. Removes the loss-scaler
+  stalls; possibly worth 1–2 %.
 - **Multi-node** (RDMA `NetworkExchangeWgrad`) — currently single-node only.
-- **hipBLASLt 1.3+ retest** — when the heuristic exposes candidates for
+- **hipBLASLt 7.3+ retest** — when the heuristic exposes candidates for
   `RELU_AUX_BIAS` / `DRELU_BGRAD` at our shapes, we can drop the manual
-  fallback and reclaim the last 1.1-1.3× from vendor-tuned MFMA kernels.
+  fallback and reclaim 1.1–1.3× from vendor-tuned MFMA kernels.
 
 ## Vendored upstream content
 
