@@ -15,12 +15,23 @@ pip install --quiet mpi4py mlperf-logging 2>&1 | tail -3 || true
 export LD_LIBRARY_PATH=/opt/rocm/lib:/workspace/hugectr_hip/build_rocm72/lib
 export PYTHONPATH=/workspace/hugectr_hip/build_rocm72/lib:${PYTHONPATH:-}
 
-# Match B200 reference dataset shape (table sizes), but keep single-hot
-# because our preprocessed day_0 binary is single-hot per slot.
+# Match B200 reference dataset shape (table sizes). Pick single-hot vs
+# synthetic multi-hot (sum=130 keys, 576 B/row) based on HCTR_USE_MULTI_HOT.
+# The two binaries live at fixed mount points -- /criteo/hugectr_bin (single-hot,
+# 160 B/row) or /criteo/hugectr_bin_mh (multi-hot, 576 B/row, B200-apples-to-apples).
 export HCTR_USE_SUBSAMPLED_CRITEO=1
 export HCTR_USE_REAL_TABLE_SIZES=1
-export HCTR_TRAIN_NUM_SAMPLES=$(stat -c %s /criteo/hugectr_bin/train_data.bin | awk '{print int($1/160)}')
-export HCTR_EVAL_NUM_SAMPLES=$(stat -c %s  /criteo/hugectr_bin/val_data.bin   | awk '{print int($1/160)}')
+if [ "${HCTR_USE_MULTI_HOT:-0}" = "1" ]; then
+    DATA_DIR=/criteo/hugectr_bin_mh
+    BYTES_PER_ROW=576
+    echo "[ok] data shape = MULTI-HOT (130 keys/row, 576 B/row)"
+else
+    DATA_DIR=/criteo/hugectr_bin
+    BYTES_PER_ROW=160
+    echo "[ok] data shape = SINGLE-HOT (26 keys/row, 160 B/row)"
+fi
+export HCTR_TRAIN_NUM_SAMPLES=$(stat -c %s "$DATA_DIR/train_data.bin" | awk -v b=$BYTES_PER_ROW '{print int($1/b)}')
+export HCTR_EVAL_NUM_SAMPLES=$(stat  -c %s "$DATA_DIR/val_data.bin"   | awk -v b=$BYTES_PER_ROW '{print int($1/b)}')
 export HCTR_AUC_THRESHOLD=0.99
 echo "[ok] TRAIN_NUM_SAMPLES=$HCTR_TRAIN_NUM_SAMPLES  EVAL_NUM_SAMPLES=$HCTR_EVAL_NUM_SAMPLES"
 
@@ -52,8 +63,8 @@ python3 train.py \
     --display_interval "$DISPLAY" \
     --eval_interval 999999 \
     --num_gpus_per_node "$NGPU" \
-    --train_data /criteo/hugectr_bin/train_data.bin \
-    --val_data   /criteo/hugectr_bin/val_data.bin \
+    --train_data "$DATA_DIR/train_data.bin" \
+    --val_data   "$DATA_DIR/val_data.bin" \
     --sharding_plan "${HCTR_SHARDING_PLAN:-auto}" \
     --mem_comm_work_ratio 9 \
     --dp_sharding_threshold 0.008 \

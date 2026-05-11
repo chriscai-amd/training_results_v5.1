@@ -152,7 +152,7 @@ __global__ void fprop_relu_aux_kernel(__half* D, uint8_t* aux, int m, int n, int
 // produces the final dbias[i] in O(log blockDim.x).
 template <bool ComputeBgrad, int kBlock>
 __global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
-                                   int m, int n, int aux_ld) {
+                                   int m, int n, int aux_ld, float bgrad_div) {
   int i = blockIdx.x;
   if (i >= m) return;
   int byte_i = i >> 3;
@@ -180,7 +180,7 @@ __global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
       __syncthreads();
     }
     if (threadIdx.x == 0) {
-      float s = partial[0];
+      float s = partial[0] / bgrad_div;
       if (!isfinite(s)) s = 0.0f;
       constexpr float kFp16Max = 65504.0f;
       if (s > kFp16Max) s = kFp16Max;
@@ -205,10 +205,16 @@ inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
   if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
   // One block per row, kBlock threads/block cooperatively walk the n cols.
   constexpr int kBlock = 256;
+  // Cache the env-knob lookup; default 256 leaves >2 orders of magnitude
+  // FP16 headroom over the 8-rank ncclAllReduce sum even at max bias values.
+  static const float kDiv = []() {
+    const char* env = getenv("HCTR_DRELU_BGRAD_DIV");
+    return env ? std::max(1.0f, static_cast<float>(std::atof(env))) : 256.0f;
+  }();
   if (compute_bgrad && dbias) {
-    bprop_drelu_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld);
+    bprop_drelu_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
   } else {
-    bprop_drelu_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld);
+    bprop_drelu_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld, 1.0f);
   }
 }
 
@@ -353,7 +359,14 @@ void CublasDesc<T>::set_fprop_attr(std::vector<size_t> dims_a, std::vector<size_
                             (epilogue == HIPBLASLT_EPILOGUE_RELU_AUX) ||
                             (epilogue == HIPBLASLT_EPILOGUE_RELU_AUX_BIAS);
   saved_bias_ptr = const_cast<T*>(bias_ptr);
-  saved_is_bias_epilogue = (bias_ptr != nullptr) && (act == Activation_t::None);
+  // ROCm port: bias post-pass must run for ANY fprop with bias != null,
+  // not just the no-activation case. Previously gated on `act == None`,
+  // which dropped the bias term for hidden ReLU layers (act=Relu, bias!=null,
+  // mask!=null) -- which is *every* hidden layer in the bottom and top MLPs.
+  // Single-GPU happened to converge because the missing bias was absorbed
+  // into the next layer's weights; multi-GPU collapsed because the missing-
+  // bias drift compounded across ranks via Adagrad + ncclAllReduce of dbias.
+  saved_is_bias_epilogue = (bias_ptr != nullptr);
   saved_is_bgrada_epilogue = false;
   saved_is_relu_aux_epilogue = (act != Activation_t::None) && (mask_out_ptr != nullptr);
   saved_aux_ptr = static_cast<void*>(mask_out_ptr);

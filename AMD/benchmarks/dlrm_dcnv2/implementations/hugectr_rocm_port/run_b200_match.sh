@@ -20,9 +20,15 @@ export PYTHONPATH=/workspace/hugectr_hip/build_rocm72/lib:${PYTHONPATH:-}
 export HCTR_USE_SUBSAMPLED_CRITEO=1
 export HCTR_USE_REAL_TABLE_SIZES=1
 if [ "${HCTR_USE_MULTI_HOT:-0}" = "1" ]; then
-    DATA_DIR=/criteo/hugectr_bin_mh
-    BYTES_PER_ROW=576
-    echo "[ok] data shape = MULTI-HOT (130 keys/row, 576 B/row)"
+    if [ "${HCTR_USE_FULL_CRITEO:-0}" = "1" ] && [ -d /criteo/hugectr_bin_mh_full ]; then
+        DATA_DIR=/criteo/hugectr_bin_mh_full
+        echo "[ok] data shape = MULTI-HOT FULL CRITEO (24 days, 214 keys/row, 912 B/row)"
+    else
+        DATA_DIR=/criteo/hugectr_bin_mh
+        echo "[ok] data shape = MULTI-HOT day_0 only (214 keys/row, 912 B/row)"
+    fi
+    # 4 (label) + 13*4 (dense) + sum(MULTI_HOT_SIZES)*4 = 4 + 52 + 214*4 = 912.
+    BYTES_PER_ROW=912
 else
     DATA_DIR=/criteo/hugectr_bin
     BYTES_PER_ROW=160
@@ -64,8 +70,8 @@ python3 train.py \
     --train_data "$DATA_DIR/train_data.bin" \
     --val_data   "$DATA_DIR/val_data.bin" \
     --sharding_plan "${HCTR_SHARDING_PLAN:-auto}" \
-    --mem_comm_work_ratio 9 \
-    --dp_sharding_threshold 0.008 \
+    --mem_comm_work_ratio "${HCTR_MEM_COMM_WORK_RATIO:-9}" \
+    --dp_sharding_threshold "${HCTR_DP_SHARD_THRESH:-0.008}" \
     --memory_cap_for_embedding "$MEM_CAP" \
     --disable_algorithm_search \
     --gen_loss_summary \
@@ -76,23 +82,38 @@ echo ""
 echo "============================================================"
 echo "         B200-MATCH RUN SUMMARY (AMD MI350X x $NGPU)"
 echo "============================================================"
-python3 - <<PY
-import re
+SUMMARY_BS=$BATCH SUMMARY_INTER=$DISPLAY SUMMARY_NGPU=$NGPU \
+SUMMARY_EVAL_BATCH=$EVAL_BATCH SUMMARY_EV_SIZE=$EV_SIZE \
+SUMMARY_PRECISION="$PRECISION_FLAGS" \
+python3 - <<'PY'
+import os, re
 log = open("/tmp/b200match.log").read()
 iters = [(int(m.group(1)), float(m.group(2)), float(m.group(3)))
          for m in re.finditer(r"Iter: (\d+) Time\(\d+ iters\): ([\d.]+)s Loss: ([\d.]+)", log)]
-bs = $BATCH
-inter = $DISPLAY
+bs    = int(os.environ["SUMMARY_BS"])
+inter = int(os.environ["SUMMARY_INTER"])
+ngpu  = int(os.environ["SUMMARY_NGPU"])
+eval_batch = os.environ["SUMMARY_EVAL_BATCH"]
+ev_size    = os.environ["SUMMARY_EV_SIZE"]
+precision  = os.environ["SUMMARY_PRECISION"]
 if iters:
     its, secs, losses = zip(*iters)
     sps = [(bs * inter) / s for s in secs]
-    steady = sps[1:] if len(sps) > 1 else sps
+    # Trim warm-up (first entry) and the partial-window outlier (last entry,
+    # which often reports a ~1ms time because the run terminated mid-window).
+    if len(sps) >= 3:
+        steady = sps[1:-1]
+    elif len(sps) > 1:
+        steady = sps[1:]
+    else:
+        steady = sps
     avg = sum(steady) / len(steady)
-    print(f"GPUs                       : $NGPU x AMD MI350X (gfx950)")
-    print(f"Global batch / per-GPU     : {bs:,} / {bs//$NGPU:,}")
-    print(f"Eval batch                 : $EVAL_BATCH")
-    print(f"Embedding dim              : $EV_SIZE")
-    print(f"Precision                  : {'FP16 mixed (scaler 16348)' if 'mixed_precision' in '$PRECISION_FLAGS' else 'FP32'}")
+    print(f"GPUs                       : {ngpu} x AMD MI350X (gfx950)")
+    print(f"Global batch / per-GPU     : {bs:,} / {bs//ngpu:,}")
+    print(f"Eval batch                 : {eval_batch}")
+    print(f"Embedding dim              : {ev_size}")
+    prec_label = "FP16 mixed (scaler 16348)" if "mixed_precision" in precision else "FP32"
+    print(f"Precision                  : {prec_label}")
     print(f"Iterations completed       : {its[-1]}")
     print(f"Final loss (BCE)           : {losses[-1]:.6f}")
     print(f"Loss range over training   : {max(losses):.4f} -> {min(losses):.4f}")

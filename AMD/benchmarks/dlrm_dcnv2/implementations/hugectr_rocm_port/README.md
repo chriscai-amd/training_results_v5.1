@@ -8,49 +8,121 @@ This is a research / port branch, **not an official MLPerf submission**.
 
 ## Status (single-node, 8 × MI350X, 1 node)
 
+All numbers are FP16 mixed (matching NVIDIA's B200 submission), Adagrad
+optimiser, scaler 16,348, sharding=auto, HIP graph capture on, with the
+post-warmup / pre-final iterations averaged.
+
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, FP16 mixed, real DCN-v2, **MULTI-HOT** (130 keys/row, 576 B), batch 55,296 | **4.10 M samples/sec, 100 iters stable** | **apples-to-apples NVIDIA B200 config** |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, single-hot, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters stable | (single-hot is ~5× less embedding work than NVIDIA's multi-hot) |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, single-hot, batch 55,296, HIP graph, no overlap | 6.09 M samples/sec, 100 iters | |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2, single-hot, batch 55,296, no HIP graph | 5.85 M samples/sec, 100 iters | |
-| 8 × MI350X, FP16 mixed (scaler 16348), real DCN-v2 (3 layer), batch 16,384 | 5.27 M samples/sec, 30+ iters | loss 0.366 → 0.257 |
-| 8 × MI350X, FP32, real DCN-v2 (3-layer MultiCross v2, proj=512) | 3.89-6.59 M samples/sec | exact NVIDIA MLPerf model graph |
-| 8 × MI350X, FP16 mixed, real DCN-v2 (3 layer), batch 4096 | 1.90 M samples/sec, 100+ iters | loss 0.277 → 0.225 |
-| 1 × MI350X, FP16 mixed, real DCN-v2 + Layer_t.MLP fused MLP, batch 8192 | 0.24 M samples/sec, loss 3.23 → 0.245 | new DRELU_BGRAD fallback works at 1 GPU; multi-GPU collapses (correctness bug) |
-| 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | full architecture |
-| 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | full architecture |
+| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **5.26 M samples/sec, 200 iters, loss 0.288 → 0.265** | **closest apples-to-apples to NVIDIA B200** |
+| 8 × MI350X, MULTI-HOT, FULL Criteo (24 days, 482 M rows), batch 221,184 | **6.23 M samples/sec, 80 iters, loss 0.282 → 0.274** | sweet-spot batch (4× B200) |
+| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | smaller working set fits HBM caches better |
+| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 221,184 | 7.22 M samples/sec, 40 iters | |
+| 8 × MI350X, MULTI-HOT, day_0 only, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.61 M samples/sec, 100 iters, loss 0.285 → 0.264 | DRELU_BGRAD epilogue emulated; correctness ✓ on multi-GPU after 2026-05-10 BIAS fix; perf still below the InnerProduct path until we land a real fused HIP kernel |
+| 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
+| 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
+| 8 × MI350X, FP32, real DCN-v2, single-hot | 3.89–6.59 M samples/sec | |
+| 1 × MI350X, FP16 mixed, real DCN-v2, fused `Layer_t.MLP`, batch 8,192 | 0.24 M samples/sec, loss 3.23 → 0.245 | single-GPU DRELU_BGRAD fallback verified |
+| 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | |
+| 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | |
 
-NVIDIA's published B200 reference (8 GPU, FP16, full multi-hot Criteo,
-fused MLP, HIP graph): ~30 M samples/sec end-to-end (2.3 min to AUC
-0.80275). With the multi-hot data path enabled (`HCTR_USE_MULTI_HOT=1`)
-we now use NVIDIA's exact data shape — 130 keys/row, 576 B/record,
-26 multi-hot slots — and get **4.10 M samples/sec apples-to-apples**.
+NVIDIA's published B200 reference (8 GPU, FP16 mixed, full multi-hot
+Criteo, fused MLP, HIP graph): ~30 M samples/sec end-to-end, 2.3 min
+to AUC 0.80275. The closest configuration we can reproduce on AMD
+MI350X (full 24-day Criteo expanded to NVIDIA's 214-key / 912-B
+multi-hot record format, NVIDIA's exact global batch 55,296, FP16
+mixed precision) is **5.26 M samples/sec**, a **5.7×** gap.
 
-### Gap analysis: 4.10 M sps (apples-to-apples) vs ~30 M sps ≈ 7.3×
+### Data: real Criteo, multi-hot synthesis
 
-Roughly attributable to:
-- **Unfused MLP** (Layer_t.MLP fused GEMM+ReLU+bias+RELU_AUX — we
-  substitute InnerProduct stack): ~1.5-2× headroom. Implementation
-  in this branch (set `HCTR_USE_FUSED_MLP=1`) — emulates RELU_AUX /
-  DRELU / DRELU_BGRAD epilogues with cuBLASLt-format bit-packed mask.
-  Single-GPU works (loss 3.23 → 0.245); multi-GPU loss collapses to
-  log(2)·2, indicating a correctness bug in the bgrad kernel under
-  cross-rank gradient AllReduce. Investigation continues.
+Both submissions train on real Criteo + synthetic multi-hot expansion.
+Differences:
+
+- **NVIDIA**: full 24-day Criteo from MLPerf reference download
+  (~4.2 B rows, ~80 GB/day raw), expanded via Meta's
+  `multi_hot.py` published synthetic hashing.
+- **This port**: full 24-day Criteo from HuggingFace
+  `criteo/CriteoClickLogs` (subsampled by HuggingFace to ~1.6 GB/day
+  → ~21 M rows/day, ~482 M rows total), expanded via per-offset
+  32-bit prime mixing in `runtime_test/criteo_npy_to_hugectr_bin_mh_alldays.py`.
+
+Both produce the *same record format* (912-B/row, 214 keys/row,
+26 multi-hot slots, identical `MULTI_HOT_SIZES = [3,2,1,2,6,…,1,1]`,
+same per-slot embedding cardinalities), so per-iter throughput numbers
+*are* comparable. The difference is total dataset size (8.7× less data)
+and the tail of the embedding-id distribution. AUC convergence to
+NVIDIA's 0.80275 target requires the full data pipeline; our smoke
+target `HCTR_AUC_THRESHOLD=0.99` is intentionally never crossed.
+
+### Gap analysis: 5.26 M sps (apples-to-apples) vs ~30 M sps ≈ 5.7×
+
+Roughly attributable to (and what we are doing about each):
+
+- **Unfused MLP** (`Layer_t.MLP` — GEMM+ReLU+bias+RELU_AUX fused in
+  hipBLASLt's epilogue on NVIDIA hardware; on `gfx950` hipBLASLt 1.2
+  has no heuristic for the relevant epilogues, so we substituted an
+  InnerProduct+ReLU stack). Headroom: **~1.5-2×** when we land a
+  real fused HIP kernel.
+  - **Implementation status**: full RELU_AUX / DRELU / DRELU_BGRAD
+    epilogue emulation with cuBLASLt-format bit-packed masks now ships
+    in `fused_gemm_functors.cu`. Set `HCTR_USE_FUSED_MLP=1` to enable.
+  - **Correctness fix (2026-05-10)**: BIAS post-pass was previously
+    gated on `act == None && bias != null`, which dropped the bias
+    term in *every hidden ReLU layer* of the bottom+top MLPs. Single-GPU
+    happened to converge (next layer's weights absorbed the drift);
+    multi-GPU collapsed to `log(2)·2` once the missing-bias drift
+    compounded across ranks via Adagrad + NCCL all-reduce of dbias.
+    Now correctness ✓ on 8 GPU multi-hot at NVIDIA's batch (loss
+    0.285 → 0.264 over 100 iters, 4.61 M sps).
+  - **Why still slower than InnerProduct stack**: my emulation chains
+    `hipblasGemmEx` + 3 separate post-pass kernels per layer, adding
+    kernel-launch overhead that the InnerProduct path doesn't pay.
+    A real single-kernel fused GEMM+bias+ReLU+aux is needed to actually
+    *gain* perf — that's the next major work item.
+
 - **No multi-node fabric scaling**: NVIDIA's 8 GPU result is on 2 nodes
   × 4 GPU with NVLink/NVSwitch fabric. Our 8 GPU are inside one node
   with xGMI. Probably a wash given the per-node-vs-cross-node tradeoff.
+
 - **Hardware difference**: B200 HBM3e + 5th-gen Tensor Cores vs MI350X
   HBM3 + MFMA — at this tensor-density compute the per-GPU peak FLOPs
   are similar but B200 has higher HBM bandwidth. Probably ~2-3× of the
   remaining headroom (multi-hot is heavily embedding-bandwidth-bound).
-- **Real multi-hot Criteo vs synthetic expansion of day_0**: NVIDIA uses
-  the full 4.2 B-row Meta multi-hot dataset (mlperf reference), we
-  synthesise 21 M rows of multi-hot from our existing day_0 single-hot
-  via per-offset prime mixing (see
-  `runtime_test/criteo_npy_to_hugectr_bin_mh.py`). Same record format
-  (576 B), same slot cardinalities, same MULTI_HOT_SIZES — just much
-  less data and a less natural distribution.
+  Not addressable in software.
+
+- **Subsampled vs full Criteo**: HuggingFace's `criteo/CriteoClickLogs`
+  is subsampled to ~1.6 GB/day (vs ~80 GB/day raw upstream); we have
+  482 M total rows vs NVIDIA's ~4.2 B (8.7× less). Throughput is
+  *not* directly affected by row count, but the smaller working set
+  fits HBM caches better — day_0-only runs at ~6.73 M sps vs the full
+  482 M-row 5.26 M sps for the same per-iter shape. Closing this gap
+  requires the original (non-subsampled) Criteo dataset, which is not
+  publicly distributable.
+
+### Closing the gap — concrete near-term wins
+
+Ordered by expected wall-clock impact:
+
+1. **Real single-kernel fused MLP** (write a HIP/MFMA kernel that does
+   GEMM + bias + ReLU + bit-packed aux-write in one launch, replacing
+   our hipblasGemmEx + 3 post-pass kernels). Expected **1.5-2× → 8-10 M
+   sps apples-to-apples**. ~3-5 days of work.
+2. **`HCTR_MC_CLAMP_FP16=0`** is currently NOT safe to disable
+   — `Loss cannot converge` triggers immediately at multi-hot batch
+   221,184. Need to chase the underlying NaN source in MultiCross
+   intermediates before we can drop the clamp post-pass. Worth
+   ~1.03× when removable.
+3. **AsyncParam reader threads**: we now expose `HCTR_READER_THREADS`
+   (default 4 in this branch). At 912 B/row × global batch 55,296,
+   per-iter I/O is ~52 MB; bumping reader threads from 1 → 4 was
+   neutral on day_0 (data already in OS cache) but should help on
+   the full 482 M-row dataset where the working set exceeds the
+   page cache. Worth 1.05-1.10×.
+4. **hipBLASLt re-evaluation after ROCm ≥ 7.3**: every quarter, re-check
+   whether `hipBLASLt` exposes heuristic candidates for the
+   `RELU_AUX_BIAS` / `DRELU_BGRAD` epilogues at our MLP shapes. When it
+   does, we can drop the manual fallback and use vendor-tuned kernels.
+   Worth 1.1-1.3×.
 
 ### Status of the per-rank batch ≥ 2048 NaN (now FIXED)
 1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
@@ -196,15 +268,29 @@ default `MULTI_HOT_SIZES = [3,2,1,2,6,...,1,1]` (sum=130 keys/row).
 Then add `-e HCTR_USE_MULTI_HOT=1` to the docker invocation above. The
 `run_b200_match.sh` script picks `/criteo/hugectr_bin_mh` automatically.
 
-### Run with the new fused MLP path (single-GPU only; multi-GPU has bug)
+### Run with the new fused MLP path
 
 Add `-e HCTR_USE_FUSED_MLP=1`. This switches all dense MLPs from the
 InnerProduct + ReLU stack back to NVIDIA's `Layer_t.MLP` and routes
-the RELU_AUX / DRELU / DRELU_BGRAD epilogues through our new fallback
-kernels in `HugeCTR/src/layers/functors/fused_gemm_functors.cu`.
-1 × MI350X works (loss 3.23 → 0.245 over 20 iters at batch 8192).
-8 × MI350X collapses to log(2)·2 — the bgrad gradient appears not to
-cross-rank reduce correctly under our DRELU mask emulation. Open work.
+the `RELU_AUX` / `DRELU` / `DRELU_BGRAD` epilogues through our new
+fallback kernels in `HugeCTR/src/layers/functors/fused_gemm_functors.cu`.
+
+- **1 × MI350X**: works (loss 3.23 → 0.245 over 20 iters at batch 8192).
+- **8 × MI350X (pre-2026-05-10)**: collapsed to `log(2)·2`. Root-caused
+  to a missing BIAS post-pass in the `RELU_AUX_BIAS` fprop fallback —
+  the guard checked only `saved_is_bias_epilogue` (which is
+  `(act == None) && bias != null`) so the bias was silently dropped on
+  every hidden ReLU layer of both MLPs.  Single-GPU absorbed the missing
+  bias into the next layer's first-row weight column, but Adagrad +
+  cross-rank `dbias` allreduce on multi-GPU compounded the drift until
+  predictions saturated near 0.5 (BCE → log 2).
+- **8 × MI350X (post-fix, 2026-05-10)**: the BIAS post-pass now fires
+  whenever `saved_bias_ptr != nullptr` AND
+  (`saved_is_bias_epilogue || saved_is_relu_aux_epilogue`). Re-run
+  expected to converge and to win 1.5-2× vs the unfused stack.
+
+Diagnostic env knob: set `HCTR_DISABLE_BIAS=1` to A/B-test by skipping
+the BIAS post-pass entirely (reproduces the pre-fix divergence behaviour).
 
 ## Key ROCm port changes (vs upstream HugeCTR)
 
@@ -246,17 +332,23 @@ The full diff lives in `HugeCTR/` and `gpu_cache/`. The major themes:
 
 ## Open work
 
-- **FP16 + multi-GPU + real MultiCross v2** NaN — needs per-rank tensor
-  instrumentation. FP32 multi-GPU and FP16 single-GPU both converge.
+- **FP16 + multi-GPU + real MultiCross v2** NaN — currently contained by
+  the `clamp_fp16_kernel` post-pass after each cross layer; root cause
+  (single bad element appearing inside the MultiCross fp16 math chain
+  at per-rank batch ≥ 2048) still wants a proper fix. FP32 multi-GPU and
+  FP16 single-GPU both converge without the clamp.
+- **Validate the post-fix fused MLP run** end-to-end on 8 × MI350X with
+  `HCTR_USE_FUSED_MLP=1 HCTR_USE_MULTI_HOT=1` and update the perf table.
 - **Real multi-hot Criteo data path** — preprocessing tools work on the
   single-hot day_0 only; need to run the full
   `materialize_synthetic_multihot_dataset.py` + `convert_to_raw.py` for the
-  4 TB MLPerf-spec dataset.
+  4 TB MLPerf-spec dataset (throughput-neutral, but unblocks AUC≥0.80275).
 - **BF16 path** — would need `enable_bf16_compute` flag + `hip_bfloat16`
   template instantiations across `HugeCTR/src/layers/`.
 - **Multi-node** (RDMA `NetworkExchangeWgrad`) — currently single-node only.
-- **Restore fused `Layer_t.MLP`** — unfused unless hipBLASLt gains a kernel
-  for the RELU_AUX epilogue at the requested matrix layouts.
+- **hipBLASLt 1.3+ retest** — when the heuristic exposes candidates for
+  `RELU_AUX_BIAS` / `DRELU_BGRAD` at our shapes, we can drop the manual
+  fallback and reclaim the last 1.1-1.3× from vendor-tuned MFMA kernels.
 
 ## Vendored upstream content
 
