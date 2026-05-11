@@ -556,17 +556,47 @@ What we tuned and what closed the gap:
 | `--cap-add=IPC_LOCK,SYS_NICE`, `--device=/dev/infiniband` | enables IB plugin, `numactl --interleave` |
 | `USE_ALGORITHM_SEARCH=false` | shortens first-iter; flat steady-state (algo-search ON regresses ~10 %) |
 | `SHARDING_PLAN=round_robin` (vs `auto`) | **+7 %** in steady |
+| `CUDA_DEVICE_MAX_CONNECTIONS=64` (vs 8 default) | **+0.9 %** (now in `config_b200_1x8_round_robin.sh`) |
 | `numactl --interleave=0,1` | flat |
 | `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
 | `NCCL_BUFFSIZE=8MiB`, `CUDA_DEVICE_MAX_CONNECTIONS=32` | flat |
+| `NCCL_MIN/MAX_NCHANNELS=16`, `NCCL_NVLS_NCHANNELS=16` | flat |
+| `NCCL_P2P_NET_CHUNKSIZE=512K`, `NCCL_LAUNCH_MODE=GROUP` | flat |
 | `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` (upstream `config_common.sh`) | **−20 %** (defaults are better here) |
 | `SHARDING_PLAN=hier_auto` | requires multi-node, errors |
 | `SHARDING_PLAN=uniform` | OOM (replicates large tables) |
 | Zipfian-synthetic data (full vocab range, real-α) | flat (4.33 vs 4.08 ms/iter) |
 
-Combined improvement vs original 100-iter measurement: **+318 %**
-(3.24 M → 13.6 M samples/s). Combined improvement vs the auto-sharding
-optimized baseline: **+7 %**.
+Combined improvement vs original 100-iter measurement: **+327 %**
+(3.24 M → 13.84 M samples/s with `CUDA_DEVICE_MAX_CONNECTIONS=64`).
+Combined improvement vs the auto-sharding optimized baseline:
+**+8 %** (round_robin +7 % and CUDA stream count +0.9 %).
+
+#### NCCL-tuning sweep against the exposed-comm budget
+
+The kineto breakdown attributes ~1.06 ms/iter to NCCL collectives that
+don't overlap with compute. We ran a 10-variant tuning sweep against
+that budget (each variant 500 iters, steady-state from iters 200–400);
+results were nearly flat:
+
+| Variant                                                                   | Steady ms/iter | Δ vs base |
+| ------------------------------------------------------------------------- | -------------: | --------: |
+| `CUDA_DEVICE_MAX_CONNECTIONS=64`                                          | **3.996**      | **−0.035 (−0.9 %)** |
+| `=64` + `NCCL_PROTO=LL128`                                                | 4.005          | −0.026 |
+| `=64` + `NCCL_PROTO=LL128` + `NCCL_P2P_NET_CHUNKSIZE=524288` + `NCCL_LAUNCH_MODE=GROUP` | 4.001          | −0.030 |
+| `=64` + `NCCL_P2P_NET_CHUNKSIZE=524288`                                   | 4.010          | −0.021 |
+| `CUDA_DEVICE_MAX_CONNECTIONS=128`                                         | 4.009          | −0.022 |
+| `NCCL_PROTO=LL128`                                                        | 4.027          | −0.004 |
+| `NCCL_MIN/MAX_NCHANNELS=16`                                               | 4.028          | −0.003 |
+| `NCCL_NVLS_NCHANNELS=16`                                                  | 4.030          | −0.001 |
+| **baseline**                                                              | **4.031**      | —      |
+| `NCCL_P2P_NET_CHUNKSIZE=524288`                                           | 4.034          | +0.002 |
+
+Run-to-run noise floor ≈ 5 µs; only the `CUDA_DEVICE_MAX_CONNECTIONS=64`
+delta is meaningfully above noise. Higher values (128) plateau, and
+combining it with any of the NCCL protocol/channel/chunk knobs doesn't
+stack. Conclusion: NCCL collectives are bandwidth-bound at the platform
+level, not algorithm-bound.
 
 ### Why the remaining 1.70× gap exists
 

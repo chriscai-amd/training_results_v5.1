@@ -23,6 +23,14 @@ export DP_SHARDING_THRESHOLD=0.008
 export USE_ALGORITHM_SEARCH=false
 export MAX_ITER=2000
 export DISPLAY_INTERVAL=100
+
+# Tiny but reproducible perf win (+0.9 % on B200) from the NCCL tuning
+# sweep documented in section 7 of README-b200-1x8.md: more concurrent
+# CUDA streams allows a touch more comm/compute overlap. Other knobs
+# tested (NCCL_PROTO=LL128, NCCL_BUFFSIZE=8M, NCCL_NVLS_NCHANNELS=16,
+# NCCL_P2P_NET_CHUNKSIZE=512K, NCCL_MAX_NCHANNELS=16) were all flat.
+export CUDA_DEVICE_MAX_CONNECTIONS=64
+
 # NCCL debug -- inspect algos/protocols/channels
 # (uncomment when diagnosing; very chatty)
 # export NCCL_DEBUG=INFO
