@@ -55,8 +55,45 @@ static void prewarm_all_blas_handles_once() {
   });
 }
 
+// ROCm port: per-device FP32 scratch for the V4 bprop_drelu_bgrad kernel.
+// One allocation per device, max-sized to handle any MLP layer's row count
+// (4096 floats = 16 KB / device is plenty -- DCN-v2's biggest m is 1024).
+// Allocated once via std::call_once before HIP graph capture begins (just
+// like g_handle_cache), so the per-iter launch path never hipMallocs.
+constexpr int kBgradScratchMaxM = 4096;
+static std::array<float*, 16> g_bgrad_scratch{};
+
+static void prewarm_bgrad_scratch_once() {
+  static std::once_flag flag;
+  std::call_once(flag, []() {
+    int n_devs = 0;
+    if (hipGetDeviceCount(&n_devs) != hipSuccess) return;
+    int saved_dev = -1;
+    hipGetDevice(&saved_dev);
+    std::lock_guard<std::mutex> lk(g_handle_mu);
+    for (int d = 0; d < n_devs && d < static_cast<int>(g_bgrad_scratch.size()); ++d) {
+      if (g_bgrad_scratch[d] != nullptr) continue;
+      if (hipSetDevice(d) != hipSuccess) continue;
+      void* p = nullptr;
+      if (hipMalloc(&p, sizeof(float) * kBgradScratchMaxM) == hipSuccess) {
+        g_bgrad_scratch[d] = static_cast<float*>(p);
+      }
+    }
+    if (saved_dev >= 0) hipSetDevice(saved_dev);
+  });
+}
+
+static float* get_bgrad_scratch_for_current_device() {
+  prewarm_bgrad_scratch_once();
+  int dev_id = -1;
+  hipGetDevice(&dev_id);
+  if (dev_id < 0 || dev_id >= static_cast<int>(g_bgrad_scratch.size())) return nullptr;
+  return g_bgrad_scratch[dev_id];
+}
+
 static hipblasHandle_t get_or_create_blas_handle_for_current_device() {
   prewarm_all_blas_handles_once();
+  prewarm_bgrad_scratch_once();
   int dev_id = -1;
   HCTR_LIB_THROW(hipGetDevice(&dev_id));
   std::lock_guard<std::mutex> lk(g_handle_mu);
@@ -156,13 +193,7 @@ __global__ void fprop_bias_relu_aux_kernel(__half* __restrict__ D,
 // (legacy fprop_relu_aux_kernel removed -- the bias-aware fused kernel
 // covers both relu-only and relu+bias paths via the bias=nullptr branch.)
 
-// V1 bprop kernel: one block per output row, kBlock threads cooperatively
-// walk the n cols. Uncoalesced reads (stride m within a warp) but very
-// high parallelism (m blocks, ~m * kBlock total threads) which is what
-// AMD's 304 CU count benefits from. Tried V2/V3 (collapse rows into
-// stripes for coalesced reads) and V4 (2D tile + atomicAdd) — both lost
-// to V1 because they reduced block count from O(m) to O(m/64), starving
-// the GPU. V4 also breaks HIP graph capture (needs hipMalloc per call).
+// V1 bprop kernel (kept as a fallback for ComputeBgrad=false).
 template <bool ComputeBgrad, int kBlock>
 __global__ void bprop_drelu_v1_kernel(__half* __restrict__ D,
                                       const uint8_t* __restrict__ aux,
@@ -204,6 +235,80 @@ __global__ void bprop_drelu_v1_kernel(__half* __restrict__ D,
   }
 }
 
+// V5 bprop_drelu_bgrad kernel: 2D tile (BLOCK_M rows x N_TILE cols/block).
+// Lane in wave = row in stripe -> 128-byte coalesced loads of D and writes.
+// Each block computes a partial column-sum per row in shared mem, then
+// atomicAdds into a per-device pre-allocated FP32 scratch buffer. A small
+// finalize kernel divides + clamps + casts to FP16 dbias.
+//
+// Why this is faster than V1: V1's per-thread reads at offset i + j_thr*m
+// are uncoalesced (each thread does its own DRAM transaction for FP16
+// scalars). At m=1024, n=13824 the kernel touches 28 MB but takes ~400 us
+// on V1, vs the HBM3 BW theoretical lower bound of 5.6 us -- a 70x BW
+// inefficiency. V5 reads 128 B per wave per col -> hits proper BW.
+//
+// HIP graph compatibility: the FP32 scratch buffer is pre-allocated by
+// prewarm_bgrad_scratch_once() during init (called from
+// CublasAlgo::init_algorithm), so the per-iter launch path never
+// allocates -- safe inside graph capture.
+template <int BLOCK_M, int WAVES_PER_BLOCK>
+__global__ void bprop_drelu_bgrad_v5_kernel(__half* __restrict__ D,
+                                            const uint8_t* __restrict__ aux,
+                                            float* __restrict__ scratch_fp32,
+                                            int m, int n, int aux_ld, int n_tile) {
+  int wave_id = threadIdx.x / BLOCK_M;
+  int lane    = threadIdx.x % BLOCK_M;
+  int i = blockIdx.x * BLOCK_M + lane;
+  if (i >= m) return;
+
+  int byte_i = i >> 3;
+  int bit_i  = i & 7;
+  uint8_t bit_mask = static_cast<uint8_t>(1u << bit_i);
+
+  int j_block_start = blockIdx.y * n_tile;
+  int j_block_end   = j_block_start + n_tile;
+  if (j_block_end > n) j_block_end = n;
+  int span = (j_block_end - j_block_start + WAVES_PER_BLOCK - 1) / WAVES_PER_BLOCK;
+  int j_start = j_block_start + wave_id * span;
+  int j_end   = j_start + span;
+  if (j_end > j_block_end) j_end = j_block_end;
+
+  float sum = 0.0f;
+  for (int j = j_start; j < j_end; ++j) {
+    uint8_t mask_byte = aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld];
+    bool nonneg = (mask_byte & bit_mask) != 0;
+    size_t off = static_cast<size_t>(i) + static_cast<size_t>(j) * m;
+    float v = __half2float(D[off]);
+    if (!nonneg) {
+      v = 0.0f;
+      D[off] = __float2half(0.0f);
+    }
+    sum += v;
+  }
+  __shared__ float wave_sums[WAVES_PER_BLOCK][BLOCK_M];
+  wave_sums[wave_id][lane] = sum;
+  __syncthreads();
+  if (wave_id == 0) {
+    float total = 0.0f;
+    #pragma unroll
+    for (int w = 0; w < WAVES_PER_BLOCK; ++w) total += wave_sums[w][lane];
+    atomicAdd(&scratch_fp32[i], total);
+  }
+}
+
+__global__ void bgrad_finalize_v5_kernel(const float* __restrict__ scratch,
+                                         __half* __restrict__ dbias,
+                                         int m, float bgrad_div) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= m) return;
+  float total = scratch[i] / bgrad_div;
+  if (!isfinite(total)) total = 0.0f;
+  constexpr float kFp16Max = 65504.0f;
+  if (total >  kFp16Max) total =  kFp16Max;
+  else if (total < -kFp16Max) total = -kFp16Max;
+  dbias[i] = __float2half(total);
+}
+
 // Single-launch fused (bias_add + ReLU + bit-packed mask write).
 // Pass `bias=nullptr` for the no-bias path. Replaces the old 2-launch
 // sequence (add_bias_per_row -> fprop_relu_aux) with one launch.
@@ -226,16 +331,53 @@ inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
                                int m, int n, int aux_ld, bool compute_bgrad,
                                hipStream_t stream) {
   if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
-  constexpr int kBlock = 256;
   static const float kDiv = []() {
     const char* env = getenv("HCTR_DRELU_BGRAD_DIV");
     return env ? std::max(1.0f, static_cast<float>(std::atof(env))) : 256.0f;
   }();
-  if (compute_bgrad && dbias) {
-    bprop_drelu_v1_kernel<true,  kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias,   m, n, aux_ld, kDiv);
-  } else {
-    bprop_drelu_v1_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld, 1.0f);
+  // Env knob HCTR_DRELU_KERNEL=v1 forces the legacy V1 kernel; default V5.
+  static const bool kUseV1 = []() {
+    const char* env = getenv("HCTR_DRELU_KERNEL");
+    return env && std::string(env) == "v1";
+  }();
+  if (!compute_bgrad || !dbias || kUseV1) {
+    constexpr int kBlock = 256;
+    if (compute_bgrad && dbias) {
+      bprop_drelu_v1_kernel<true,  kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias,   m, n, aux_ld, kDiv);
+    } else {
+      bprop_drelu_v1_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld, 1.0f);
+    }
+    return;
   }
+  // V5: 2D tile + atomicAdd to per-device FP32 scratch + finalize kernel.
+  // BLOCK_M = 64 = gfx950 wavefront; coalesced loads.
+  // WAVES_PER_BLOCK = 4 -> 256 threads/block.
+  // N_TILE = 1024 cols/block -> good per-thread serial run length.
+  constexpr int BLOCK_M = 64;
+  constexpr int WAVES   = 4;
+  constexpr int kThreads = BLOCK_M * WAVES;
+  constexpr int N_TILE  = 1024;
+  if (m > kBgradScratchMaxM) {
+    // Bigger than our preallocated scratch -> fall back to V1 to stay safe.
+    constexpr int kBlock = 256;
+    bprop_drelu_v1_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
+    return;
+  }
+  float* scratch = get_bgrad_scratch_for_current_device();
+  if (!scratch) {
+    constexpr int kBlock = 256;
+    bprop_drelu_v1_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
+    return;
+  }
+  hipMemsetAsync(scratch, 0, sizeof(float) * static_cast<size_t>(m), stream);
+  int grid_x = (m + BLOCK_M - 1) / BLOCK_M;
+  int grid_y = (n + N_TILE  - 1) / N_TILE;
+  dim3 grid(grid_x, grid_y, 1);
+  bprop_drelu_bgrad_v5_kernel<BLOCK_M, WAVES><<<grid, kThreads, 0, stream>>>(
+      D, aux, scratch, m, n, aux_ld, N_TILE);
+  constexpr int kFinBlk = 256;
+  int fin_grid = (m + kFinBlk - 1) / kFinBlk;
+  bgrad_finalize_v5_kernel<<<fin_grid, kFinBlk, 0, stream>>>(scratch, dbias, m, kDiv);
 }
 
 template <typename T>
