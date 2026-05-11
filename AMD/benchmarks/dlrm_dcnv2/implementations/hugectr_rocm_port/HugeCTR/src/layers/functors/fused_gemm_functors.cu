@@ -117,9 +117,16 @@ __global__ void add_bias_per_row_kernel(T* D, const T* __restrict__ bias, int m,
 
 // fprop kernel: applies bias (already in D), then computes mask and ReLU.
 // Each thread handles one byte (8 row positions in one column).
-__global__ void fprop_relu_aux_kernel(__half* D, uint8_t* aux, int m, int n, int aux_ld) {
+// FUSED bias-add + ReLU + bit-packed mask write, in a single kernel launch.
+// Replaces (add_bias_per_row -> fprop_relu_aux) sequence with one launch.
+// When `bias` is nullptr, behaves like the original ReLU-only fprop_relu_aux.
+// Each thread handles one byte (8 row positions in one column).
+__global__ void fprop_bias_relu_aux_kernel(__half* __restrict__ D,
+                                           const __half* __restrict__ bias,
+                                           uint8_t* __restrict__ aux,
+                                           int m, int n, int aux_ld) {
   int byte_i = blockIdx.x * blockDim.x + threadIdx.x;     // byte index within column
-  int j = blockIdx.y * blockDim.y + threadIdx.y;          // column
+  int j      = blockIdx.y * blockDim.y + threadIdx.y;     // column
   int max_byte = (m + 7) / 8;
   if (byte_i >= max_byte || j >= n) return;
   uint8_t mask = 0;
@@ -131,9 +138,10 @@ __global__ void fprop_relu_aux_kernel(__half* D, uint8_t* aux, int m, int n, int
     if (i >= m) break;
     size_t off = static_cast<size_t>(i) + static_cast<size_t>(j) * m;
     float v = __half2float(D[off]);
+    if (bias != nullptr) v += __half2float(bias[i]);
     // Sanitize: NaN -> 0, clamp magnitude to FP16 range.
     if (!isfinite(v)) v = 0.0f;
-    else if (v > kFp16Max) v = kFp16Max;
+    else if (v >  kFp16Max) v =  kFp16Max;
     else if (v < -kFp16Max) v = -kFp16Max;
     if (v > 0.0f) {
       mask |= static_cast<uint8_t>(1u << b);
@@ -144,6 +152,9 @@ __global__ void fprop_relu_aux_kernel(__half* D, uint8_t* aux, int m, int n, int
   }
   aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld] = mask;
 }
+
+// (legacy fprop_relu_aux_kernel removed -- the bias-aware fused kernel
+// covers both relu-only and relu+bias paths via the bias=nullptr branch.)
 
 // bprop kernel: applies the saved RELU mask to D in-place; optionally
 // computes dbias = column-sum of masked D.
@@ -190,13 +201,22 @@ __global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
   }
 }
 
-inline void launch_fprop_relu_aux(__half* D, uint8_t* aux, int m, int n, int aux_ld,
-                                  hipStream_t stream) {
+// Single-launch fused (bias_add + ReLU + bit-packed mask write).
+// Pass `bias=nullptr` for the no-bias path. Replaces the old 2-launch
+// sequence (add_bias_per_row -> fprop_relu_aux) with one launch.
+inline void launch_fprop_bias_relu_aux(__half* D, const __half* bias, uint8_t* aux,
+                                       int m, int n, int aux_ld, hipStream_t stream) {
   if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
   int max_byte = (m + 7) / 8;
   dim3 block(8, 16, 1);
   dim3 grid((max_byte + 7) / 8, (n + 15) / 16, 1);
-  fprop_relu_aux_kernel<<<grid, block, 0, stream>>>(D, aux, m, n, aux_ld);
+  fprop_bias_relu_aux_kernel<<<grid, block, 0, stream>>>(D, bias, aux, m, n, aux_ld);
+}
+
+// Backward-compat wrapper: ReLU+aux only (no bias).
+inline void launch_fprop_relu_aux(__half* D, uint8_t* aux, int m, int n, int aux_ld,
+                                  hipStream_t stream) {
+  launch_fprop_bias_relu_aux(D, nullptr, aux, m, n, aux_ld, stream);
 }
 
 inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
@@ -671,29 +691,46 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
           mat_d, HIP_R_16F, static_cast<int>(cublas_desc.saved_ldc),
           HIPBLAS_COMPUTE_32F, HIPBLAS_GEMM_DEFAULT));
     }
-    if (cublas_desc.saved_is_bias_epilogue && cublas_desc.saved_bias_ptr) {
-      static const bool kDisableBias = []() {
-        const char* env = std::getenv("HCTR_DISABLE_BIAS");
-        return env && env[0] == '1';
-      }();
-      if (!kDisableBias) {
+    static const bool kDisableBias = []() {
+      const char* env = std::getenv("HCTR_DISABLE_BIAS");
+      return env && env[0] == '1';
+    }();
+    // ROCm port: FUSED post-pass dispatch. Cuts one kernel launch per FC
+    // layer's fprop on the RELU_AUX_BIAS path (which is what Layer_t.MLP
+    // emits for every hidden layer in DLRM-DCNv2's bottom + top MLPs):
+    //   * RELU_AUX_BIAS (act=Relu, bias!=null, mask!=null):
+    //       single launch_fprop_bias_relu_aux call (was 2: bias + relu_aux)
+    //   * BIAS-only (act=None, bias!=null):
+    //       single launch_add_bias_per_row call (unchanged)
+    //   * RELU_AUX-only (act=Relu, bias==null, mask!=null):
+    //       single launch_fprop_bias_relu_aux with bias=nullptr
+    //   * DEFAULT (no epilogue): nothing
+    if constexpr (std::is_same<T, __half>::value) {
+      const bool need_bias = cublas_desc.saved_is_bias_epilogue && cublas_desc.saved_bias_ptr;
+      const bool need_relu = cublas_desc.saved_is_relu_aux_epilogue && cublas_desc.saved_aux_ptr;
+      if (!kDisableBias && need_relu) {
+        const __half* bias_ptr = need_bias
+            ? reinterpret_cast<const __half*>(cublas_desc.saved_bias_ptr)
+            : nullptr;
+        launch_fprop_bias_relu_aux(reinterpret_cast<__half*>(mat_d),
+                                   bias_ptr,
+                                   reinterpret_cast<uint8_t*>(cublas_desc.saved_aux_ptr),
+                                   static_cast<int>(cublas_desc.saved_m),
+                                   static_cast<int>(cublas_desc.saved_n),
+                                   static_cast<int>(cublas_desc.saved_aux_ld), stream);
+      } else if (!kDisableBias && need_bias) {
+        launch_add_bias_per_row<T>(mat_d, reinterpret_cast<const T*>(cublas_desc.saved_bias_ptr),
+                                   static_cast<int>(cublas_desc.saved_m),
+                                   static_cast<int>(cublas_desc.saved_n), stream);
+      }
+    } else {
+      if (!kDisableBias && cublas_desc.saved_is_bias_epilogue && cublas_desc.saved_bias_ptr) {
         launch_add_bias_per_row<T>(mat_d, reinterpret_cast<const T*>(cublas_desc.saved_bias_ptr),
                                    static_cast<int>(cublas_desc.saved_m),
                                    static_cast<int>(cublas_desc.saved_n), stream);
       }
     }
-    // ROCm port: RELU_AUX[+BIAS] fprop fused MLP path. Bias was already added
-    // above by the BIAS post-pass kernel (when saved_is_bias_epilogue is true),
-    // so here we just need to compute the mask and apply ReLU. Only valid for
-    // FP16 currently (Layer_t.MLP is __half-only in HugeCTR).
     if constexpr (std::is_same<T, __half>::value) {
-      if (cublas_desc.saved_is_relu_aux_epilogue && cublas_desc.saved_aux_ptr) {
-        launch_fprop_relu_aux(reinterpret_cast<__half*>(mat_d),
-                              reinterpret_cast<uint8_t*>(cublas_desc.saved_aux_ptr),
-                              static_cast<int>(cublas_desc.saved_m),
-                              static_cast<int>(cublas_desc.saved_n),
-                              static_cast<int>(cublas_desc.saved_aux_ld), stream);
-      }
       if (cublas_desc.saved_is_drelu_epilogue && cublas_desc.saved_aux_ptr) {
         launch_bprop_drelu(reinterpret_cast<__half*>(mat_d),
                            reinterpret_cast<const uint8_t*>(cublas_desc.saved_aux_ptr),
