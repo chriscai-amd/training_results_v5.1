@@ -428,59 +428,266 @@ entirely and reproduces the pre-fix divergence behaviour.
 
 ## Key ROCm port changes (vs upstream HugeCTR)
 
-The full diff lives in `HugeCTR/` and `gpu_cache/`. The major themes:
+The initial port commit (`7882215`, 2026-05-09) added 1,661 files and
+~478 K LOC — essentially the full upstream HugeCTR + GPU cache + vendored
+3rd-party trees, post-hipify, with the hand fixes below to make them
+build and run on ROCm 7.2 / `gfx950`. Sections are ordered roughly the
+way you'd hit them porting from scratch: build, link, runtime correctness,
+performance.
 
-1. **`hipify-perl` pass over the entire CUDA tree** (~234 K LOC) plus
-   ~30 hand-fixes for things hipify doesn't translate cleanly:
-   - 64-bit warp-mask intrinsics (`__ffs`/`__popc`) — `hugectr_hip_warp_compat.h`
-   - `cooperative_groups::reduce / inclusive_scan` → hand-rolled `shfl_xor`
-     primitives in `key_filtering_operators.cu`
-   - `MLCommon::LinAlg` (cuml dependency) → HIP-native shim in
-     `prims/mlcommon_linalg_hip.cuh`
-   - `cublasLt*` enums (e.g. `CUBLASLT_EPILOGUE_RELU_AUX`) → `hipblasLt*`
-   - Stripped NVIDIA-only deps (`cuDNN`, NVML, CUDA virtual-memory allocators)
-   - `bar.sync` PTX inline asm → `__syncthreads()`
+### Section 1 — Build system & configuration
 
-2. **`-fopenmp` for HIP source files** (CMakeLists.txt). Without this,
-   `#pragma omp parallel` is silently no-opped by amdclang, causing the AUC
-   warmup `ncclAllReduce` to deadlock waiting on ranks that never enter the
-   collective. (Multi-GPU was hung at "Starting AUC NCCL warm-up" until this
-   was added.)
+| File | Change | Why |
+|---|---|---|
+| `CMakeLists.txt` (root) | Set `CMAKE_HIP_ARCHITECTURES=gfx950`. Search for `hipBLAS`, `hipBLASLt`, `RCCL`, `rocrand`, `rocprim`, `hipDNN`-stub. Drop `find_package(CUDA)` / `find_package(CUDAToolkit)`. | gfx950 is the MI350X arch; AMD libraries replace the CUDA equivalents. |
+| `CMakeLists.txt` (root) | `add_compile_options($<$<COMPILE_LANGUAGE:HIP>:-fopenmp> $<$<COMPILE_LANGUAGE:CXX>:-fopenmp>)` and `add_link_options(-fopenmp)`. | **Critical**: without `-fopenmp` for HIP sources, `amdclang` silently no-ops `#pragma omp parallel`, causing the AUC NCCL warmup to deadlock waiting on ranks that never enter the collective. The 8-GPU runs hung at "Starting AUC NCCL warm-up" until this landed. |
+| `HugeCTR/core23/CMakeLists.txt`, `embedding/CMakeLists.txt`, `gpu_cache/CMakeLists.txt`, `HugeCTR/src/CMakeLists.txt` | Per-target `set_source_files_properties(... LANGUAGE HIP)`, link against `hip::host`, `roc::hipblaslt`, `roc::rccl`, `tbb`. | CMake/HIP toolchain expectations. |
+| `cmake/FindNUMA.cmake`, `cmake/FindAIO.cmake` | Vendored or local-fix variants (the upstream Find scripts assume Debian package layouts that don't match the ROCm container). | |
+| `hugectr_hip_warp_compat.h` (NEW) | `__device__ __forceinline__ int __ffs(unsigned long long)` etc. Dispatches to `__ffsll` / `__popcll`. | AMD wave64 means warp masks are 64-bit; upstream HugeCTR uses 32-bit mask intrinsics. Build errors otherwise. |
+| `scripts/rebuild_in_container.sh`, `scripts/run_in_container.sh`, `scripts/run_b200_match.sh`, `runtime_test/criteo_npy_to_hugectr_bin*.py`, `runtime_test/preprocess_criteo_to_npy_gz.py`, `runtime_test/process_days.sh` | Driver scripts (docker-aware, NFS-aware, libaio install in container). | The cluster doesn't have Pyxis/Enroot — everything goes through plain `srun + docker run`. |
 
-3. **Fused-GEMM functor with hipblasGemmEx fallback** in
-   `HugeCTR/src/layers/functors/fused_gemm_functors.cu`. hipBLASLt 1.2 on
-   gfx950 either returns 0 heuristic candidates for, or returns runtime-failing
-   algos for, several MultiCross v2 GEMM shapes. The fallback caches m/n/k/op
-   in `CublasDesc` and routes to `hipblasGemmEx` (FP32 accumulation) plus
-   manual `BIAS` (per-row add) and `BGRADA` (column sum) post-pass kernels.
+### Section 2 — Hipify + manual translation gaps
 
-4. **MLP layers** default to `InnerProduct + ReLU` stacks (not the fused
-   `Layer_t.MLP`) because hipBLASLt 1.2 lacks heuristic candidates for the
-   fused MLP's `RELU_AUX_BIAS` / `DRELU_BGRAD` epilogues at our shapes.
-   `Layer_t.MLP` works (correctness restored after the BIAS-fix in
-   commit `0d9a35e`'s set_fprop_attr) but is currently slower than the
-   InnerProduct path (4.83 vs 12.55 M sps at NVIDIA's batch). Closing
-   this needs a real fused HIP/MFMA single-kernel GEMM.
+`hipify-perl` covered most of the CUDA → HIP translation (cuda* →
+hip*, `__half` types are layout-compatible). What it did NOT translate
+cleanly required hand-fixes:
 
-5. **HIP graph capture and intra/inter-iter overlap re-enabled by default**
-   in the solver. Earlier benchmarks were explicitly disabling overlap
-   via `HCTR_INTRA_OVERLAP=0 HCTR_INTER_OVERLAP=0`, regression from an
-   early day_0-only sweep; with V5 + clamp-fold + full-Criteo, overlap-on
-   is now a +8.5 % win.
+| Issue | Fix | File(s) |
+|---|---|---|
+| `cooperative_groups::reduce` / `inclusive_scan` | Hand-rolled `shfl_xor`-based primitives | `HugeCTR/src/embeddings/data_distributor/key_filtering_operators.cu` |
+| `MLCommon::LinAlg::binaryOp / matrixVectorOp` (cuml dependency) | HIP-native shim with `__device__` lambdas | `HugeCTR/include/prims/mlcommon_linalg_hip.cuh` (NEW) |
+| `cublasLtMatmulDescAttribute` enums (`CUBLASLT_EPILOGUE_RELU_AUX_BIAS`, `_DRELU_BGRAD`, etc.) | Renamed to `hipblasLt*` equivalents | `HugeCTR/src/layers/functors/fused_gemm_functors.cu` |
+| `cublasGemmAlgo_t` constants | hipBLAS uses different enum names | `HugeCTR/src/layers/fully_connected_layer*.cu` |
+| `cuDNN` / `cudnnTensorDescriptor_t` | All cuDNN code paths gated out (only used by older `BatchNormLayer` not in DLRM-DCNv2) | `HugeCTR/src/layers/batch_norm_layer.cu` (excluded), `HugeCTR/src/layers/excluded_layer_stubs.cpp` (NEW, throwing stubs for excluded layers' constructors so the type system still compiles) |
+| `nvml.h` | Stripped; ROCm has `rocm_smi` but DLRM-DCNv2 doesn't need it | `HugeCTR/core23/error.hpp` |
+| CUDA virtual-memory allocators (`cuMemMap`, `cuMemAddressReserve`) | Replaced with runtime-throwing stubs | `HugeCTR/core23/details/low_level_cuda_allocator.cpp` |
+| FP8 (`__nv_fp8_e4m3` etc.) | Stubbed — gfx950 has FP8 in hardware but the HugeCTR code paths use NVIDIA-specific intrinsics | `gpu_cache/src/static_hash_table_stub.cpp` |
+| `bar.sync` PTX inline assembly | `__syncthreads()` | A few embedding kernel hot loops |
+| `uint2`/`uint4` union initializers `{x, y}` | Replaced with `make_uint2(x, y)` / `make_uint4(x, y, z, w)` | `HugeCTR/include/hashtable/cudf/concurrent_unordered_map.cuh` |
+| `atomicCAS` / `atomicAdd` user-defined overloads | Guarded with `#ifndef __HIPCC__` to avoid double-define against HIP's own | `gpu_cache/src/nv_gpu_cache.cu`, `concurrent_unordered_map.cuh` |
+| `__host__` vs `__device__` macro mismatches | Added `#elif defined(__HIPCC__)` branch | `HugeCTR/core23/macros.hpp` |
+| `obj.data<T>()` template-keyword errors under `amdclang` | Sweep replace with `obj.template data<T>()` | many `.cu` files |
+| `hipblasGemmEx` `computeType` argument type (was `HIP_R_32F`, expected `HIPBLAS_COMPUTE_32F`) | Type fix | `HugeCTR/src/layers/fully_connected_layer_half.cu` |
+| `hipblasHgemm` argument type (`__half*` vs `hipblasHalf*`) | `reinterpret_cast` | `HugeCTR/src/layers/multi_cross_layer.cu`, `fully_connected_layer_half.cu` |
+| Missing `<unistd.h>` for `usleep` | Added include | a few headers |
+| `static_assert` on 32-bit warp mask vs 64-bit | `0xFFFFFFFF` → `0xFFFFFFFFFFFFFFFFULL` | warp-vote intrinsic call sites |
+| Linker couldn't find `libtbb.so.2` | CMake `find_library(TBB tbb)` and link explicitly | top-level `CMakeLists.txt` |
+| `libaio.h` missing in container | `apt-get install -y libaio-dev libnuma-dev libtbb-dev` step in `rebuild_in_container.sh` | scripts |
 
-6. **V5 2D-tile post-pass kernels** (commits `56bc046` + `63a9c54`) for
-   `bprop_drelu_bgrad` and `reduce_sum_columns` (BGRADA). Replace V1's
-   one-block-per-row + 256-thread cooperative scan (uncoalesced) with
-   a 2D tile of (BLOCK_M=64 rows × N_TILE=1024 cols/block), wave-aligned
-   coalesced reads, atomicAdd into per-device pre-allocated FP32 scratch,
-   finalize kernel divides + clamps + casts. Pre-warmed via std::call_once
-   so HIP graph capture sees the alloc done. Was 49 % of single-GPU GPU
-   time before V5 was actually engaged; sub-1 % after.
+### Section 3 — Wave-size (32 vs 64) corrections
 
-7. **FP16 NaN/inf clamp folded into `vector_fma{3,4}_align8`** (commit
-   `93aad5c`). New `__device__ sanitize_half2_fp16` helper inlined at the
-   FMA store boundary. Eliminates one launch + memory pass per cross
-   layer per iter (was 7.45 ms over 60 iters in the rocprof trace).
+`gfx950` is wave64. Several HugeCTR kernels were written assuming
+wave32 and break silently when the warp size shifts:
+
+| File | Change | Symptom if not fixed |
+|---|---|---|
+| `HugeCTR/include/common.hpp` | `#if defined(__HIP_PLATFORM_AMD__)` → `WARP_SIZE = 64` | `matrix_pair_mul_kernel`, `row_scaling_sum_kernel` in MultiCross bprop produced cross-row contamination → NaN at per-rank batch ≥ 2048 (commit `9d05c0f`). |
+| `HugeCTR/embedding/operators/generic_lookup.cuh` | Reverted to `WARP_SIZE = 32` after wave64 caused regression here | Embedding lookup performance regressed when wave64 was applied; the original wave32 assumption is correct for these specific kernels. The selective override is keyed on `__HIP_PLATFORM_AMD__` and the file. |
+| `hugectr_hip_warp_compat.h` (NEW) | `__ffs`/`__popc`/`__ballot` overloads for `unsigned long`, `unsigned long long`, `int64_t` so 64-bit warp masks compile | Build errors on warp-vote intrinsics. |
+
+### Section 4 — Runtime correctness fixes
+
+| Issue | Fix | Commit |
+|---|---|---|
+| **OpenMP `#pragma omp parallel` silently no-opped** by amdclang → AUC NCCL warmup deadlocked on missing ranks | `-fopenmp` for HIP/CXX in CMakeLists | `0a24ef2` |
+| **MultiCross v2 BGRADA FP16 overflow** at per-rank batch ≥ 2048: column-sum reduce stored into FP16 directly, sum could exceed 65,504 → `inf` → propagates through `ncclSum` → NaN poisons Adagrad accumulator (sqrt(inf²) = inf → NaN) | FP32 accumulation + isfinite() guard + ±FP16-max clamp + pre-divide by 256 for ncclSum FP16 headroom (Adagrad is scale-invariant so the divide is mathematically free) | `5439485` |
+| **Wave-size mismatch in MultiCross bprop** caused row-cross-contamination at per-rank batch ≥ 2048 | `WARP_SIZE = 64` for AMD | `9d05c0f` |
+| **MultiCross fprop NaN poisoning** at per-rank batch ≥ 2048: a single FP16 NaN/inf in `layer_output_tensors[i]` propagated through subsequent GEMMs (NaN × anything = NaN) | `clamp_fp16_kernel` post-pass after each cross layer's `fused_matrix_elementwise_dot_add`. Later (commit `93aad5c`) inlined into the FMA store via `sanitize_half2_fp16` to save the kernel launch. | `0a24ef2` then `93aad5c` |
+| **`hipblasCreate` illegal during HIP graph capture** | Per-device `hipblasHandle_t` cache pre-warmed at compile time via `prewarm_all_blas_handles_once()` (`std::call_once`), called from `CublasAlgo<T>::init_algorithm` so all handles exist before fprop/bprop is captured | `eb4fa60` |
+| **Synthetic Criteo IDs (0..65535) indexed OOB** into the real `TABLE_SIZE_ARRAY` entries (some of which are 3, 36, 63) | `train.py`: clamp `TABLE_SIZE_ARRAY[i] = max(real_size, 65536)` when `HCTR_USE_REAL_TABLE_SIZES=1` | `7882215` |
+| **`Model.fit()` segfaulted with synthetic data** → `DistributedSlotSparseEmbeddingHash` was incompatible with `MultiHot AsyncDataReader` | Switched to the modern `EmbeddingCollection` API in `train.py`; added `Reshape` layers between `EmbeddingCollection` output and `Concat` | `7882215` |
+| **`ncclCommInitAll` failed on 8-GPU init** → `shard_matrix` was hardcoded for 1 GPU in `python_criteo_train_ec.py` | Scale to `NGPU` in `train.py`'s sharding plan generation | `7882215` |
+| **Multi-GPU fused MLP collapsed to `log(2)·2`** → BIAS post-pass guard was `(act == None) && bias != null`, dropping the bias term on every hidden ReLU layer of both MLPs. Single-GPU absorbed the drift; multi-GPU compounded via Adagrad + NCCL `dbias` all-reduce. | Drop the `act == None` clause; BIAS post-pass now fires whenever `bias != null && (saved_is_bias_epilogue || saved_is_relu_aux_epilogue)` | `0d9a35e` |
+| **`DistributedSlotSparseEmbeddingHash` fp8 path** → not portable | Stubbed with throwing constructor (we use the modern EmbeddingCollection anyway) | `7882215` |
+| **Excluded layers** (`MultiHeadAttention`, `GRULayer`, etc.) → not in DLRM but still type-referenced | Throwing stubs in `excluded_layer_stubs.cpp` (NEW) so the type system compiles without the layer implementations | `7882215` |
+
+### Section 5 — Numerical-precision additions for FP16 multi-GPU
+
+The FP16 + 8-GPU + real MultiCross v2 path needed several numerical
+hardening changes that don't exist in the upstream CUDA build (which
+uses BF16 mixed precision and avoids most overflow problems):
+
+| File | Change |
+|---|---|
+| `HugeCTR/src/layers/functors/fused_gemm_functors.cu` | `to_f32<T>` / `from_f32<T>` intrinsics for safe `__half` ↔ `float` conversion. FP32 accumulation in all bgrad/bgrada paths. |
+| `HugeCTR/src/layers/functors/fused_gemm_functors.cu` | Always-on FP32 accumulation in the `hipblasGemmEx` fallback (FP16 GEMM with FP16 accumulate would overflow MultiCross intermediates). |
+| `HugeCTR/src/layers/multi_cross_layer.cu` | `sanitize_half2_fp16` helper folded into `vector_fma{3,4}_align8<__half>` — NaN → 0, |v| > 65504 → ±65504 inline at the FMA store. |
+| `HugeCTR/src/layers/functors/fused_gemm_functors.cu` | Pre-divide by `HCTR_DRELU_BGRAD_DIV` (default 256) before FP16 store, so per-rank dbias × 8 ranks under `ncclSum` stays under FP16 max. Adagrad scale-invariance means the divide is mathematically free. |
+
+### Section 6 — Excluded paths (not implemented in this port)
+
+These upstream HugeCTR paths are stubbed, gated, or replaced because
+DLRM-DCNv2 doesn't need them:
+
+- **cuDNN-based BatchNorm** — not used by DLRM-DCNv2.
+- **NVML / DCGM telemetry** — replaced with `rocm-smi` shell calls in scripts.
+- **CUDA virtual-memory allocators** — runtime-throwing stub.
+- **FP8 quantised embedding tables** — gfx950 has FP8 in hardware but the HugeCTR code paths use `__nv_fp8_e4m3` and assorted NVIDIA intrinsics; stubbed.
+- **`MultiHeadAttention`, `GRU`, `MultiCrossEntropyLoss`** layers — throwing stubs (not in DLRM-DCNv2 graph).
+- **HierarchicalKV / EmbeddingCachePolicy** — vendored 3rd-party submodule; we use the simpler `EmbeddingCollection` API.
+- **MPI multi-node** (`NetworkExchangeWgrad` over RDMA) — stubbed via `mpi4py_stub.py` for single-node-only runs.
+- **`mlperf_common` package** — stubbed via `mlperf_common_stub.py` (provides `MLLoggerWrapper` and `HCTRCommunicationHandler`).
+
+## Performance optimisation timeline
+
+Each entry below corresponds to one or more commits and includes the
+measured throughput delta. All numbers are at NVIDIA's exact B200 batch
+of 55,296 unless otherwise noted, FP16 mixed, full real Criteo
+(482 M-row HF subsample), 8 × MI350X. "Sweet spot" = batch 110,592.
+
+### Phase 1 — Initial port (commit `7882215`, 2026-05-09)
+
+Get the thing to build, link, and run a few iterations.
+
+| Configuration | Result |
+|---|---|
+| 8 GPU, FP32, real DCN-v2 | **3.89–6.59 M sps** (worked first try after the `-fopenmp` deadlock fix) |
+| 8 GPU, FP16, InnerProduct interaction substitute | 12.29 M sps (substitute, not real DCN-v2) |
+| 8 GPU, FP16, real MultiCross v2 | NaN at iter ≤ 2 (bug below) |
+
+Open issue at this point: "FP16 + multi-GPU + real MultiCross NaNs at
+iter ≤ 2" — tracked separately and resolved over phases 2–4.
+
+### Phase 2 — Multi-GPU FP16 MultiCross stabilisation (commits `9d05c0f`, `5439485`, `0a24ef2`, 2026-05-09)
+
+Three independent FP16 numerical bugs in MultiCross v2 needed fixing
+before 8-GPU FP16 training would converge:
+
+| Fix | Mechanism | Effect |
+|---|---|---|
+| `WARP_SIZE = 64` for AMD (commit `9d05c0f`) | MultiCross bprop kernels (`matrix_pair_mul_kernel`, `row_scaling_sum_kernel`) used hardcoded `WARP_SIZE = 32` warp masks; on wave64 this caused cross-row contamination | Unblocked per-rank batch up to 1024. Beyond that → still NaN. |
+| FP16 BGRADA hardening (commit `5439485`) | FP32 accumulation + ±65504 clamp + `isfinite()` guard + pre-divide by 256 for ncclSum FP16 headroom | Per-rank batch up to ~1024 stable. |
+| `clamp_fp16_kernel` post-pass on MultiCross fprop output (commit `0a24ef2`) | Sanitises the per-cross-layer output after `fused_matrix_elementwise_dot_add`, so a single inf/NaN element doesn't poison the next layer's GEMM | **8 × MI350X FP16 batch 55,296 NOW CONVERGES** — first apples-to-apples training run end-to-end. |
+
+Result: 8 × MI350X, FP16 mixed, batch 55,296, real DCN-v2 →
+**5.85 M sps, 100 iters stable, loss 0.285 → 0.254**.
+
+### Phase 3 — HIP graph + intra/inter-iter overlap (commit `eb4fa60`)
+
+Re-enable the solver knobs that the initial port had defaulted off
+because of `hipblasCreate` failures during graph capture. Fixed by
+pre-warming a per-device `hipblasHandle_t` cache via `std::call_once`
+in `CublasAlgo<T>::init_algorithm`.
+
+| Configuration | Throughput | Δ vs phase 2 |
+|---|---|---|
+| HIP graph off, no overlap | 5.85 M sps | baseline |
+| HIP graph on, no overlap | 6.09 M sps | +4.1 % |
+| HIP graph on, intra+inter overlap on | **6.26 M sps** | +7.0 % |
+
+### Phase 4 — Multi-hot data path (commit `5e12007`)
+
+The initial port was running on a synthetic single-hot binary (160
+B/row, 26 keys/row). NVIDIA's submission consumes 912-B multi-hot
+records (214 keys/row, sum of `MULTI_HOT_SIZES`). We added:
+
+- `runtime_test/criteo_npy_to_hugectr_bin_mh.py` (NEW, day_0 only first)
+- `runtime_test/criteo_npy_to_hugectr_bin_mh_alldays.py` (NEW)
+- `runtime_test/preprocess_criteo_to_npy_gz.py` (NEW)
+- `runtime_test/process_days.sh` (NEW)
+- `train.py`: `HCTR_USE_MULTI_HOT=1` env knob to enable multi-hot record format
+
+Throughput at this point dropped because multi-hot does ~5× more
+embedding lookups per sample, but the comparison to NVIDIA's 8 × B200
+result is now apples-to-apples (same 912 B/row format).
+
+| Configuration | Throughput |
+|---|---|
+| MULTI-HOT, day_0 only, batch 55,296 | 6.73 M sps |
+| MULTI-HOT, full Criteo (482 M rows), batch 55,296 | 5.73 M sps (smaller working set fits HBM caches less well at full data) |
+
+### Phase 5 — Fused MLP epilogue emulation (commits `2ee57e7`, `0d9a35e`, `61ce55b`)
+
+Add `RELU_AUX` / `DRELU` / `DRELU_BGRAD` epilogue emulation to the
+`hipblasGemmEx` fallback so `Layer_t.MLP` can run on AMD. Includes:
+
+- `fprop_relu_aux_kernel`: cuBLASLt-format bit-packed mask write
+- `bprop_drelu_kernel`: applies the saved mask to the bprop GEMM output
+- `bprop_drelu_kernel<true>`: + computes bgrad column-sum
+- BIAS-fix in `set_fprop_attr` so the bias term doesn't get dropped on hidden ReLU layers (commit `0d9a35e`)
+- Bias + ReLU + aux fused into a single `fprop_bias_relu_aux_kernel` (commit `61ce55b`)
+
+Status: works on multi-GPU (correctness ✓ after BIAS fix); enabled
+via `HCTR_USE_FUSED_MLP=1`. Currently slower than the InnerProduct
+stack (4.83 vs 12.55 M sps at NVIDIA's batch). Restoring fused MLP as
+a perf win needs a real single-kernel HIP/MFMA GEMM.
+
+### Phase 6 — V5 2D-tile bgrad/bgrada kernels (commits `56bc046`, `63a9c54`, `4fc896a`)
+
+`rocprof --stats` showed `reduce_sum_columns_kernel` (the V1 BGRADA
+post-pass) was **49 %** of all GPU time on a single-GPU run — a
+~289 ms / 590 ms hot kernel. The V1 design (one block per row,
+256-thread cooperative scan, uncoalesced reads at stride-`m`) hit
+~1 % CU utilisation at small `m`.
+
+Replaced with a V5 design: 2D tile (BLOCK_M=64 rows × N_TILE=1024 cols
+per block), wave-aligned coalesced reads, atomicAdd into a per-device
+pre-allocated FP32 scratch, finalize kernel divides + clamps + casts.
+Pre-warmed via `std::call_once` so HIP graph capture sees the alloc done.
+
+The same design is applied to both:
+- `bprop_drelu_bgrad_v5_kernel` (commit `56bc046`) — for the dgrad GEMM's DRELU+BGRAD epilogue
+- `bgrada_v5_kernel` (commit `63a9c54`) — for the wgrad GEMM's BGRADA epilogue (used by MultiCross)
+
+| Configuration | Throughput | Δ |
+|---|---|---|
+| pre-V5 (legacy reduce_sum_columns) | 5.73 M sps | baseline |
+| V5 in source but stale build → V5 not engaged | 5.73 M sps | (none — not actually running V5) |
+| **V5 actually engaged after clean rebuild** (commit `4fc896a`) | **11.24 M sps** | **+96 %** |
+
+This was the single biggest win in the entire port. The measurement
+also exposed an embarrassing process bug: the V5 kernels were in the
+binary but the build I'd been benchmarking against was stale, so V5
+was never running. Verified by adding a one-shot `[HCTR-V5] ... path=V5`
+diag print and watching it fire on the first BGRADA call.
+
+### Phase 7 — FP16 clamp folded into MultiCross FMA (commit `93aad5c`)
+
+The `clamp_fp16_kernel` from phase 2 was running 3× per iter as a
+separate kernel (7.45 ms over 60 iters in the rocprof trace).
+Folded the sanitise into `vector_fma{3,4}_align8<__half>`'s store
+path via a new `__device__ sanitize_half2_fp16` helper. Same memory
+access pattern, free ALU.
+
+| Configuration | Throughput | Δ |
+|---|---|---|
+| separate clamp kernel | 11.24 M sps | baseline |
+| **clamp inline in FMA** | **11.57 M sps** | +2.9 % at NVIDIA's batch |
+| **clamp inline in FMA, sweet-spot batch 110,592** | **16.01 M sps** | **+15 %** at sweet-spot batch |
+
+### Phase 8 — Re-enable intra/inter-iteration overlap (commit `68e560e`)
+
+`train.py` already defaults `HCTR_INTRA_OVERLAP=1` and
+`HCTR_INTER_OVERLAP=1` — earlier benchmark scripts were explicitly
+setting both to 0 because an early sweep on day_0-only data showed
+slight regression. With V5 + clamp-fold + full-Criteo, overlap-on
+is now a clean win:
+
+| Batch | Overlap off | Overlap on | Δ |
+|---|---|---|---|
+| 55,296 (NVIDIA's exact) | 11.57 M sps | **12.55 M sps** | **+8.5 %** |
+| 110,592 (AMD sweet spot) | 16.01 M sps | **16.89 M sps** | +5.5 % |
+
+### Final cumulative results
+
+After all eight phases, on full real Criteo, FP16 mixed,
+multi-hot, 8 × MI350X auto sharding, HIP graph + overlap on:
+
+| Batch | Throughput | vs NVIDIA B200 (HF subsample, 13.57 M sps) |
+|---|---|---|
+| **55,296** (NVIDIA's exact) | **12.55 M sps** | 0.92× (still 7.5 % behind) |
+| **110,592** (AMD sweet spot) | **16.89 M sps** | **1.245×** (24.5 % AHEAD) |
+
+Cumulative improvement vs the phase 2 first-converging baseline of
+5.85 M sps: **+114 %** at NVIDIA's batch and **+189 %** at sweet-spot.
+
+The `b200/.../README-b200-1x8.md` companion documents NVIDIA's own
+8 × B200 cluster running on the same HuggingFace Criteo subsample
+hitting **13.57 M sps** (not the publicly-reported 23.02 M sps,
+which is on the no-longer-available 4.2 B-row MLPerf reference
+corpus). So our 16.89 M sps at sweet-spot batch is the first time
+this port has actually beaten an equivalent NVIDIA baseline on
+identical input data.
 
 ## Open work
 
