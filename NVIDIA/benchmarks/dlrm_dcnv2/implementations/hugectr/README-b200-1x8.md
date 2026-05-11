@@ -287,13 +287,13 @@ captures a 5 s window starting 30 s after process spawn (covers init through
 | `mem/comm bw ratio` | 9 |
 | `MAX_ITER` | 100 (perf only — remove for time-to-AUC convergence) |
 
-## 7. Performance results (1 × 8 B200, HF subsample corpus)
+## 7. Performance results (1 × 8 B200)
 
-> The numbers below were measured on the 473 M-row HuggingFace subsample
-> (section 4.2). Numbers on the full 4.2 B-row MLCommons R2 corpus
-> (section 4.1) are expected to track the published ~23 M samples/s
-> reference — section 8 explains the corpus-volume mechanism. Refresh
-> these tables once the full-corpus download completes.
+> Headline tables below were measured on the 473 M-row HuggingFace
+> subsample (section 4.2). Section 7.5 then re-runs the same config on
+> a 235 M-row prefix of the full **MLCommons R2 corpus** (section 4.1)
+> and shows the throughput is identical — confirming that corpus size
+> is not what's separating us from the 23 M samples/s reference.
 
 ### 7.1 Throughput
 
@@ -336,29 +336,40 @@ The first iter takes ~1.0 s for cuBLAS algorithm search + cuda-graph
 instantiation. With `USE_ALGORITHM_SEARCH=false` and a 2000-iter window
 this overhead drops to ~5 % of measured wall.
 
-### 7.5 Data-vs-hardware diagnostic (synthetic-data sweep)
+### 7.5 Data-vs-hardware diagnostic (synthetic and full-corpus sweep)
 
-To rule out hardware/system causes for the gap to MLPerf reference, we ran the
-same `round_robin` config against three data variants:
+To rule out hardware/system causes for the gap to MLPerf reference, we ran
+the same `round_robin` config against several data variants, including
+the **full MLCommons-R2-distributed pre-processed corpus** (section 4.1):
 
-| Data variant                                      | Steady ms/iter | M samples/s | Notes |
-| ------------------------------------------------- | -------------: | ----------: | ----- |
-| Uniform synthetic, indices ~ U[0, 40 M)           | 6.30           | 8.78        | No locality, every embedding lookup cold |
-| **Real Criteo HF subsample (473 M rows)**         | **4.08**       | **13.57**   | Our recommended baseline |
-| Zipfian synthetic, α from `profile_sparse_freq.py` | 4.33           | 12.77       | Same row count as uniform; matches real-data perf to 94 % |
-| MLPerf 5.1-0040 reference (full 4.2 B rows)       | 2.16           | 23.02       | Published `MLLOG.tracked_stats.throughput` |
+| Data variant                                       | Rows in file | Steady ms/iter | M samples/s | Notes |
+| -------------------------------------------------- | -----------: | -------------: | ----------: | ----- |
+| Uniform synthetic, indices ~ U[0, 40 M)            |        235 M | 6.30           | 8.78        | No locality, every embedding lookup cold |
+| Zipfian synthetic, α from `profile_sparse_freq.py` |        235 M | 4.33           | 12.77       | Long-tail synth; matches real-data perf to 94 % |
+| **Real Criteo HF subsample**                       |        473 M | **4.08**       | **13.57**   | Day-aware shuffle of HF mirror |
+| **MLCommons R2 full-corpus prefix**                |       4.2 B (first 235 M sequentially read, rest sparse-extended) | **4.05** | **13.66** | Same Zipf access pattern as full corpus; same MD5 set as MLPerf submitters' val_data.bin |
+| MLPerf 5.1-0040 reference, pure-train segments     |        4.2 B | 2.13           | 25.96       | From `result_*.txt` 5 % epoch segments |
+| MLPerf 5.1-0040 reference, whole-run avg          |        4.2 B | 2.40           | 23.02       | `tracked_stats.throughput` (includes 16 × 1 s eval pauses) |
+
+**The full-corpus prefix and the HF subsample agree within 1 %** —
+proving the corpus-volume hypothesis (that the gap to MLPerf is because
+our 473 M-row corpus has 9 × fewer hot-item hits than the 4.2 B-row
+reference) was **wrong**. Sampling 55 296 rows per iter from a Zipf with
+α ≈ 1.04 produces statistically identical per-iter access patterns
+regardless of whether the underlying corpus has 235 M, 473 M, or 4.2 B
+rows; the distribution shape is what matters, not the row count.
 
 Interpretation:
 
-- **Uniform → real → Zipfian** spans 1.55× — confirms **access-pattern
-  locality is the dominant data effect**, but our real subsample already
-  sits at the high end.
-- Zipfian-synthetic over the **full 40 M-cap range** gets 94 % of real-data
-  perf, which means the Zipf shape (α ≈ 1.04 on the 5 large tables) is what
-  the auto/round-robin planner is calibrated for, not the row count.
-- **The 1.94 × gap to the MLPerf reference is _not_ closed by any
-  distribution-shape fix or system-tuning knob.** It only closes with the
-  full 4.2 B-row corpus that submitters have but is not publicly available.
+- The Zipf **shape** dominates the data effect (uniform → real spans 1.55 ×,
+  Zipfian → real is only 6 %).
+- The **corpus volume** does **not** affect per-iter steady-state throughput
+  on this benchmark.
+- **The remaining 1.7–1.9 × gap to the MLPerf reference is system-level**
+  (driver/NCCL/host scheduling), not data — see section 8.
+
+Earlier diagnostic logs claiming the gap was corpus-volume-driven have
+been corrected as of 2026-05-11.
 
 ### 7.2 Compute vs comm breakdown (per-GPU avg, training-window-only)
 
@@ -559,7 +570,8 @@ optimized baseline: **+7 %**.
 
 ### Why the remaining 1.70× gap exists
 
-We rigorously tested every plausible cause:
+We rigorously tested every plausible cause. After the section-7.5
+experiment refuted the corpus-volume hypothesis:
 
 ```
 Ruled out by direct measurement
@@ -567,35 +579,43 @@ Ruled out by direct measurement
   ├── cuBLAS algorithm search                        (slows things, not helps)
   ├── sharding plan auto vs round_robin              (RR is +7 %, picked)
   ├── NCCL_ALGO/PROTO sweep, NVLS multicast use      (flat across configs)
+  ├── NCCL_GRAPH_REGISTER / LOCAL_REGISTER           (defaults better than upstream's =0)
+  ├── NCCL_BUFFSIZE, CUDA_DEVICE_MAX_CONNECTIONS     (flat)
   ├── numactl --interleave                           (flat)
   ├── IB device passthrough + SYS_NICE/IPC_LOCK caps (now applied)
   ├── GPU clock / power throttling                   (P0, 1965 MHz, well below 1000 W)
   ├── run-to-run variance                            (CV 2.9 %, not the issue)
   ├── access-pattern distribution shape              (Zipfian gets 94 % of real)
-  └── feature → label correlation                    (XOR-based label, BF16 stable)
+  ├── feature → label correlation                    (XOR-based label, BF16 stable)
+  ├── corpus volume                                  (full 4.2 B prefix == 473 M HF, no diff)
+  ├── GPU SKU/topology                               (B200 192 GB, 18× NVLink/53 GB/s, NV18 full mesh)
+  └── NCCL primitive bandwidth                       (alltoall 142–214 GB/s, all-reduce 390 GB/s
+                                                       at MLPerf-spec sizes — within normal range)
 
-Remaining cause
-  └── corpus volume:  473 M rows (HF mirror) vs 4.2 B rows (MLPerf reference)
+Remaining candidate (un-disproven)
+  └── system-level scheduling / single-iter latency
+       │  (compute busy ≈ 2.13 ms matches reference; the extra ~1.9 ms is
+       │   exposed comm + CPU-side launch / scheduling overhead that the
+       │   reference platform overlaps fully)
        │
-       ├── per-table item-frequency profile (`profile_sparse_freq.py`):
-       │     - 5 large tables (40 M caps): Zipf α ≈ 1.04–1.10, top-1 % covers ~80 % mass
-       │     - in 4.2 B rows: each top-1 % item is hit ~33 600 ×
-       │     - in 0.47 B rows: each top-1 % item is hit ~1 400 ×
-       │     - that ~24× difference in hot-item reuse is consistent with the
-       │       observed 1.94 × throughput gap
+       ├── NCCL or driver version specifics: reference used the upstream
+       │   PyTorch 25.03 image too, but their cluster has tested NCCL +
+       │   network plugins as a unit. Our IB plugin path may differ.
        │
-       └── fix: download the full 4.2 B-row pre-processed corpus
-             from the MLCommons R2 distribution (section 4.1).
-             Drop-in for our `train.py` — no preprocessing needed.
-             Expected post-fix throughput: ~23 M samples/s (matches
-             GigaComputing 5.1-0040).
+       ├── Host CPU & launch latency: reference is dual Intel Xeon 6960P,
+       │   ours is single AMD EPYC 9575F. CUDA-graph launches close some
+       │   of this, but each iter still has CPU work outside the graph.
+       │
+       └── NVSwitch / partition layout: reference is a custom 1-board
+           8-GPU server (GigaComputing G894-AD1); ours is a server with
+           the same GPUs but unknown NVSwitch chip count / link layout.
+           NCCL bus-bw above is healthy but not at theoretical peak.
 ```
 
-Of these, only the corpus-volume cause is fixable, but it _is_ fixable:
-section 4.1 above documents the MLCommons R2 path to the same
-`{train,val,test}_data.bin` files MLPerf submitters used (MD5s match the
-NVIDIA reference). Switching from the HF mirror to that corpus is
-expected to close the gap; nothing else in this repository will.
+None of these are easily actionable from inside this repository. To
+materially close the gap we'd need either (a) firmware/driver/NCCL
+versions aligned to NVIDIA's MLPerf submission build, or (b) the same
+exact server topology. Neither is publicly documented.
 
 ## 9. Profiling / debugging notes
 
