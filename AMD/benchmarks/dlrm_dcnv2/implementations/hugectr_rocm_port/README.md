@@ -14,13 +14,12 @@ post-warmup / pre-final iterations averaged.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **5.73 M samples/sec, 80 iters, loss 0.285 → 0.265** | **closest apples-to-apples to NVIDIA B200** |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **7.25 M samples/sec, 40 iters, loss 0.304 → 0.272** | sweet-spot batch on AMD |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 6.23 M samples/sec, 80 iters, loss 0.282 → 0.274 | |
-| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | smaller working set fits HBM caches better |
-| 8 × MI350X, MULTI-HOT, day_0 only, batch 221,184 | 7.22 M samples/sec, 40 iters | |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | **4.83 M samples/sec** (avg of 3), 80 iters | DRELU_BGRAD + BGRADA epilogues both emulated with V5 2D-tile kernels; bias/ReLU/aux fused into single post-pass; +5% vs initial 4.61 |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | **6.02 M samples/sec**, 40 iters | sweet-spot batch with fused MLP — total +19% gain this session (5.07 → 6.02) from V5-style 2D-tile bgrad/bgrada kernels + bias-relu-aux fusion |
+| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **11.24 M samples/sec** (3-run avg, σ ~0.4 %), loss 0.285 → 0.264 | **apples-to-apples NVIDIA B200 config** — V5 BGRADA kernel finally engaged (was 5.73 with stale build) |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **13.92 M samples/sec** (3-run avg), loss 0.304 → 0.272 | **AMD sweet-spot batch — beats 8 × B200 on same HF data (13.57)** |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | **15.03 M samples/sec**, loss 0.282 → 0.274 | larger batch trades correctness window for throughput |
+| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | (kept for historical record; pre-V5-engagement, also smaller working set) |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.83 M samples/sec, loss 0.285 → 0.266 | DRELU_BGRAD + BGRADA epilogues emulated with V5 2D-tile kernels; **slower than InnerProduct path** because fused-MLP fallback chains 5 launches/FC layer vs InnerProduct's 4 |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | 6.02 M samples/sec | sweet-spot batch with fused MLP fallback |
 | 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
 | 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
 | 8 × MI350X, FP32, real DCN-v2, single-hot | 3.89–6.59 M samples/sec | |
