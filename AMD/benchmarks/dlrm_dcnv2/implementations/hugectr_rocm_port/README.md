@@ -14,8 +14,8 @@ post-warmup / pre-final iterations averaged.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.55 M samples/sec** (3-run avg, σ ~0.4 %), loss 0.285 → 0.264 | **apples-to-apples NVIDIA B200 config** — overlap ON + clamp folded into FMA |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **16.89 M samples/sec**, loss 0.282 → 0.272 | **AMD sweet-spot batch — 24 % AHEAD of 8 × B200 on same HF data (13.57)** |
+| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.74 M samples/sec** (3-run avg, σ ~0.05 %), loss 0.281 → 0.263 | **apples-to-apples NVIDIA B200 config** — V5 add_bias + scratch-zero-skip |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **17.37 M samples/sec**, loss 0.282 → 0.272 | **AMD sweet-spot batch — 28 % AHEAD of 8 × B200 on same HF data (13.57)** |
 | 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 15.03 M samples/sec, loss 0.282 → 0.274 | (overlap-off measurement; rerun pending) |
 | 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | (kept for historical record; pre-V5-engagement, also smaller working set) |
 | 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.83 M samples/sec, loss 0.285 → 0.266 | DRELU_BGRAD + BGRADA epilogues emulated with V5 2D-tile kernels; **slower than InnerProduct path** because fused-MLP fallback chains 5 launches/FC layer vs InnerProduct's 4 |
@@ -35,8 +35,8 @@ same HuggingFace Criteo subsample** (8.7× less data than the unobtainable
 
 | | This port | NVIDIA B200 | Ratio |
 |---|---|---|---|
-| **batch 55,296** (NVIDIA's exact)         | **12.55 M sps** | 13.57 M sps  | 0.92× |
-| **batch 110,592** (AMD sweet spot)        | **16.89 M sps** | 13.57 M sps  | **1.245×** |
+| **batch 55,296** (NVIDIA's exact)         | **12.74 M sps** | 13.57 M sps  | 0.94× |
+| **batch 110,592** (AMD sweet spot)        | **17.37 M sps** | 13.57 M sps  | **1.280×** |
 | **batch 221,184**                          | 15.03 M sps   | 13.57 M sps  | 1.108× |
 
 The breakthrough was discovering that the V5 2D-tile `BGRADA` kernel
@@ -216,33 +216,31 @@ gap needs a real single-kernel HIP/MFMA fused GEMM kernel that
 bundles GEMM + bias + ReLU + aux-write into one launch (3-5 days
 of CUTLASS-AMD work).
 
-### Closing the remaining 7.5 % at NVIDIA's batch — actionable items
+### Closing the remaining 6.1 % at NVIDIA's batch — actionable items
 
-Ordered by EV / effort. (We're already 24.5 % ahead at sweet-spot
+Ordered by EV / effort. (We're already 28 % ahead at sweet-spot
 batch; this section is specifically about the small-batch regime.)
 
-1. **`add_bias_per_row_kernel` → V5 2D-tile**. Trace shows it's
-   0.08 ms/call × 3 calls/iter. The same V5 design we used for
-   BGRAD/BGRADA applies — known to give 2-3× on these shapes.
-   Expected: ~1 % wall.  Effort: ~30 min.
-2. **Consolidate `__amd_rocclr_fillBufferAligned` calls**. ~36 calls
-   per iter, mostly HugeCTR-internal scratch zeroing inside the
-   captured graph. Moving these to a one-time pre-zero of a global
-   scratch arena would save 0.05–0.10 ms/iter (1–2 %).
-   Effort: medium (HugeCTR core change).
-3. **RCCL deep tuning**. Only ran 4 knobs so far (PROTO, ALGO,
+1. **Consolidate the remaining `__amd_rocclr_fillBufferAligned` calls**.
+   We've cut our V5 BGRAD/BGRADA contributions from 6 → 3 calls/iter
+   (commit `b898899`); ~30 calls/iter remain from HugeCTR-internal
+   scratch zeroing (Tensor allocator init, MultiCross v2 `accum_dx`
+   reset, embedding `value_index_per_gpu` reset, etc). Moving these
+   to one-time pre-zero of a global scratch arena would save
+   0.05–0.10 ms/iter (1–2 %). Effort: medium (HugeCTR core change).
+2. **RCCL deep tuning**. Only ran 4 knobs so far (PROTO, ALGO,
    NTHREADS, NCHANNELS); none moved the needle past +1 %. Worth a
    focused pass with `RCCL_DEBUG=INFO` + `RCCL_BUFFSIZE` +
    `RCCL_P2P_LEVEL` + custom topology file once we have a working
    multi-GPU rocprof trace. Expected: 1–4 %.
-4. **Real single-kernel HIP/MFMA fused MLP GEMM**. Closes the
+3. **Real single-kernel HIP/MFMA fused MLP GEMM**. Closes the
    `hipblasGemmEx` vs `cutlass_s128x256_bgrada` gap (~14 % of B200
    time). Would also restore `Layer_t.MLP` to a perf win vs the
    InnerProduct stack. Expected: 3–5 % at small batch, more at large
    batch.  Effort: 3–5 days CUTLASS-AMD work.
-5. **hipBLASLt 7.3+ retest**. When the heuristic exposes candidates
+4. **hipBLASLt 7.3+ retest**. When the heuristic exposes candidates
    for `RELU_AUX_BIAS` / `DRELU_BGRAD` at our shapes, we can drop the
-   fallback entirely. Supersedes #4.
+   fallback entirely. Supersedes #3.
 
 **Out-of-scope** (hardware / data limitations):
 
@@ -668,18 +666,51 @@ is now a clean win:
 | 55,296 (NVIDIA's exact) | 11.57 M sps | **12.55 M sps** | **+8.5 %** |
 | 110,592 (AMD sweet spot) | 16.01 M sps | **16.89 M sps** | +5.5 % |
 
+### Phase 9 — V5-style `add_bias_per_row_v5_kernel` (commit `3b984e4`)
+
+The fprop BIAS post-pass was using a 16×16 thread-block kernel where
+threads in a wave hit strided (i_offset, j_offset) coords → 4 partial
+32-byte chunks per wave per col. Apply the same V5 design (BLOCK_M=64
+rows × N_TILE=128 cols/block, lane in wave = row in stripe, all lanes
+read same j → 128-byte coalesced load) used for V5 BGRADA. Bias[i] is
+loaded once per block per row into shared memory and broadcast across
+N_TILE columns vs the legacy kernel re-fetching from HBM N_TILE times
+per row. FP16-only (FP32 falls through to legacy kernel).
+
+| Batch | Before | After V5 add_bias | Δ |
+|---|---|---|---|
+| 55,296 | 12.55 M sps | **12.72 M sps** (3-run avg) | +1.4 % |
+| 110,592 | 16.89 M sps | **17.33 M sps** | +2.6 % |
+
+### Phase 10 — V5 BGRADA scratch zeroing folded into finalize kernel (commit `b898899`)
+
+V5 BGRAD/BGRADA was issuing a per-iter `hipMemsetAsync` to zero the
+per-device FP32 scratch buffer before each atomicAdd accumulation —
+3 launches per iter at ~15-20 µs each. Move the zeroing into the
+`bgrad_finalize_v5_kernel`: after each thread reads `scratch[i]`,
+divides + clamps + casts to FP16 `dbias[i]`, it ALSO writes 0.0f back
+to `scratch[i]` for the next iter. Same memory access (already
+touching `scratch[i]` for the read), no atomicAdd correctness concern
+(writes happen after the iteration's final accumulation read, before
+the next iter's first atomicAdd).
+
+| Batch | Before | After scratch-zero-skip | Δ |
+|---|---|---|---|
+| 55,296 | 12.72 M sps | **12.74 M sps** (3-run avg) | +0.2 % (within noise) |
+| 110,592 | 17.33 M sps | **17.37 M sps** | +0.2 % |
+
 ### Final cumulative results
 
-After all eight phases, on full real Criteo, FP16 mixed,
-multi-hot, 8 × MI350X auto sharding, HIP graph + overlap on:
+After all ten phases, on full real Criteo, FP16 mixed, multi-hot,
+8 × MI350X auto sharding, HIP graph + overlap on:
 
 | Batch | Throughput | vs NVIDIA B200 (HF subsample, 13.57 M sps) |
 |---|---|---|
-| **55,296** (NVIDIA's exact) | **12.55 M sps** | 0.92× (still 7.5 % behind) |
-| **110,592** (AMD sweet spot) | **16.89 M sps** | **1.245×** (24.5 % AHEAD) |
+| **55,296** (NVIDIA's exact) | **12.74 M sps** | 0.94× (6.1 % behind) |
+| **110,592** (AMD sweet spot) | **17.37 M sps** | **1.280×** (28 % AHEAD) |
 
 Cumulative improvement vs the phase 2 first-converging baseline of
-5.85 M sps: **+114 %** at NVIDIA's batch and **+189 %** at sweet-spot.
+5.85 M sps: **+118 %** at NVIDIA's batch and **+197 %** at sweet-spot.
 
 The `b200/.../README-b200-1x8.md` companion documents NVIDIA's own
 8 × B200 cluster running on the same HuggingFace Criteo subsample
