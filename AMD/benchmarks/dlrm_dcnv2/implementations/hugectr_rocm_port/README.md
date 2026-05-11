@@ -14,10 +14,11 @@ post-warmup / pre-final iterations averaged.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **5.26 M samples/sec, 200 iters, loss 0.288 → 0.265** | **closest apples-to-apples to NVIDIA B200** |
-| 8 × MI350X, MULTI-HOT, FULL Criteo (24 days, 482 M rows), batch 221,184 | **6.23 M samples/sec, 80 iters, loss 0.282 → 0.274** | sweet-spot batch (4× B200) |
+| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **5.73 M samples/sec, 80 iters, loss 0.285 → 0.265** | **closest apples-to-apples to NVIDIA B200** |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **7.25 M samples/sec, 40 iters, loss 0.304 → 0.272** | sweet-spot batch on AMD |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 6.23 M samples/sec, 80 iters, loss 0.282 → 0.274 | |
 | 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | smaller working set fits HBM caches better |
-| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 221,184 | 7.22 M samples/sec, 40 iters | |
+| 8 × MI350X, MULTI-HOT, day_0 only, batch 221,184 | 7.22 M samples/sec, 40 iters | |
 | 8 × MI350X, MULTI-HOT, day_0 only, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.61 M samples/sec, 100 iters, loss 0.285 → 0.264 | DRELU_BGRAD epilogue emulated; correctness ✓ on multi-GPU after 2026-05-10 BIAS fix; perf still below the InnerProduct path until we land a real fused HIP kernel |
 | 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
 | 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
@@ -31,7 +32,38 @@ Criteo, fused MLP, HIP graph): ~30 M samples/sec end-to-end, 2.3 min
 to AUC 0.80275. The closest configuration we can reproduce on AMD
 MI350X (full 24-day Criteo expanded to NVIDIA's 214-key / 912-B
 multi-hot record format, NVIDIA's exact global batch 55,296, FP16
-mixed precision) is **5.26 M samples/sec**, a **5.7×** gap.
+mixed precision) is **5.73 M samples/sec**, a **5.2×** gap. At our
+own AMD-tuned sweet-spot batch (110,592 = 2× the B200 batch) the
+throughput rises to **7.25 M samples/sec**, a **4.1×** gap.
+
+### Where the gap lives — `rocm-smi` profile
+
+A direct `rocm-smi --showuse` sample during steady-state training
+shows **GPU utilisation of only 1–7 %** across all 8 GPUs at the
+sweet-spot batch. The MI350X is mostly idle waiting on host-side
+work — a kernel-launch / data-staging bottleneck, not raw GPU
+compute. Confirmed by:
+
+- HIP graph on vs off: only ~4% delta (5.83 vs 5.59 M sps at batch
+  110,592). On NVIDIA the same flag would typically buy 1.5-3× by
+  bundling launches; here HugeCTR's HIP graph capture is partial
+  (the multi-hot data-reader pipeline and the per-iter MLLog calls
+  are outside the captured region).
+- Larger global batches (221k, 442k, 884k) increase per-iter GPU
+  time but only modestly improve throughput, suggesting per-iter
+  CPU-side overhead dominates.
+- Algorithm-search on/off: neutral — hipBLASLt's heuristic is
+  already being used; the search adds overhead without finding
+  better kernels at our shapes.
+
+**This means the dominant remaining lever is the host-side overhead
+in HugeCTR's iter loop** (in particular the unfused-MLP path's
+multiple kernel launches per FC layer + the data-reader -> embedding
+hand-off), not the GPU compute itself. A real single-kernel fused
+MLP that bundles GEMM + bias + ReLU + aux-write into one launch
+would pay off on two axes — fewer kernels in the captured graph
+(less launch overhead) and fewer post-pass kernels in our fallback
+(less HIP launch overhead) — and is the highest-EV next item.
 
 ### Data: real Criteo, multi-hot synthesis
 

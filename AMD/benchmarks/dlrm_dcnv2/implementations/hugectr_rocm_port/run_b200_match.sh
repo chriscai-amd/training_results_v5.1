@@ -58,7 +58,12 @@ echo "[run] precision_flags='$PRECISION_FLAGS'"
 # which OOMs against the real 204 M-ID TABLE_SIZE_ARRAY at ev_size=128).
 MEM_CAP=${HCTR_MEM_CAP:-256}
 
-python3 train.py \
+ALGO_SEARCH_FLAG=""
+if [ "${HCTR_ENABLE_ALGO_SEARCH:-0}" != "1" ]; then
+    ALGO_SEARCH_FLAG="--disable_algorithm_search"
+fi
+
+python3 train.py $ALGO_SEARCH_FLAG \
     --batchsize "$BATCH" \
     --batchsize_eval "$EVAL_BATCH" \
     --ev_size "$EV_SIZE" \
@@ -73,7 +78,6 @@ python3 train.py \
     --mem_comm_work_ratio "${HCTR_MEM_COMM_WORK_RATIO:-9}" \
     --dp_sharding_threshold "${HCTR_DP_SHARD_THRESH:-0.008}" \
     --memory_cap_for_embedding "$MEM_CAP" \
-    --disable_algorithm_search \
     --gen_loss_summary \
     --optimizer "${HCTR_OPTIMIZER:-adagrad}" \
     $PRECISION_FLAGS 2>&1 | tee /tmp/b200match.log
