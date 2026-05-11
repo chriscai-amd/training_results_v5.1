@@ -129,6 +129,9 @@ __device__ inline T from_f32(float x) { return static_cast<T>(x); }
 template <>
 __device__ inline __half from_f32<__half>(float x) { return __float2half(x); }
 
+// Legacy 16x16 thread-block bias-add kernel. Kept as a fallback for FP32
+// (where the V5 specialisation isn't worth the LDS overhead) and for tiny
+// m where 2D-tile parallelism isn't useful.
 template <typename T>
 __global__ void add_bias_per_row_kernel(T* D, const T* __restrict__ bias, int m, int n) {
   // D is col-major m x n. Bias has length m, broadcast across the n columns.
@@ -144,6 +147,56 @@ __global__ void add_bias_per_row_kernel(T* D, const T* __restrict__ bias, int m,
       else if (v < -kFp16Max) v = -kFp16Max;
     }
     D[off] = from_f32<T>(v);
+  }
+}
+
+// V5-style FP16 bias-add kernel: mirror of bgrada_v5_kernel design, but
+// for the fprop BIAS post-pass (D[i,j] += bias[i] for col-major D). One
+// block processes a (BLOCK_M=64 rows x N_TILE cols) tile; lane in wave
+// is the row, all lanes in a wave read the same column j -> 128-byte
+// coalesced loads/stores. Bias is loaded once per row per block via
+// shared memory broadcast (one __half per row = 128 B for BLOCK_M=64).
+//
+// vs the legacy 16x16 thread-block kernel:
+//   legacy: thread (i, j) reads D[i + j*m]; threads in a wave have
+//           strided (i_wave_offset, j_wave_offset) -> 4 stride-m chunks
+//           per wave, only partially coalesced.
+//   V5:     lane is row in stripe, all lanes in wave read same j ->
+//           1 contiguous 128-byte load per wave per col. Plus the bias
+//           value for each row is in shared mem so we don't refetch
+//           bias[i] from HBM N_TILE times per row.
+template <int BLOCK_M, int N_TILE>
+__global__ void add_bias_per_row_v5_kernel(__half* __restrict__ D,
+                                           const __half* __restrict__ bias,
+                                           int m, int n) {
+  int lane  = threadIdx.x;                    // 0..BLOCK_M-1 (= row in stripe)
+  int wave  = threadIdx.y;                    // 0..(N_TILE/32 - 1)
+  int i = blockIdx.x * BLOCK_M + lane;
+  if (i >= m) return;
+
+  // Load bias[i] once per block into shared mem (lane handles its own row).
+  __shared__ float s_bias[BLOCK_M];
+  if (wave == 0) s_bias[lane] = __half2float(bias[i]);
+  __syncthreads();
+  float b = s_bias[lane];
+
+  int j_start = blockIdx.y * N_TILE + wave * 32;
+  int j_end   = j_start + 32;
+  if (j_end > n) j_end = n;
+  if (blockIdx.y * N_TILE + N_TILE > n) {
+    int total_end = (blockIdx.y + 1) * N_TILE;
+    if (total_end > n) total_end = n;
+    if (j_start >= total_end) return;
+  }
+
+  constexpr float kFp16Max = 65504.0f;
+  for (int j = j_start; j < j_end; ++j) {
+    size_t off = static_cast<size_t>(i) + static_cast<size_t>(j) * m;
+    float v = __half2float(D[off]) + b;
+    if (!isfinite(v)) v = 0.0f;
+    else if (v >  kFp16Max) v =  kFp16Max;
+    else if (v < -kFp16Max) v = -kFp16Max;
+    D[off] = __float2half(v);
   }
 }
 
@@ -417,6 +470,22 @@ __global__ void reduce_sum_columns_kernel(const T* __restrict__ A, T* dbias, int
 template <typename T>
 inline void launch_add_bias_per_row(T* D, const T* bias, int m, int n, hipStream_t s) {
   if (m == 0 || n == 0 || bias == nullptr) return;
+  // FP16 path: V5-style 2D tile (BLOCK_M=64 rows x N_TILE=128 cols/block).
+  // Fully coalesced 128-byte loads, bias broadcast via shared mem.
+  if constexpr (std::is_same<T, __half>::value) {
+    constexpr int BLOCK_M = 64;
+    constexpr int N_TILE  = 128;          // 4 waves x 32 cols/wave
+    constexpr int kWaves  = N_TILE / 32;  // = 4
+    int grid_x = (m + BLOCK_M - 1) / BLOCK_M;
+    int grid_y = (n + N_TILE  - 1) / N_TILE;
+    dim3 block(BLOCK_M, kWaves, 1);
+    dim3 grid(grid_x, grid_y, 1);
+    add_bias_per_row_v5_kernel<BLOCK_M, N_TILE>
+        <<<grid, block, 0, s>>>(reinterpret_cast<__half*>(D),
+                                reinterpret_cast<const __half*>(bias), m, n);
+    return;
+  }
+  // FP32 fallback: legacy 16x16 thread-block kernel.
   dim3 block(16, 16, 1);
   dim3 grid((m + 15) / 16, (n + 15) / 16, 1);
   add_bias_per_row_kernel<T><<<grid, block, 0, s>>>(D, bias, m, n);
