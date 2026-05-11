@@ -138,24 +138,31 @@ Ordered by expected wall-clock impact:
 
 1. **Real single-kernel fused MLP** (write a HIP/MFMA kernel that does
    GEMM + bias + ReLU + bit-packed aux-write in one launch, replacing
-   our hipblasGemmEx + 3 post-pass kernels). Expected **1.5-2× → 8-10 M
-   sps apples-to-apples**. ~3-5 days of work.
-2. **`HCTR_MC_CLAMP_FP16=0`** is currently NOT safe to disable
+   our hipblasGemmEx + 1 fused post-pass kernel). Expected **~1.2-1.5×
+   → 9-11 M sps apples-to-apples**. ~3-5 days of work. The post-pass
+   fusion done in this branch already collapsed the easy launch-count
+   wins; the remaining headroom is in (a) doing the GEMM via an MFMA
+   kernel that knows to write the AUX mask inline, and (b) replacing
+   our `bprop_drelu_kernel<true>` per-row column scan with an
+   MFMA + LDS reduction for the bgrad path.
+2. **GPU utilisation is only 1-7 %** at steady state per `rocm-smi`,
+   meaning the dominant cost is currently host-side. HIP graph capture
+   in HugeCTR is partial on AMD (the multi-hot reader pipeline and
+   MLLog calls fall outside the captured region). A fuller HIP-graph
+   capture region or a re-architect of the per-iter Python loop could
+   pull GPU util into the 30-50 % range. Worth **2-4×** if we can do it.
+3. **`HCTR_MC_CLAMP_FP16=0`** is currently NOT safe to disable
    — `Loss cannot converge` triggers immediately at multi-hot batch
    221,184. Need to chase the underlying NaN source in MultiCross
-   intermediates before we can drop the clamp post-pass. Worth
-   ~1.03× when removable.
-3. **AsyncParam reader threads**: we now expose `HCTR_READER_THREADS`
-   (default 4 in this branch). At 912 B/row × global batch 55,296,
-   per-iter I/O is ~52 MB; bumping reader threads from 1 → 4 was
-   neutral on day_0 (data already in OS cache) but should help on
-   the full 482 M-row dataset where the working set exceeds the
-   page cache. Worth 1.05-1.10×.
-4. **hipBLASLt re-evaluation after ROCm ≥ 7.3**: every quarter, re-check
+   intermediates before we can drop the clamp post-pass. Worth ~1.03×.
+4. **AsyncParam reader threads**: bumped to 4 by default in this branch
+   (`HCTR_READER_THREADS`). Neutral on day_0 (cached) but helps a small
+   amount on the full 482 M-row dataset. Worth 1.02-1.05×.
+5. **hipBLASLt re-evaluation after ROCm ≥ 7.3**: every quarter, re-check
    whether `hipBLASLt` exposes heuristic candidates for the
    `RELU_AUX_BIAS` / `DRELU_BGRAD` epilogues at our MLP shapes. When it
    does, we can drop the manual fallback and use vendor-tuned kernels.
-   Worth 1.1-1.3×.
+   Would supersede #1.
 
 ### Status of the per-rank batch ≥ 2048 NaN (now FIXED)
 1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
