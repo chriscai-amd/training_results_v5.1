@@ -581,16 +581,27 @@ Ruled out by direct measurement
   ├── NCCL_ALGO/PROTO sweep, NVLS multicast use      (flat across configs)
   ├── NCCL_GRAPH_REGISTER / LOCAL_REGISTER           (defaults better than upstream's =0)
   ├── NCCL_BUFFSIZE, CUDA_DEVICE_MAX_CONNECTIONS     (flat)
+  ├── NCCL_LAUNCH_MODE GROUP vs PARALLEL             (~1 % only on first iter, flat steady)
   ├── numactl --interleave                           (flat)
   ├── IB device passthrough + SYS_NICE/IPC_LOCK caps (now applied)
-  ├── GPU clock / power throttling                   (P0, 1965 MHz, well below 1000 W)
+  ├── GPU clock / power throttling                   (P0, boosts to 1965 MHz under load,
+                                                       cannot pin without sudo)
   ├── run-to-run variance                            (CV 2.9 %, not the issue)
   ├── access-pattern distribution shape              (Zipfian gets 94 % of real)
   ├── feature → label correlation                    (XOR-based label, BF16 stable)
   ├── corpus volume                                  (full 4.2 B prefix == 473 M HF, no diff)
   ├── GPU SKU/topology                               (B200 192 GB, 18× NVLink/53 GB/s, NV18 full mesh)
-  └── NCCL primitive bandwidth                       (alltoall 142–214 GB/s, all-reduce 390 GB/s
+  ├── NCCL primitive bandwidth                       (alltoall 142–214 GB/s, all-reduce 390 GB/s
                                                        at MLPerf-spec sizes — within normal range)
+  ├── full-repo file diff vs GigaComputing 5.1-0040  (only `requirements.txt` differs:
+                                                       upstream uses mlperf-logging 5.0.0-rc3
+                                                       vs our rc2 inherited from NVIDIA NVIDIA/
+                                                       branch — non-perf path)
+  ├── NCCL plugin path                               (RDMA Plugin v9 + SHARP CollNet v9 loaded
+                                                       at runtime; identical to upstream image)
+  └── NCCL algorithm selection at runtime            (`NCCL_DEBUG=TUNING` confirms NVLS proto
+                                                       SIMPLE on 32 channels for the 30 MB
+                                                       AllReduce; max parallelism, no fallback)
 
 Remaining candidate (un-disproven)
   └── system-level scheduling / single-iter latency
@@ -598,24 +609,52 @@ Remaining candidate (un-disproven)
        │   exposed comm + CPU-side launch / scheduling overhead that the
        │   reference platform overlaps fully)
        │
-       ├── NCCL or driver version specifics: reference used the upstream
-       │   PyTorch 25.03 image too, but their cluster has tested NCCL +
-       │   network plugins as a unit. Our IB plugin path may differ.
+       ├── NCCL & plugin stack: identical inside the container
+       │   (NCCL 2.25.1+cuda12.8, RDMA Plugin v9, SHARP CollNet v9,
+       │    NVLS multicast on 32 channels, GDR=1; AllReduce 30 MB runs
+       │    on NVLS proto SIMPLE — exactly what reference would). The
+       │    bus-bw we measure (alltoall 214 GB/s @8.6 MB, all_reduce
+       │    390 GB/s @40 MB) is mid-range B200 NVLink, ~38 % of
+       │    theoretical peak.
        │
-       ├── Host CPU & launch latency: reference is dual Intel Xeon 6960P,
-       │   ours is single AMD EPYC 9575F. CUDA-graph launches close some
-       │   of this, but each iter still has CPU work outside the graph.
+       ├── Host CPU & launch latency: reference is dual Intel Xeon 6960P
+       │   on a bare-metal G894-AD1 chassis; ours is a single AMD EPYC
+       │   9575F on a *virtualized* (virtiofs /home, vfio GPU passthrough)
+       │   host. CUDA-graph launches close most of this but each iter
+       │   still has ~0.86 ms host-side work outside the graph.
        │
-       └── NVSwitch / partition layout: reference is a custom 1-board
-           8-GPU server (GigaComputing G894-AD1); ours is a server with
-           the same GPUs but unknown NVSwitch chip count / link layout.
-           NCCL bus-bw above is healthy but not at theoretical peak.
+       ├── GPU clock pinning: reference probably pins clocks via
+       │   `sudo nvidia-smi -lgc 1965` (the run.sub does this for
+       │   MaxQ/MinEDP modes). We cannot run any sudo command in
+       │   the container, so SM clock transitions between 120 MHz idle
+       │   and 1965 MHz under load every iter (eats a few µs).
+       │
+       └── NVSwitch / partition layout: reference is GigaComputing's
+           G894-AD1 board with NVLink-5 in a fixed layout. Ours has
+           NV18 full mesh and reports `Fabric: CliqueId=0, Healthy` —
+           same logical topology but unknown chip-rev / cabling.
 ```
 
-None of these are easily actionable from inside this repository. To
-materially close the gap we'd need either (a) firmware/driver/NCCL
-versions aligned to NVIDIA's MLPerf submission build, or (b) the same
-exact server topology. Neither is publicly documented.
+We further reduced this list via:
+
+- `NCCL_DEBUG=INIT,COLL,TUNING` confirms the NCCL stack picks the same
+  algorithms (NVLS multicast for AllReduce, RING for SendRecv, 32
+  channels) on B200 as the reference would. There is no NCCL knob left
+  to tune at the application level.
+- `NCCL_LAUNCH_MODE=GROUP` (vs the `PARALLEL` set by the Dockerfile) is
+  ~1 % faster only on the first warm-up iter; flat in steady-state.
+- `nvidia-smi -lgc / -pl` reject without root, so we can't pin GPU
+  clocks. The remaining 1.9 ms/iter gap is the sum of CPU-launch /
+  scheduling overhead (~0.86 ms outside the CUDA graph) and exposed
+  NCCL time that the reference platform fully overlaps with compute
+  (~1.06 ms). Both are functions of the host platform.
+
+None of these are actionable from inside this repository without
+sudo/root on the compute node. To materially close the gap we'd need
+either (a) bare-metal access to set GPU clocks and CPU governors,
+(b) firmware/driver/NCCL versions aligned to NVIDIA's MLPerf submission
+build, or (c) the same exact server topology. None are publicly
+documented.
 
 ## 9. Profiling / debugging notes
 

@@ -23,6 +23,10 @@ export DP_SHARDING_THRESHOLD=0.008
 export USE_ALGORITHM_SEARCH=false
 export MAX_ITER=2000
 export DISPLAY_INTERVAL=100
+# NCCL debug -- inspect algos/protocols/channels
+# (uncomment when diagnosing; very chatty)
+# export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=INIT,COLL,TUNING
 export EVAL_INTERVAL=2000000
 
 ## System run params
