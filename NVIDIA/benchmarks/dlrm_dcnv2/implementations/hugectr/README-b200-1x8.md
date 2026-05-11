@@ -49,6 +49,7 @@ Egress         HTTPS only (no plain HTTP through to archive.ubuntu.com)
 | `scripts/gen_synthetic_bin.py`  | new     | Generate `train_data.bin` / `val_data.bin` with **uniform-random** sparse indices over the full 40 M caps. Bypasses the data-prep pipeline; used as a control in the data-vs-hardware diagnostic. |
 | `scripts/gen_zipfian_bin.py`    | new     | Same row format, but per-table **Zipfian** sparse-index draws (α from `profile_sparse_freq.py`) so the access pattern matches real Criteo's long-tail. Includes XOR-of-popular-items label so the BF16 loss path doesn't NaN. |
 | `scripts/criteo_freq_profile.json` | new  | Empirical per-table Zipf parameters fitted on `day_0_sparse.npy` (Step-2 contiguous output). Consumed by `gen_zipfian_bin.py`. |
+| `scripts/breakdown_nsys.py`     | new     | Post-process an `nsys` `.sqlite` trace: auto-detect the training window via NCCL kernel density, then bucket every GPU kernel into compute / NCCL (exposed vs hidden) and report the top-K kernels. Used to produce sections 7.2–7.4. |
 | `Dockerfile`                    | patched | Adds an apt `http://` → `https://` rewrite before `apt-get update` (cluster egress is HTTPS-only to `archive.ubuntu.com`). |
 | `requirements.txt`              | patched | Bumps `mpi4py` from `3.1.5` to `>=4.0.0` (3.1.5 is incompatible with the setuptools shipped in the `nvcr.io/nvidia/pytorch:25.03-py3` base image). |
 | `.gitignore`                    | new     | Local ignore for `**/__pycache__/`. |
@@ -320,55 +321,95 @@ Interpretation:
 
 ### 7.2 Compute vs comm breakdown (per-GPU avg, training-window-only)
 
-The training window is auto-detected via NCCL kernel density (200 ms bins
-with ≥100 NCCL events) — see `breakdown_nsys.py`.
+Captured with `--cuda-graph-trace=node` on the recommended config
+(`config_b200_1x8_round_robin.sh`, 2000-iter run, full-trace mode). The
+training window (1900 iters of steady-state) is auto-detected via NCCL
+kernel density (200 ms bins with ≥100 NCCL events) by
+`scripts/breakdown_nsys.py`.
 
 ```
 metric                  avg/GPU (ms)    sum 8 GPUs (ms)
 ────────────────────────────────────────────────────────
-compute (busy)               196.88          1575.04          (86.1 % of wall)
-comm total                    85.36           682.92
-  exposed                     31.79           254.31          (13.9 % of wall)
-  hidden                      53.58           428.60          (62.8 % of comm hidden)
-wall (any-kernel)            228.67          1829.36
+compute (busy)              4 048.19         32 385.54        (66.8 % of wall)
+comm total                  3 175.16         25 401.26
+  exposed                   2 010.32         16 082.58        (33.2 % of wall)
+  hidden                    1 164.83          9 318.67        (36.7 % of comm hidden)
+wall (any-kernel)           6 058.52         48 468.13
 ```
 
-### 7.3 Top kernels in the training window (training-only, all 8 GPUs)
+Per-iter (over the 1900-iter steady window): wall ≈ 4.08 ms/iter,
+compute busy ≈ 2.13 ms, exposed comm ≈ 1.06 ms.
+
+Note this is meaningfully different from the earlier `auto`-sharding +
+100-iter trace (which showed compute 86 %, exposed comm 14 %). With
+`round_robin` the 5 large 40 M-cap tables land on 5 distinct GPUs so the
+embedding all-to-all has higher payload and more visible exposed time —
+but the overall iter is **shorter**, because round_robin avoids the
+auto-planner cost-model's miscalibration on the HF subsample (see
+section 7.5). i.e. round_robin trades a higher fraction of comm exposure
+for a shorter total iter.
+
+### 7.3 Top kernels in the training window (8 GPUs aggregated, 1 900 iters)
 
 ```
-%      kernel                                       inst   total_ms   role
-─────────────────────────────────────────────────────────────────────────
-16.4%  ncclDevKernel_SendRecv                       3152     488      embedding all-to-all
- 6.5%  ncclDevKernel_AllReduce_Sum_f16              800      195      DDP grad sync
- 6.1%  embedding update4_kernel (Adam)              1600     181      sparse opt
- 4.8%  cub::DeviceRadixSortOnesweep                 7120     144      sparse-index sort
- 4.1%  HugeCTR vector_mul_fma3_align (fp16)         2376     123      fused FMA
- 4.1%  cutlass3x_sm100_s128x256_bgrada (BF16 BWD)   2376     122      MLP backward
- 3.5%  HugeCTR label_and_count_keys                  784     103      sparse prep (KJT)
- 3.4%  embedding multi_to_one_reduce_vec4_v2         800     102      sparse fwd reduction
- 3.0%  nvjet_hsh_128x192_64x7 (cuBLAS GEMM)         2376      88      MLP forward
- 2.5%  ada_grad_update4_kernel                       800      73      dense optimizer
- 2.3%  embedding multi_to_one_warp_per_ev (fp32)     792      70      sparse fwd
- 2.1%  cutlass_80_s16816gemm_drelu (mixed BWD)      1584      62      MLP backward
- 2.1%  HugeCTR vector_fma4_align8                   2376      61      fused FMA
- 1.8%  nvjet_hsh_64x192_64x8 (cuBLAS GEMM)           891      54      MLP fwd
- 1.6%  HugeCTR concat_bwd_kernel                    1584      47      interaction layer bwd
+%      kernel                                                              inst    total_ms   role
+─────────────────────────────────────────────────────────────────────────────────────────────────
+32.0%  ncclDevKernel_SendRecv                                              63 952  22 237      embedding all-to-all
+ 4.5%  ncclDevKernel_AllReduce_Sum_f16_RING_LL                             16 000   3 164      DDP grad sync
+ 3.7%  nvjet_hsh_128x96_64x8 (cuBLAS GEMM)                                 47 976   2 601      MLP fwd/bwd
+ 3.3%  nvjet_hsh_448x128_64x2_1x2_h_bx_TNT                                 47 976   2 323      MLP fwd
+ 3.3%  HugeCTR vector_mul_fma3_align (fp16)                                47 976   2 307      fused FMA
+ 3.1%  embedding update4_kernel (Adam)                                     16 000   2 179      sparse opt
+ 3.0%  embedding multi_to_one_reduce_vec4_v2                               16 000   2 119      sparse fwd reduction
+ 2.9%  cutlass3x_sm100_s128x256_bgrada (BF16 BWD)                          47 976   1 984      MLP backward
+ 2.7%  cub::DeviceRadixSortOnesweep                                        79 952   1 906      sparse-index sort
+ 2.7%  HugeCTR label_and_count_keys                                        15 984   1 882      sparse prep (KJT)
+ 2.5%  embedding multi_to_one_warp_per_ev_vec4 (fp32)                      15 992   1 712      sparse fwd
+ 2.4%  nvjet_hsh_448x128_64x2_1x2_h_bz_bias_NNT                            47 976   1 650      MLP fwd + bias
+ 2.0%  HugeCTR vector_fma4_align8                                          47 976   1 406      fused FMA
+ 1.9%  ada_grad_update4_kernel                                             16 000   1 351      dense optimizer
+ 1.8%  cutlass_80_s16816gemm_drelu                                         31 984   1 224      MLP backward
+ 1.7%  nvjet_hsh_128x192_64x7 (cuBLAS GEMM)                                47 976   1 193      MLP forward
+ 1.7%  nvjet_hsh_128x192_64x7_NNT                                          47 976   1 192      MLP forward
+ 1.6%  embedding multi_to_one_warp_per_ev_vec4_half                        15 992   1 120      sparse fwd
+ 1.6%  embedding one_to_multi_warp_per_ev_vec4_half                        15 992   1 093      sparse bwd scatter
+ 1.4%  cutlass3x_sm100_s256x256_bias_relu_aux                              31 984     953      MLP forward
+ 1.3%  HugeCTR concat_fwd_kernel                                           31 984     879      interaction concat fwd
+ 1.2%  nvjet_hsh_128x192_64x6_2x1_2cta_v_badd_NTT                          15 992     862      MLP fwd
+ 1.2%  HugeCTR convert_array (fp32→fp16)                                   15 992     826      precision cast
+ 1.1%  HugeCTR concat_bwd_kernel                                           31 984     794      interaction concat bwd
+ 1.0%  HugeCTR swizzle_keys                                                15 984     710      sparse prep (KJT)
 ```
 
 ### 7.4 Aggregate buckets (% of GPU time)
 
 ```
-NCCL                       ~23 %   (16.4 + 6.5)
-embedding ops              ~17 %   (update4, multi_to_one, label_and_count)
-sparse infra (sort, cub)    ~6 %   (radix sort + scan)
-MLP fwd/bwd GEMMs          ~14 %   (cutlass_s128x256, nvjet_hsh, drelu)
-elementwise FMA / fused    ~10 %   (vector_mul/fma)
-optimizer (adagrad)         ~3 %
-other (long tail)          ~27 %
+NCCL                       ~37 %   (32.0 SendRecv + 4.5 AllReduce)
+embedding ops              ~21 %   (update4, multi_to_one_reduce/warp_per_ev,
+                                    one_to_multi, label_and_count, swizzle,
+                                    replicate_bucket_range)
+MLP fwd/bwd GEMMs          ~21 %   (5 cutlass3x sm100 + many nvjet_hsh shapes)
+sparse infra (sort, cub)    ~3 %   (radix sort + splitKreduce + scan)
+elementwise FMA / fused     ~5 %   (vector_mul_fma3, vector_fma4)
+MLP support / fused         ~3 %   (drelu, concat fwd/bwd, convert, splitK)
+optimizer (adagrad dense)   ~2 %
+other (long tail)          ~8 %
 ```
 
-DLRM-DCNv2 is **embedding/comm-bound, not compute-bound** on B200. GEMMs are
-only ~14 % of GPU time; embedding lookup + sort + comm dominate.
+DLRM-DCNv2 on B200 in this config is **comm-and-embedding-bound, not
+compute-bound**:
+- NCCL alone is 37 % (up from 23 % in the earlier `auto`-sharding trace —
+  round_robin spreads the 5 big embedding tables across 5 distinct GPUs
+  so their inputs/outputs all need all-to-all).
+- Embedding ops add another 21 %.
+- MLP GEMMs (forward + backward + epilogues) are only ~21 %, which sets
+  the upper bound on B200 Tensor Core utilization for this benchmark
+  (≈14 % MFU peak observed in section 7.2 of an earlier trace).
+
+The 33 % exposed-comm fraction means roughly 1 ms of every 4 ms iter is
+spent waiting on `SendRecv` or `AllReduce` that did not overlap with
+compute — the single biggest target for further perf work would be tighter
+overlap of embedding all-to-all with the dense MLP GEMMs.
 
 ## 8. Comparison vs published MLPerf v5.1 numbers
 
