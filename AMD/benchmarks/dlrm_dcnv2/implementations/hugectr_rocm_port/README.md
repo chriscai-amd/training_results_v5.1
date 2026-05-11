@@ -19,8 +19,8 @@ post-warmup / pre-final iterations averaged.
 | 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 6.23 M samples/sec, 80 iters, loss 0.282 → 0.274 | |
 | 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | smaller working set fits HBM caches better |
 | 8 × MI350X, MULTI-HOT, day_0 only, batch 221,184 | 7.22 M samples/sec, 40 iters | |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.75 M samples/sec, 80 iters, loss 0.285 → 0.266 | DRELU_BGRAD epilogue emulated + bias/ReLU/aux fused into a single post-pass kernel (saves 1 launch / FC fprop); still ~17% below InnerProduct path |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | 5.88 M samples/sec, 40 iters | sweet-spot batch with fused MLP (was 5.07 before the post-pass fusion landed) |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | **4.83 M samples/sec** (avg of 3), 80 iters | DRELU_BGRAD + BGRADA epilogues both emulated with V5 2D-tile kernels; bias/ReLU/aux fused into single post-pass; +5% vs initial 4.61 |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | **6.02 M samples/sec**, 40 iters | sweet-spot batch with fused MLP — total +19% gain this session (5.07 → 6.02) from V5-style 2D-tile bgrad/bgrada kernels + bias-relu-aux fusion |
 | 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
 | 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
 | 8 × MI350X, FP32, real DCN-v2, single-hot | 3.89–6.59 M samples/sec | |
@@ -111,6 +111,20 @@ Roughly attributable to (and what we are doing about each):
     write are now fused into a single `fprop_bias_relu_aux_kernel` —
     cuts one launch per FC fprop, +16 % throughput on the fused-MLP
     path at the AMD sweet-spot batch (5.07 → 5.88 M sps).
+  - **V5 2D-tile kernels for both bgrad post-passes (this branch)**:
+    The legacy `bprop_drelu_kernel` (V1) launched one block per output
+    row + cooperative 256-thread column scan (uncoalesced reads); the
+    legacy `reduce_sum_columns_kernel` (BGRADA) launched one thread per
+    output row total -> ~1% CU util at m=128. Both are now superseded
+    by V5 kernels: 2D tile (BLOCK_M=64 rows × N_TILE=1024 cols/block)
+    with WAVES_PER_BLOCK=4 -> 256 threads/block, lane-in-wave = row in
+    stripe -> 128-byte coalesced reads. Per-block partial sums via
+    shared mem then atomicAdd into a per-device pre-allocated FP32
+    scratch buffer (allocated once via std::call_once before HIP graph
+    capture begins, so per-iter launch path stays graph-safe). Final
+    small kernel divides + clamps + casts to FP16. Net win on full
+    Criteo at batch 110,592: 5.88 → 6.02 M sps (+2%) on top of the
+    post-pass fusion.
   - **Why still slower than InnerProduct stack** (5.88 vs 7.28 M sps
     at sweet-spot batch): the launch-count math now favours fused-MLP
     only marginally. The remaining gap is in bprop, where my
