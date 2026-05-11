@@ -19,7 +19,8 @@ post-warmup / pre-final iterations averaged.
 | 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 6.23 M samples/sec, 80 iters, loss 0.282 → 0.274 | |
 | 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | smaller working set fits HBM caches better |
 | 8 × MI350X, MULTI-HOT, day_0 only, batch 221,184 | 7.22 M samples/sec, 40 iters | |
-| 8 × MI350X, MULTI-HOT, day_0 only, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.61 M samples/sec, 100 iters, loss 0.285 → 0.264 | DRELU_BGRAD epilogue emulated; correctness ✓ on multi-GPU after 2026-05-10 BIAS fix; perf still below the InnerProduct path until we land a real fused HIP kernel |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.75 M samples/sec, 80 iters, loss 0.285 → 0.266 | DRELU_BGRAD epilogue emulated + bias/ReLU/aux fused into a single post-pass kernel (saves 1 launch / FC fprop); still ~17% below InnerProduct path |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | 5.88 M samples/sec, 40 iters | sweet-spot batch with fused MLP (was 5.07 before the post-pass fusion landed) |
 | 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
 | 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
 | 8 × MI350X, FP32, real DCN-v2, single-hot | 3.89–6.59 M samples/sec | |
