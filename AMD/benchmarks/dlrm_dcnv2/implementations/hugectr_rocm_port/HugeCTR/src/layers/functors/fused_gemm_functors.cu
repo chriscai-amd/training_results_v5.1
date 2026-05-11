@@ -156,18 +156,22 @@ __global__ void fprop_bias_relu_aux_kernel(__half* __restrict__ D,
 // (legacy fprop_relu_aux_kernel removed -- the bias-aware fused kernel
 // covers both relu-only and relu+bias paths via the bias=nullptr branch.)
 
-// bprop kernel: applies the saved RELU mask to D in-place; optionally
-// computes dbias = column-sum of masked D.
-// One block per row i; threads in the block cooperatively walk columns
-// (coalesced reads across threadIdx.x), then a shared-memory reduction
-// produces the final dbias[i] in O(log blockDim.x).
+// V1 bprop kernel: one block per output row, kBlock threads cooperatively
+// walk the n cols. Uncoalesced reads (stride m within a warp) but very
+// high parallelism (m blocks, ~m * kBlock total threads) which is what
+// AMD's 304 CU count benefits from. Tried V2/V3 (collapse rows into
+// stripes for coalesced reads) and V4 (2D tile + atomicAdd) — both lost
+// to V1 because they reduced block count from O(m) to O(m/64), starving
+// the GPU. V4 also breaks HIP graph capture (needs hipMalloc per call).
 template <bool ComputeBgrad, int kBlock>
-__global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
-                                   int m, int n, int aux_ld, float bgrad_div) {
+__global__ void bprop_drelu_v1_kernel(__half* __restrict__ D,
+                                      const uint8_t* __restrict__ aux,
+                                      __half* __restrict__ dbias,
+                                      int m, int n, int aux_ld, float bgrad_div) {
   int i = blockIdx.x;
   if (i >= m) return;
   int byte_i = i >> 3;
-  int bit_i = i & 7;
+  int bit_i  = i & 7;
   uint8_t bit_mask = static_cast<uint8_t>(1u << bit_i);
   float sum = 0.0f;
   for (int j = threadIdx.x; j < n; j += kBlock) {
@@ -185,18 +189,17 @@ __global__ void bprop_drelu_kernel(__half* D, const uint8_t* aux, __half* dbias,
     __shared__ float partial[kBlock];
     partial[threadIdx.x] = sum;
     __syncthreads();
-    // Tree reduction within block.
     for (int s = kBlock / 2; s > 0; s >>= 1) {
       if (threadIdx.x < s) partial[threadIdx.x] += partial[threadIdx.x + s];
       __syncthreads();
     }
     if (threadIdx.x == 0) {
-      float s = partial[0] / bgrad_div;
-      if (!isfinite(s)) s = 0.0f;
+      float total = partial[0] / bgrad_div;
+      if (!isfinite(total)) total = 0.0f;
       constexpr float kFp16Max = 65504.0f;
-      if (s > kFp16Max) s = kFp16Max;
-      else if (s < -kFp16Max) s = -kFp16Max;
-      dbias[i] = __float2half(s);
+      if (total >  kFp16Max) total =  kFp16Max;
+      else if (total < -kFp16Max) total = -kFp16Max;
+      dbias[i] = __float2half(total);
     }
   }
 }
@@ -223,18 +226,15 @@ inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
                                int m, int n, int aux_ld, bool compute_bgrad,
                                hipStream_t stream) {
   if (m == 0 || n == 0 || aux == nullptr || D == nullptr) return;
-  // One block per row, kBlock threads/block cooperatively walk the n cols.
   constexpr int kBlock = 256;
-  // Cache the env-knob lookup; default 256 leaves >2 orders of magnitude
-  // FP16 headroom over the 8-rank ncclAllReduce sum even at max bias values.
   static const float kDiv = []() {
     const char* env = getenv("HCTR_DRELU_BGRAD_DIV");
     return env ? std::max(1.0f, static_cast<float>(std::atof(env))) : 256.0f;
   }();
   if (compute_bgrad && dbias) {
-    bprop_drelu_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
+    bprop_drelu_v1_kernel<true,  kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias,   m, n, aux_ld, kDiv);
   } else {
-    bprop_drelu_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld, 1.0f);
+    bprop_drelu_v1_kernel<false, kBlock><<<m, kBlock, 0, stream>>>(D, aux, nullptr, m, n, aux_ld, 1.0f);
   }
 }
 
