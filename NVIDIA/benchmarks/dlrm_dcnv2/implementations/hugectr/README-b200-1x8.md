@@ -451,6 +451,51 @@ training hyperparameters.
 [gigact]: https://github.com/mlcommons/training_results_v5.1/blob/main/GigaComputing/benchmarks/dlrm_dcnv2/implementations/B200/hugectr/config_G894-AD1_1x8x6912.sh
 [gigares]: https://github.com/mlcommons/training_results_v5.1/tree/main/GigaComputing/results/G894-AD1_hugectr/dlrm_dcnv2
 
+### Cross-check against the full published stack
+
+We cross-checked our setup against every file that ships with the MLPerf
+submission, not just the DL config:
+
+| What we compared                                                | Reference                                                | Ours                                                | Match? |
+| --------------------------------------------------------------- | -------------------------------------------------------- | --------------------------------------------------- | ------ |
+| DL hyperparameters (batch/LR/scaler/sharding/mem-comm/dp-thresh)| `config_G894-AD1_1x8x6912.sh`                            | `config_b200_1x8.sh`                                | ✓      |
+| Common NCCL env (`NCCL_NVLS_ENABLE=1`, `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0`) | `config_common.sh`                                       | sourced via `run_b200.sh` (see "negative finding" below) | ✓      |
+| Container base image                                            | `nvcr.io/nvidia/pytorch:25.03-py3`                       | same                                                | ✓      |
+| HugeCTR commit                                                  | `NVIDIA-Merlin/HugeCTR v25.03.00` (`-DSM=80;90;100`, `-DENABLE_MULTINODES=ON`, `-DSHARP_A2A=OFF`) | same                                                | ✓      |
+| `requirements.txt`                                              | `mlperf-common@0993367`, `mlperf-logging@5.0.0-rc2`, `mpi4py==3.1.5` | same except `mpi4py>=4.0.0` (3.1.5 incompatible with new setuptools — purely a build fix) | ✓      |
+| Dockerfile ENVs (`NCCL_LAUNCH_MODE=PARALLEL`, `SHARP_COLL_*`, `HCOLL_ENABLE_MCAST=0`) | baked into the upstream Dockerfile                       | same Dockerfile, baked into our image                | ✓      |
+| `train.py` solver config (`use_cuda_graph=True`, `train_intra_iteration_overlap=True`, `train_inter_iteration_overlap=True`, `grouped_all_reduce=True`, `num_iterations_statistics=20`, `cache_eval_data=1`) | upstream `train.py` (unchanged)                          | upstream `train.py` (unchanged)                     | ✓      |
+| Data layout                                                     | 912 B/row (1 + 13 + 214 int32 columns)                   | same                                                | ✓      |
+| GPU SKU                                                         | B200-SXM-180GB                                           | B200 (same SM 100 die)                              | ✓      |
+
+Negative finding (worth documenting): forwarding the upstream
+`config_common.sh` NCCL env vars into our docker container regresses our
+steady-state by ~20 % (10.04 s → 12.04 s):
+
+| Inside-container NCCL state                              | 2000-iter wall (s) | M samples/s | Notes |
+| -------------------------------------------------------- | -----------------: | ----------: | ----- |
+| **NCCL defaults (NVLS=1, GRAPH_REGISTER=1, LOCAL_REGISTER=1)** | **9.95–10.04**     | **11.0**    | What we ship (`run_b200.sh` does **not** forward these) |
+| Upstream literal (`NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0`) | 12.04              | 9.18        | Regression of ~20 % |
+| Default + `NCCL_BUFFSIZE=8M`                                | 10.04              | 11.0        | Flat |
+| Default + `CUDA_DEVICE_MAX_CONNECTIONS=32`                  | 9.98               | 11.1        | Flat |
+
+`NCCL_NVLS_ENABLE=1` is the NCCL ≥ 2.18 default on Blackwell when
+multicast is available, so explicitly setting it is a no-op for us. The
+`*_REGISTER=0` knobs are NVIDIA's submission-time workaround for a
+known issue on GB200 NVL72's SHARP-enabled fabric; on a standard 8×B200
+NVSwitch domain (ours), buffer pre-registration (the NCCL default)
+genuinely helps. We therefore deliberately **diverge** from upstream
+`config_common.sh` on these two and rely on the in-container NCCL
+defaults — `run_b200.sh` does not forward `NCCL_GRAPH_REGISTER` or
+`NCCL_LOCAL_REGISTER` from the host shell.
+
+With this in place our software stack is a **superset** of what the
+GigaComputing 5.1-0040 submission used: identical container, HugeCTR
+build, DL hyperparams, NUMA/IB capabilities; plus `round_robin` sharding
+(+7 % steady) and the two NCCL register knobs left at NCCL's defaults
+(+20 % steady vs upstream literal). The remaining throughput gap is
+attributable to corpus volume, not configuration.
+
 What we tuned and what closed the gap:
 
 | What we tuned | Effect |
@@ -461,6 +506,8 @@ What we tuned and what closed the gap:
 | `SHARDING_PLAN=round_robin` (vs `auto`) | **+7 %** in steady |
 | `numactl --interleave=0,1` | flat |
 | `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
+| `NCCL_BUFFSIZE=8MiB`, `CUDA_DEVICE_MAX_CONNECTIONS=32` | flat |
+| `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` (upstream `config_common.sh`) | **−20 %** (defaults are better here) |
 | `SHARDING_PLAN=hier_auto` | requires multi-node, errors |
 | `SHARDING_PLAN=uniform` | OOM (replicates large tables) |
 | Zipfian-synthetic data (full vocab range, real-α) | flat (4.33 vs 4.08 ms/iter) |

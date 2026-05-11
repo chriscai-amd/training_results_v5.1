@@ -129,6 +129,8 @@ docker run --rm \
     -e NCCL_ALGO -e NCCL_PROTO -e NCCL_IB_DISABLE \
     -e NCCL_IB_HCA -e NCCL_IB_GID_INDEX -e NCCL_NET_GDR_LEVEL \
     -e NCCL_DEBUG -e NCCL_DEBUG_SUBSYS \
+    -e NCCL_BUFFSIZE -e NCCL_MIN_NCHANNELS -e NCCL_MAX_NCHANNELS \
+    -e NCCL_NCHANNELS_PER_NET_PEER -e CUDA_DEVICE_MAX_CONNECTIONS \
     '${IMAGE}' \
     bash -c '
         if [ -n \"\$NSYS_TRACE\" ]; then
