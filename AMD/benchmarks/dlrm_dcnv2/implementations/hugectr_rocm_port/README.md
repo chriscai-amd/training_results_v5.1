@@ -14,9 +14,9 @@ post-warmup / pre-final iterations averaged.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **11.24 M samples/sec** (3-run avg, σ ~0.4 %), loss 0.285 → 0.264 | **apples-to-apples NVIDIA B200 config** — V5 BGRADA kernel finally engaged (was 5.73 with stale build) |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **13.92 M samples/sec** (3-run avg), loss 0.304 → 0.272 | **AMD sweet-spot batch — beats 8 × B200 on same HF data (13.57)** |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | **15.03 M samples/sec**, loss 0.282 → 0.274 | larger batch trades correctness window for throughput |
+| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.55 M samples/sec** (3-run avg, σ ~0.4 %), loss 0.285 → 0.264 | **apples-to-apples NVIDIA B200 config** — overlap ON + clamp folded into FMA |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **16.89 M samples/sec**, loss 0.282 → 0.272 | **AMD sweet-spot batch — 24 % AHEAD of 8 × B200 on same HF data (13.57)** |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 15.03 M samples/sec, loss 0.282 → 0.274 | (overlap-off measurement; rerun pending) |
 | 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | (kept for historical record; pre-V5-engagement, also smaller working set) |
 | 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.83 M samples/sec, loss 0.285 → 0.266 | DRELU_BGRAD + BGRADA epilogues emulated with V5 2D-tile kernels; **slower than InnerProduct path** because fused-MLP fallback chains 5 launches/FC layer vs InnerProduct's 4 |
 | 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | 6.02 M samples/sec | sweet-spot batch with fused MLP fallback |
@@ -35,9 +35,9 @@ same HuggingFace Criteo subsample** (8.7× less data than the unobtainable
 
 | | This port | NVIDIA B200 | Ratio |
 |---|---|---|---|
-| **batch 55,296** (NVIDIA's exact)         | **11.24 M sps** | 13.57 M sps  | 0.83× |
-| **batch 110,592** (AMD sweet spot)        | **13.92 M sps** | 13.57 M sps  | **1.026×** |
-| **batch 221,184**                          | **15.03 M sps** | 13.57 M sps  | **1.108×** |
+| **batch 55,296** (NVIDIA's exact)         | **12.55 M sps** | 13.57 M sps  | 0.92× |
+| **batch 110,592** (AMD sweet spot)        | **16.89 M sps** | 13.57 M sps  | **1.245×** |
+| **batch 221,184**                          | 15.03 M sps   | 13.57 M sps  | 1.108× |
 
 The breakthrough was discovering that the V5 2D-tile `BGRADA` kernel
 (checked in earlier as commit `63a9c54` for the wgrad bias-gradient
