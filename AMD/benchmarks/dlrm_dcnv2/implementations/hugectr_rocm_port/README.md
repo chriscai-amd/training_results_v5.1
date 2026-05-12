@@ -220,6 +220,8 @@ so future work can skip these):**
 | `HCTR_ENABLE_ALGO_SEARCH=1` | **−0.7 % (algo search regresses)** |
 | `HCTR_USE_CUDA_GRAPH=0` (vs ON) | −0.7 % (graph ON marginally wins, matches NV finding) |
 | `SKIP_ALLREDUCE=1` (debug, no DP allreduce) | −12 % (skipping allreduce hurts due to disabled overlap) |
+| `HCTR_LOOKUP_WARPS_PER_BLOCK` ∈ {1, 2, 4, 8} (default 2) | flat (5-trial avg 11.66 – 11.78 M sps) |
+| `MEM_COMM_BW_RATIO`/`WORK_RATIO` ratio ∈ {1.1, 1.8, 2.25, 4.5} | flat (3-trial avg 11.69 – 11.79 M sps) |
 
 **Conclusion of the audit**: every Python/env-var-level knob NV uses
 to extract perf on B200 has been tested on AMD; only `NCCL_PROTO=LL128`
