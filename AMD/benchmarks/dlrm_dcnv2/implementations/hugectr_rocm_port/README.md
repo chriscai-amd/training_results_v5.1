@@ -180,26 +180,28 @@ Every actionable item below was tested on AMD; results:
 | `RCCL_MSCCL_ENABLE`, `RCCL_MSCCLPP_*` (RCCL-specific) | n/a | flat | Default OK |
 | GPU clock pinning via `rocm-smi --setperflevel high` | n/a | **`Not supported on the given system`** (no sudo, like NV) | Cannot apply |
 
-**Compile-time / kernel-level tunings** (not yet attempted; require
-rebuild + re-validation):
+**Compile-time / kernel-level tunings tested (rebuild + re-validation):**
 
-- **Embedding lookup `kWarpSize=32` → `kWarpSize=64`** in
-  `embedding/operators/generic_lookup.cuh`. The `multi_to_one_*` and
-  `one_to_multi_*` kernels are launched as `block_size{32, 2}` =
-  64-thread blocks. On AMD wave64 each block is exactly 1 wavefront,
-  but the inner `__shfl_sync(0xFFFF...FFULL, l, j)` shuffles across
-  the full 64 lanes while the kernel's `lane_id = threadIdx.x ∈ [0,32)`
-  logic only selects from a 32-lane subset. The second logical CUDA
-  warp (threadIdx.y=1) ends up reading the same shuffled value as
-  the first instead of its own — wasting half the wave on duplicate
-  work. A previous experimental switch to wave64 caused FP16 NaN at
-  large batches (per-comment in the file), but is worth a second
-  attempt now that V5 BGRADA is the wgrad path. A correct port could
-  yield +5–10 % on the embedding portion (NV's profile has these at
-  21 % of total, so call it ~+1–2 % overall).
+- **Embedding lookup launch config** (`generic_lookup.cuh`'s
+  `multi_to_one_warp_per_ev_vec4_kernel` for `max_ev_size <= 256`).
+  Default is `block_size{32, 2}` = 64-thread blocks (NV's CUDA-warp-32
+  split-warp tiling). On AMD wave64 each block is 1 wavefront, and we
+  hypothesised that the inner `__shfl_sync(mask=0xFF...FFULL, l, j)`
+  with `j ∈ [0,32)` would shuffle across the full 64 lanes and waste
+  the second logical warp.
+  Plumbed an `HCTR_LOOKUP_WARPS_PER_BLOCK` env knob that varies
+  `block_size.y` ∈ {1, 2, 4, 8}; A/B-tested 5-trial average:
+  `WARPS=1: 11.78, WARPS=2: 11.73, WARPS=4: 11.74, WARPS=8: 11.66 M sps`
+  → all within 1 % day-to-day noise. **HIP's `__shfl_sync` with
+  block_dim.x=32 is implicitly width-32-aware on AMD CDNA3** — so
+  the second warp is *not* duplicating work; it correctly reads its
+  own 32-lane subgroup. No perf gap here. Knob retained as a
+  diagnostic-only escape hatch.
 - **Per-kernel `dim3 block_size{}` re-tuning** for the small-`m` MLP
   GEMM epilogues — block sizes inherited from CUDA SM-warp-32 sizing
-  rather than CDNA wave-64 sizing. Plausibly +0.5–1 % each.
+  rather than CDNA wave-64 sizing. Not yet attempted; bounded by
+  per-shape rebuild + per-shape correctness check, plausibly +0.5–1 %
+  each.
 
 **Additional knobs swept (all flat or regressed on AMD, now documented
 so future work can skip these):**
