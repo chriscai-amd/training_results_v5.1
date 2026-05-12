@@ -201,6 +201,24 @@ rebuild + re-validation):
   GEMM epilogues — block sizes inherited from CUDA SM-warp-32 sizing
   rather than CDNA wave-64 sizing. Plausibly +0.5–1 % each.
 
+**Additional knobs swept (all flat or regressed on AMD, now documented
+so future work can skip these):**
+
+| Knob | Result |
+|---|---|
+| `OMP_NUM_THREADS` 1/2/4/8/16/32 | flat (11.6 – 11.8 M sps) |
+| `HCTR_READER_THREADS` 1/2/4/8 (NV uses 1) | flat |
+| `HSA_NO_SCRATCH_RECLAIM=0` | **−12 % (must keep at 1)** |
+| `HSA_ENABLE_SDMA=0` | **−7 % (SDMA needed)** |
+| `GPU_MAX_HW_QUEUES` != default | **−40 %** |
+| `HSA_USE_SVM=1` | flat |
+| `AMD_DIRECT_DISPATCH=1` | flat |
+| `AMD_SERIALIZE_KERNEL=0` | flat |
+| `AMD_SERIALIZE_COPY=0` | flat |
+| `HCTR_ENABLE_ALGO_SEARCH=1` | **−0.7 % (algo search regresses)** |
+| `HCTR_USE_CUDA_GRAPH=0` (vs ON) | −0.7 % (graph ON marginally wins, matches NV finding) |
+| `SKIP_ALLREDUCE=1` (debug, no DP allreduce) | −12 % (skipping allreduce hurts due to disabled overlap) |
+
 **Conclusion of the audit**: every Python/env-var-level knob NV uses
 to extract perf on B200 has been tested on AMD; only `NCCL_PROTO=LL128`
 moves the needle and that's already baked in. The remaining gap to
