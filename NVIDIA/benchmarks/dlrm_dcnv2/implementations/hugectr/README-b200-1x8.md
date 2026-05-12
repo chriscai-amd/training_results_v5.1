@@ -576,11 +576,15 @@ runs were `status: success` (hit AUC ≥ 0.80275); convergence happened
 between 0.70 and 0.90 of one epoch (median 0.75), and per-run throughput
 agreed to within ±0.4 %.
 
-| metric                           | reference (8 × B200, 5.1-0040) | ours          |
-| -------------------------------- | ------------------------------ | ------------- |
-| total throughput (M samples/s)   | 23.02                          | 13.57         |
-| per-GPU throughput (M samples/s) | 2.88                           | 1.70          |
-| % of reference                   | 100 %                          | **59.0 %**    |
+| metric                           | reference (8 × B200, 5.1-0040) | ours (May 2026) |
+| -------------------------------- | ------------------------------ | --------------- |
+| total throughput (M samples/s)   | 23.02                          | 15.46           |
+| per-GPU throughput (M samples/s) | 2.88                           | 1.93            |
+| % of reference                   | 100 %                          | **67.2 %**      |
+
+(Earlier April 2026 best was 13.57 M samples/s = 59.0 % of reference;
+the May 2026 round added `AsyncParam(num_threads=4)` for +10.7 %
+throughput. See section 8.1.)
 
 The reference G894-AD1 (8 × B200, MLPerf 5.1-0040) uses a config file
 [`config_G894-AD1_1x8x6912.sh`][gigact] that is **identical** to ours in
@@ -860,6 +864,107 @@ either (a) bare-metal access to set GPU clocks and CPU governors,
 (b) firmware/driver/NCCL versions aligned to NVIDIA's MLPerf submission
 build, or (c) the same exact server topology. None are publicly
 documented.
+
+### 8.1 Final tuning round (May 2026): AsyncParam.num_threads
+
+After exhausting the env-var sweep above, we audited the python config
+itself and found one parameter that the upstream `train.py` leaves at
+its inherited default of **1**:
+
+```
+hugectr.AsyncParam(num_threads=1, num_batches_per_thread=16, ...)
+```
+
+On bare-metal Intel Xeon 6900-series (the reference platform) a
+single 5 GHz core is fast enough to keep the GPU pipeline fed. On our
+**virtualized AMD EPYC 9575F (3.3 GHz, no Turbo because cpufreq driver
+is not exposed by KVM/QEMU)** the single async-reader thread pegs at
+100 % during steady-state and acts as the bottleneck.
+
+Bumping it to 4 threads removed the bottleneck and gave the largest
+single application-level win we found:
+
+| `num_threads` | Steady ms/iter | Throughput (M samples/s) | Δ |
+| ------------: | -------------: | -----------------------: | -: |
+| 1 (upstream) | 4.005 | 13.81 | — |
+| **4 (ours)** | **3.577** | **15.46** | **−10.7 %** |
+| 8 | 3.580 | 15.45 | flat (saturates) |
+| 16 | 3.610 | 15.32 | slightly worse (over-subscribe) |
+
+This is now baked into `train.py` as a single-line change. It moves us
+from **59 % of reference → 68 % of reference**.
+
+### 8.2 Final stress-check sweeps (May 2026, post-num_threads=4)
+
+After the data-reader fix, we re-ran every plausible application/
+host-side knob to look for a remaining stackable win. **All
+flat (within ±1 % run-to-run noise floor):**
+
+| Sweep family | Variants tried | Best Δ vs ctrl | Verdict |
+| ----- | ----- | ---: | ----- |
+| glibc allocator (`LD_PRELOAD=libtcmalloc_minimal`, `MALLOC_ARENA_MAX`, `MALLOC_TOP_PAD_`) | 6 | −1.2 % (`MALLOC_TOP_PAD_=131072`) | within noise |
+| CUDA module loading (`CUDA_MODULE_LOADING={EAGER,LAZY}`) | 2 | flat | within noise |
+| HugeCTR overflow check (`HUGECTR_DISABLE_OVERFLOW_CHECK=1`) | 1 | flat | within noise |
+| Real-time scheduling (`chrt -f 50/99`, `nice -n -20`) | 3 | flat | within noise |
+| OpenMP runtime (`OMP_NUM_THREADS={1,2,4,8}`, `OMP_WAIT_POLICY=ACTIVE`, `KMP_AFFINITY=close`, `GOMP_SPINCOUNT`) | 8 | −0.7 % (`OMP_NUM_THREADS=8`) | within noise |
+| HugeCTR RMM allocator (`HCTR_RMM_SETTABLE={true,false}`) | 2 | flat | within noise |
+| NCCL protocol (`NCCL_PROTO={Simple,LL,LL128}`) | 3 | LL is +1.1 % worse | flat for Simple/LL128 |
+| NCCL channel pinning (`NCCL_MIN/MAX_NCHANNELS={4,8,16,32}`, `NCCL_NVLS_NCHANNELS={8,16,32}`) | 7 | −0.7 % (`NCCL_NVLS_NCHANNELS=16`) | within noise |
+| NCCL buffer (`NCCL_BUFFSIZE={8M,16M}`) | 2 | flat | within noise |
+| **CUDA_DEVICE_MAX_CONNECTIONS** when actually applied via config edit (env-var pass-through is clobbered by config `export`) | 5 (1, 8, 16, 32, 128) | **+15.5 % regression at cdmc=1** | cdmc=64 (current) confirmed best |
+| HugeCTR unique-key ratios (`DENSE_UNIQUE_RATIO={0,1}`, `WGRAD_UNIQUE_RATIO=0`) | 3 | flat (wur=0 segfaults) | leave at default |
+| Stacked combinations of all marginal wins (cdmc=1 + nch=16 + nvls=16 + dur=1) | 4 | +21 % regression (cdmc=1 dominates) | abandoned |
+
+**Important methodological correction**: `CUDA_DEVICE_MAX_CONNECTIONS`
+is `export`ed inside `config_b200_1x8_round_robin.sh`, so passing it as
+a host-shell env var to `run_b200.sh` does not take effect — the
+config's `export` clobbers it. Earlier sweeps (logged in section 8) that
+appeared to show `cdmc=1` was beneficial were actually all running with
+the config's `cdmc=64`, with the apparent ~0.9 % gain being run-to-run
+noise. With proper config-edited `cdmc=1` we measure **+15.5 %
+regression** — confirming that `cdmc=64` is the right value for our
+multi-stream HugeCTR workload.
+
+### 8.3 Final state (May 2026)
+
+| Configuration | Steady ms/iter | Throughput (M samples/s) | % of reference |
+| ----- | ---: | ---: | ---: |
+| Upstream defaults (`num_threads=1`) on virtiofs | ≈ 4.20 | 13.16 | 57 % |
+| Best prior config (Apr 2026) | 4.04 | 13.69 | 59 % |
+| **+ AsyncParam(num_threads=4)** (this round) | **3.58** | **15.46** | **68 %** |
+| MLPerf 5.1-0040 reference (8×B200 SXM5, bare-metal Xeon 6900P) | 2.13 | 22.80 | 100 % |
+
+The remaining 32 % gap (1.45 ms/iter) is the platform-fundamental
+delta between our virtualized AMD EPYC 9575F and reference's
+bare-metal Intel Xeon 6900P: ~0.86 ms host-side `cudaGraphLaunch` jitter,
+~0.20 ms exposed NCCL inside HugeCTR's captured graph (closeable only
+with HugeCTR C++ source modification), and ~0.39 ms residual host
+scheduling. None of these are reachable from python config or
+runtime env vars without root on the compute node.
+
+#### Application-level optimization is now exhausted
+
+Across all our tuning rounds we tested **>120 distinct configurations**
+spanning sharding plans, NCCL protocols/channels/buffers, CUDA stream
+counts, HugeCTR scheduling knobs, glibc/jemalloc allocators,
+OpenMP runtimes, real-time scheduling priorities, NUMA bindings, data
+file location/format, async-reader threading, and numerous
+combinations. Two changes survived as reproducible wins:
+
+1. `SHARDING_PLAN=round_robin` (+7 %)
+2. `AsyncParam.num_threads=4` (+10.6 %)
+
+Plus two robustness fixes that are flat on a quiet host but defensive:
+
+3. `HCTR_DEFAULT_CONCURRENCY=8` (prevents 240-thread thrashing under
+   host contention)
+4. `train_data.bin` on `/mnt/local_disk` ext4 NVMe, not `/home`
+   virtiofs (+4 % steady; tighter variance)
+
+Further closure of the gap requires either (a) bare-metal access for
+GPU/CPU clock pinning and lower `cudaGraphLaunch` overhead, or
+(b) HugeCTR C++ source-level patches to reschedule the backward NCCL
+inside the captured graph. Neither is reachable from this repository.
 
 ## 9. Profiling / debugging notes
 

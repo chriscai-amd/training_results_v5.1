@@ -368,7 +368,11 @@ reader = hugectr.DataReaderParams(
     cache_eval_data=1,
     slot_size_array=TABLE_SIZE_ARRAY,
     async_param=hugectr.AsyncParam(
-        num_threads=1,
+        # num_threads bumped from upstream default (1) to 4: the single-thread
+        # async reader was a bottleneck on our virtualized AMD EPYC host
+        # (saturates a 3.3 GHz core; iter time dropped from 4.00 -> 3.57 ms,
+        # +10.7 % throughput). 4 -> 8 threads is flat; >8 hurts (over-subscribe).
+        num_threads=4,
         num_batches_per_thread=16,
         shuffle=False,
         multi_hot_reader=True,
