@@ -138,6 +138,8 @@ docker run --rm \
     -e NCCL_RUNTIME_CONNECT \
     -e NCCL_GRAPH_MIXING_SUPPORT -e NCCL_CUMEM_ENABLE \
     -e NCCL_CHECKS_DISABLE \
+    -e HCTR_DEFAULT_CONCURRENCY -e DENSE_UNIQUE_RATIO -e WGRAD_UNIQUE_RATIO \
+    -e HCTR_RMM_SETTABLE \
     '${IMAGE}' \
     bash -c '
         if [ -n \"\$NSYS_TRACE\" ]; then

@@ -31,6 +31,15 @@ export DISPLAY_INTERVAL=100
 # NCCL_P2P_NET_CHUNKSIZE=512K, NCCL_MAX_NCHANNELS=16) were all flat.
 export CUDA_DEVICE_MAX_CONNECTIONS=64
 
+# Pin HugeCTR's CPU-side thread pool to one thread per GPU. The default
+# is std::thread::hardware_concurrency() which on a 240-core EPYC = 240
+# threads, all of which compete for CPU when the host is contended.
+# Measured +30 % throughput vs default on this cluster (8.36 -> 10.97
+# M samples/s tracked, 3 trials, HF mirror). The HugeCTR thread pool is
+# only used for housekeeping (data prep, loss summary, planner stats),
+# so 8 workers is plenty.
+export HCTR_DEFAULT_CONCURRENCY=8
+
 # NCCL debug -- inspect algos/protocols/channels
 # (uncomment when diagnosing; very chatty)
 # export NCCL_DEBUG=INFO

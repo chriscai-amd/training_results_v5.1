@@ -646,6 +646,7 @@ What we tuned and what closed the gap:
 | `USE_ALGORITHM_SEARCH=false` | shortens first-iter; flat steady-state (algo-search ON regresses ~10 %) |
 | `SHARDING_PLAN=round_robin` (vs `auto`) | **+7 %** in steady |
 | `CUDA_DEVICE_MAX_CONNECTIONS=64` (vs 8 default) | **+0.9 %** (now in `config_b200_1x8_round_robin.sh`) |
+| **`HCTR_DEFAULT_CONCURRENCY=8`** (vs default = `std::thread::hardware_concurrency()` = 240 on our EPYC) | **+30 %** under host contention; flat on a quiet host. Now in `config_b200_1x8_round_robin.sh`. The default spins 240 worker threads on our 240-core EPYC for what is really just a housekeeping/data-prep pool, and they thrash when the host has other tenants. Also tested 16/32/64; 64 also gave the same win, 16/32 were strictly worse than the 240 default. |
 | `numactl --interleave=0,1` | flat |
 | `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
 | `NCCL_BUFFSIZE=8MiB`, `CUDA_DEVICE_MAX_CONNECTIONS=32` | flat |
@@ -741,6 +742,17 @@ Ruled out by direct measurement
                                                        2.29.7 Blackwell tuning and the
                                                        2.29+ "CE collectives + CUDA graphs"
                                                        hang/perf fix)
+  ├── HugeCTR thread-pool size                       (HCTR_DEFAULT_CONCURRENCY)
+                                                       NOT ruled out -- this is the one
+                                                       application-level lever that *did*
+                                                       move the needle. Default value
+                                                       std::thread::hardware_concurrency()
+                                                       creates 240 worker threads on our
+                                                       240-core EPYC; they thrash when the
+                                                       host is contended. Setting it to 8
+                                                       gives a reproducible +30 % under
+                                                       contention and is now baked into
+                                                       config_b200_1x8_round_robin.sh.
   └── HugeCTR captured-graph scheduling knobs         (patched train.py to set
                                                        grouped_all_reduce=False, fuse_wb=True
                                                        and num_iterations_statistics=100 — all
