@@ -50,6 +50,7 @@ Egress         HTTPS only (no plain HTTP through to archive.ubuntu.com)
 | `scripts/gen_zipfian_bin.py`    | new     | Same row format, but per-table **Zipfian** sparse-index draws (α from `profile_sparse_freq.py`) so the access pattern matches real Criteo's long-tail. Includes XOR-of-popular-items label so the BF16 loss path doesn't NaN. |
 | `scripts/criteo_freq_profile.json` | new  | Empirical per-table Zipf parameters fitted on `day_0_sparse.npy` (Step-2 contiguous output). Consumed by `gen_zipfian_bin.py`. |
 | `scripts/breakdown_nsys.py`     | new     | Post-process an `nsys` `.sqlite` trace: auto-detect the training window via NCCL kernel density, then bucket every GPU kernel into compute / NCCL (exposed vs hidden) and report the top-K kernels. Used to produce sections 7.2–7.4. |
+| `scripts/critical_path_nsys.py` | new     | Per-stream / per-NCCL-kernel breakdown of an `nsys` trace: classifies each NCCL kernel as "with concurrent compute on another stream" vs "on the critical path", lists the busy streams, and rasterizes a 1–2-iter ASCII timeline to expose where comm sits relative to compute. Used to produce section 7.4a. |
 | `Dockerfile`                    | patched | Adds an apt `http://` → `https://` rewrite before `apt-get update` (cluster egress is HTTPS-only to `archive.ubuntu.com`). |
 | `requirements.txt`              | patched | Bumps `mpi4py` from `3.1.5` to `>=4.0.0` (3.1.5 is incompatible with the setuptools shipped in the `nvcr.io/nvidia/pytorch:25.03-py3` base image). |
 | `.gitignore`                    | new     | Local ignore for `**/__pycache__/`. |
@@ -433,7 +434,95 @@ for a shorter total iter.
  1.0%  HugeCTR swizzle_keys                                                15 984     710      sparse prep (KJT)
 ```
 
-### 7.4 Aggregate buckets (% of GPU time)
+### 7.4a Per-stream / critical-path decomposition
+
+Cross-checking against the NVIDIA MLPerf v1.1 blog post on the HugeCTR
+DLRM optimization strategy ("In the forward propagation phase, the
+bottom MLP is performed while the forward all-to-all kernel is waiting
+for the data to arrive. In the backward propagation phase, all-reduce
+and all-to-all are overlapped … to use the idle resources on the GPU"):
+the reference's 2.13 ms/iter steady-state is supposed to equal **pure
+compute time** with all comm hidden.
+
+Our `scripts/critical_path_nsys.py` walks the same `b200_1x8_rr_full.sqlite`
+trace per-stream and per-NCCL-kernel, classifying each NCCL kernel as
+"with concurrent compute on another stream" vs "on the critical path"
+and rasterizing 1–2 iters as ASCII. On GPU 0 of our 1900-iter trace:
+
+```
+total NCCL kernels             :  9,994
+  with concurrent compute      :  9,978   (99.8 %)
+  on critical path (none)      :     16   ( 0.2 %)
+total NCCL time                : 3,560.7 ms across 8 GPUs ( 1.05 ms/iter/GPU)
+  with concurrent compute      : 1,267.0 ms                ( 36 % of NCCL time)
+  on critical path             : 2,293.8 ms                ( 64 % of NCCL time)
+```
+
+So *most NCCL kernels by count* land on streams with parallel compute
+running, but the *largest NCCL kernels* (by time) — embedding all-to-all
+SendRecv plus DDP all-reduce — execute past the end of the compute
+window and therefore most of their *time* is exposed.
+
+The 1-iter rasterization (one char ≈ 20 µs) makes this visible:
+
+```
+stream  |←──────────────── iter 4.08 ms ────────────────→|
+345     |##                          ###CCCCCCCCCCCCCCCCCC######                                                                                                       |
+270     ||##########################      #### #######                                          CCCCCCCCCCCCCCCCCCCCCCCCCCCC###                                       |
+357     ||           ######CCCCCCCCCC#####   CCCCCCCCC ## ####                                                                                                         |
+411     ||                                           ##############   #####                                                                                            |
+410     ||                                    ######## ######                                                                                                          |
+406     ||                     ############                                                                                                                            |
+356     ||   ####### ### ###                                                                                                                                           |
+409     ||                                    ###                                                                                                                      |
+408     ||                                                            ####                                                                                             |
+        |←─ compute (~40 % of iter) ─→|←─ overlapped ─→|←─ exposed ─→|  ←──────── host idle (~35 % of iter) ────────────→|
+```
+
+Two distinct losses are visible:
+
+1. **End-of-iter exposed NCCL** (~0.6 ms / iter): the late SendRecv on
+   stream 345 and the DDP all-reduce on stream 270 run after compute is
+   finished — there's no compute kernel anywhere on the GPU to overlap
+   them with.
+
+2. **End-of-iter host-side idle gap** (~1.4 ms / iter): the GPU is
+   genuinely empty of any kernel for the last ~35 % of the iter wall.
+   This is the per-iter `cudaGraphLaunch` overhead between graph
+   replays — CUDA graph saves intra-iter launch cost, but the host call
+   to enqueue the next graph still has a per-call cost determined by
+   the host driver.
+
+The math closes:
+
+```
+4.08 ms (our iter)
+ −  1.4 ms (host gap between graph replays)
+ −  0.6 ms (end-of-iter exposed NCCL)
+ =  2.08 ms                                  ← matches reference's 2.13 ms
+```
+
+To erase either loss we'd need to change something not exposed at the
+HugeCTR Python or NCCL env level:
+
+- **End-of-iter exposed NCCL.** The captured CUDA graph schedules
+  comm at the end of the iter; the reference is presumably scheduled
+  with backward compute extending into the comm window (the v1.1 blog
+  describes "data gradient computation and weight gradient computation
+  of an MLP are performed in parallel … unlike the data gradients,
+  weight gradients are not needed until the gradient all-reduce"). The
+  schedule is decided by HugeCTR C++ in `model.fit()` and the host CUDA
+  driver's graph optimizer — both fixed when `use_cuda_graph=True` is
+  on.
+
+- **End-of-iter host idle.** Driven by per-graph-launch host overhead.
+  The reference platform's driver (570.x branch in their submission)
+  may produce a tighter inter-iter launch path than our 580.x branch,
+  and bare-metal hosts avoid the virtio-fs / vfio-passthrough latency
+  we incur.
+
+Both are platform-fundamental given our constraints (no sudo / no
+kernel access / no driver-version pinning).
 
 ```
 NCCL                       ~37 %   (32.0 SendRecv + 4.5 AllReduce)
