@@ -754,6 +754,24 @@ Ruled out by direct measurement
                                                        few cores actually feeding the GPU
                                                        data path). Baked into the config as
                                                        belt-and-suspenders.
+  ├── HugeCTR scheduling knobs to attack the host
+  │   gap directly                                    Tested on idle host w/ HF mirror,
+                                                       all within ±5 % run-to-run noise:
+                                                         baseline (gen_loss_summary=true):  9.79 s
+                                                         gen_loss_summary=false           : 10.61 s   (worse)
+                                                         use_cuda_graph=False             :  9.60 s   (flat)
+                                                         train_inter_iteration_overlap=F  : 10.02 s   (flat)
+                                                         HCTR_DEFAULT_CONCURRENCY=1       :  9.82 s   (flat)
+                                                         HCTR_DEFAULT_CONCURRENCY=8       :  9.61 s   (flat)
+                                                       Conclusion: the 1.4 ms host gap
+                                                       between cudaGraphLaunch replays is
+                                                       NOT caused by the per-iter loss
+                                                       readback (turning it off makes things
+                                                       worse) and NOT caused by the captured
+                                                       graph schedule per se (use_cuda_graph
+                                                       =False gets the same number). It is
+                                                       genuinely the host driver / virtio-fs
+                                                       / vfio launch path.
   └── HugeCTR captured-graph scheduling knobs         (patched train.py to set
                                                        grouped_all_reduce=False, fuse_wb=True
                                                        and num_iterations_statistics=100 — all
