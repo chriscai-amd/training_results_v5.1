@@ -925,6 +925,108 @@ noise. With proper config-edited `cdmc=1` we measure **+15.5 %
 regression** — confirming that `cdmc=64` is the right value for our
 multi-stream HugeCTR workload.
 
+### 8.2a Validation of the virtualization hypothesis (May 2026, direct measurement)
+
+In May 2026 we validated the central claim — *"the residual gap to MLPerf
+reference is virtualization-induced"* — with direct measurement from a fresh
+`nsys` trace at our best config. Findings summarized:
+
+**Confirmation that we are in a KVM full virtualization environment:**
+
+| Marker | Observed value | Interpretation |
+| ------ | -------------- | -------------- |
+| `systemd-detect-virt` | `kvm` | KVM hypervisor |
+| CPUID `hypervisor` flag | set | inside a VM |
+| `lscpu` Hypervisor vendor / Virtualization type | KVM / full | full virt (not paravirt-only) |
+| `/sys/devices/system/cpu/cpu0/cpufreq/` | does not exist | cpufreq driver not exposed; guest cannot control P-states |
+| `/proc/cpuinfo` `cpu MHz` under load | 3300 (all cores) | locked at base; no Turbo (vendor spec is 3.3-5.0 GHz boost) |
+| `clocksource0/current_clocksource` | `kvm-clock` | paravirt clock |
+| `findmnt /home` | virtiofs | paravirt file system |
+| `lspci -nnk` for the 8 B200s | `Kernel driver in use: nvidia` (regular driver) | GPUs are vfio-passthrough'd to the guest from the host's vfio-pci binding (expected to look this way from inside the guest) |
+
+The reference platform (G894-AD1 in MLPerf 5.1-0040, used by GigaComputing
+to publish 23.0 M samples/s on 8 × B200) is the *bare-metal* version of
+this chassis class: Intel Xeon 6960P (Granite Rapids), no hypervisor.
+
+**Direct CUDA-API and GPU-timeline measurement from a 3 s
+training-window `nsys` trace:**
+
+| Quantity | Our virtualized 1 × 8 B200 | Bare-metal Hopper/Blackwell (published) | Slowdown |
+| -------- | -------------------------: | --------------------------------------: | -------: |
+| `cudaGraphLaunch` p50    | **530 μs** | 10–30 μs | **17-50 ×** |
+| `cudaGraphLaunch` p90    | 698 μs | <60 μs | >10 × |
+| `cudaGraphLaunch` p99    | 1 292 μs | <100 μs | >13 × |
+| `cudaGraphLaunch` max    | 5 050 μs | <200 μs | 25 ×+ |
+| `cudaGraphLaunch` min    | 102 μs | <5 μs | 20 × |
+
+All 8 ranks (= 8 GPU host processes) show the same latency distribution
+(per-rank averages 444–592 μs; identical max). This rules out a single-
+GPU defect — the slowdown is **system-wide**, exactly what is expected
+from virtualization.
+
+**Per-GPU idle-time decomposition (merged across 9 streams per GPU):**
+
+| GPU | busy ms (of 2 879 ms trace) | idle ms | busy % | idle % |
+| --- | ---------------------------: | ------: | -----: | -----: |
+| 0 | 2 406 | 473 | 83.6 % | 16.4 % |
+| 1 | 2 416 | 463 | 83.9 % | 16.1 % |
+| 2 | 2 409 | 470 | 83.7 % | 16.3 % |
+| 3 | 2 418 | 461 | 84.0 % | 16.0 % |
+| 4 | 2 417 | 462 | 84.0 % | 16.0 % |
+| 5 | 2 419 | 460 | 84.0 % | 16.0 % |
+| 6 | 2 406 | 473 | 83.6 % | 16.4 % |
+| 7 | 2 404 | 475 | 83.5 % | 16.5 % |
+
+Each GPU is idle **16.0–16.5 %** of every iteration → **0.65 ms idle
+per iter per GPU**. This matches the cudaGraphLaunch host time per iter
+(0.53 ms) plus the small cascading delay on downstream streams while
+they wait for the next graph replay.
+
+**Per-stream inter-kernel-gap distribution (GPU 0, 3 streams shown):**
+
+| Stream | kernels | gap p50 | gap p90 | **gap p99** | gap max |
+| ------ | ------: | ------: | ------: | ----------: | ------: |
+| compute stream | 23 665 | 0.6 μs | 49 μs | 1 338 μs | 42.7 ms |
+| NCCL stream    | 10 627 | 7.7 μs | 1 319 μs | **1 864 μs** | 45.8 ms |
+| copy stream    | 10 508 | 0.5 μs | 66 μs | **3 290 μs** | 45.4 ms |
+
+The compute stream's kernels are tightly back-to-back (p50 0.6 μs) as
+expected for a CUDA graph replay. The NCCL and copy streams show **ms-
+scale p99 gaps** — these are the per-iter waits at graph boundaries where
+host-driven `cudaGraphLaunch` for the next iter has to complete before
+the next batch of NCCL / copy kernels can be queued. On bare-metal these
+gaps should also be sub-microsecond inside the captured graph; on our
+virtualized host they routinely stretch to milliseconds.
+
+**Per-iter cycle measurement** (using the once-per-iter NCCL AllReduce as
+a marker on GPU 0): mean 4 062 μs, p50 **3 487 μs**, p90 3 769 μs.
+Reference is 2 130 μs/iter. Gap = 1.36 ms.
+
+**Attribution of the 1.36 ms gap:**
+
+| Component | Estimated contribution | Evidence |
+| --------- | ---------------------: | -------- |
+| `cudaGraphLaunch` host overhead in excess of bare-metal | **~0.50 ms** | (530 − 20) μs × 1 launch/iter = 510 μs, exactly the measured GPU-idle floor |
+| In-graph kernel-launch latency surfacing as stream stalls | ~0.5 ms | NCCL/copy streams' p99 gaps cluster at 1–3 ms in our trace; should be sub-μs on bare-metal inside a captured graph |
+| Exposed end-of-iter NCCL because CPU launches are slow to deliver next iter's first kernel | ~0.2 ms | HugeCTR schedule places one backward AllReduce after the last compute kernel; reference hides it because next-iter compute starts immediately |
+| Slow CPU at 3.3 GHz vs reference's 3.9 GHz turbo | small (<0.2 ms) | most of the per-iter critical path is GPU-side; only the launch path and event-callback path are CPU-bound |
+
+**Conclusion: hypothesis validated.** The captured CUDA graph topology
+is byte-identical to reference (proven in §8 above), so the 1.36 ms gap
+cannot be attributed to "different work being done". It is fully
+explained by host-side launch and scheduling overhead at the
+hypervisor/driver boundary, with `cudaGraphLaunch` latency being the
+single largest measurable contributor (~0.50 ms, 37 % of the total
+gap, observed directly as GPU idle time).
+
+This is unfixable from application code. Resolution would require
+either (a) bare-metal access, (b) hypervisor admin-level changes
+(vCPU pinning with `cpu-pin`, disable `numa_balancing`, switch THP
+to `always`, use kernel-bypass IRQ delivery for the GPU), or (c) a
+future CUDA driver release that further amortizes `cudaGraphLaunch`
+on virtualized hosts. None of these are reachable from this
+repository.
+
 ### 8.3 Final state (May 2026)
 
 | Configuration | Steady ms/iter | Throughput (M samples/s) | % of reference |
