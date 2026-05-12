@@ -140,6 +140,8 @@ docker run --rm \
     -e NCCL_CHECKS_DISABLE \
     -e HCTR_DEFAULT_CONCURRENCY -e DENSE_UNIQUE_RATIO -e WGRAD_UNIQUE_RATIO \
     -e HCTR_RMM_SETTABLE \
+    -e OMP_NUM_THREADS -e OMP_PROC_BIND -e OMP_PLACES -e OMP_WAIT_POLICY \
+    -e GOMP_SPINCOUNT -e KMP_BLOCKTIME -e KMP_AFFINITY \
     '${IMAGE}' \
     bash -c '
         if [ -n \"\$NSYS_TRACE\" ]; then

@@ -647,6 +647,7 @@ What we tuned and what closed the gap:
 | `SHARDING_PLAN=round_robin` (vs `auto`) | **+7 %** in steady |
 | `CUDA_DEVICE_MAX_CONNECTIONS=64` (vs 8 default) | **+0.9 %** (now in `config_b200_1x8_round_robin.sh`) |
 | **`HCTR_DEFAULT_CONCURRENCY=8`** (vs default = `std::thread::hardware_concurrency()` = 240 on our EPYC) | **Robustness fix**: prevents a +30 % perf regression when the host is contended; **flat (within noise) on a quiet host** (4.21 ms baseline vs 4.21 ms with the env var, 2 trials each). Now in `config_b200_1x8_round_robin.sh` because it has no downside. The default spins 240 worker threads on our 240-core EPYC for what is really just a housekeeping/data-prep pool, and they thrash when other tenants share the host. 16 and 32 are strictly worse than 240 under contention; 8 and 64 both recover to the quiet-host baseline. |
+| **Move `train_data.bin` to `/mnt/local_disk` (ext4 NVMe) instead of `/home` (virtiofs)** | **+4 % steady-state** on quiet host (4.21 → 4.04 ms/iter, 3 trials, mean 9.57 s vs 9.79 s) and notably tighter iter-to-iter variance. Driven by O_DIRECT read bandwidth: virtiofs gives **0.58 GB/s** O_DIRECT, ext4 NVMe gives **9.4 GB/s** (16 ×). The async multi-hot data reader doesn't fully sit on the critical path even at virtiofs's slow O_DIRECT — but moving to local NVMe still claws back ~0.17 ms/iter. Recommended for any benchmark run where the host is contended. |
 | `numactl --interleave=0,1` | flat |
 | `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
 | `NCCL_BUFFSIZE=8MiB`, `CUDA_DEVICE_MAX_CONNECTIONS=32` | flat |
@@ -754,6 +755,23 @@ Ruled out by direct measurement
                                                        few cores actually feeding the GPU
                                                        data path). Baked into the config as
                                                        belt-and-suspenders.
+  ├── Data file on slow virtiofs vs local NVMe       Confirmed virtiofs O_DIRECT bandwidth is
+                                                       only 0.58 GB/s vs 9.4 GB/s on ext4 NVMe
+                                                       (16x). Moving the 150 GB train prefix
+                                                       to /mnt/local_disk gives +4 % steady-
+                                                       state (4.21 -> 4.04 ms) and tighter
+                                                       iter-to-iter variance. Modest because
+                                                       the async data reader's prefetch (16
+                                                       batches buffered) mostly hides the
+                                                       slow virtiofs path; but it's worth it
+                                                       for the variance reduction.
+  ├── OpenMP runtime tunings                         (5 variants tested: OMP_NUM_THREADS=8
+                                                       alone, +OMP_WAIT_POLICY=ACTIVE, +OMP_
+                                                       PROC_BIND=close OMP_PLACES=cores, both
+                                                       combined, GOMP_SPINCOUNT=max). Best
+                                                       was active+close at 9.92 s, identical
+                                                       to baseline 9.79 s within noise. The
+                                                       1.4 ms gap isn't OpenMP fork/join.
   ├── HugeCTR scheduling knobs to attack the host
   │   gap directly                                    Tested on idle host w/ HF mirror,
                                                        all within ±5 % run-to-run noise:
