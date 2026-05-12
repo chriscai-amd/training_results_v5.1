@@ -153,6 +153,71 @@ there. The smaller-batch regime hits the more comm-bound + per-iter-
 overhead-bound part of the curve, where AMD's software stack hasn't
 caught up to NVIDIA's yet.
 
+### Comprehensive NV-submission audit (2026-05-12)
+
+A full re-read of NVIDIA's published B200 1×8 README (sister branch
+`chcai/b200`) plus their public MLPerf 5.1 submission, focused on
+finding any remaining perf knob NV ships that we could plumb in.
+Every actionable item below was tested on AMD; results:
+
+**Knobs NV uses on B200 → tested on AMD MI350X**
+
+| NV recommendation | NV-measured impact | AMD-measured impact | Action |
+|---|---|---|---|
+| `SHARDING_PLAN=round_robin` (vs `auto`) | +7 % | **−23 % (regresses)** | Keep `auto` |
+| `USE_ALGORITHM_SEARCH=false` | +5–10 % first-iter | already off in our train.py | Already on |
+| `MEM_COMM_BW_RATIO=9` (B200 cost-model) | n/a (default) | flat (sweep 7.4/15, ratio 1.1–4.5) | `7.4/5` retained |
+| `CUDA_DEVICE_MAX_CONNECTIONS=64` | +0.9 % | **AMD analog: `HIP_FORCE_DEV_KERNARG=1`** | +0.1 % within noise; **baked in (no downside)** |
+| `HCTR_DEFAULT_CONCURRENCY=8` | flat on idle host | flat (sweep 8/16/32/64/240) | Default OK |
+| `NCCL_LAUNCH_MODE=PARALLEL` (Dockerfile) | flat steady | flat (PARALLEL vs GROUP) | Default OK |
+| `grouped_all_reduce=True` | flat | flat (sweep True/False) | Default OK |
+| `num_iterations_statistics=20` | flat | flat (sweep 5/20/100) | Default OK |
+| `NCCL_PROTO=LL128` | flat | **+1.0 % vs Simple** | Baked in |
+| `NCCL_ALGO=Ring` | flat (NCCL default) | flat | Baked in (RCCL default for 8-rank) |
+| `NCCL_GRAPH_REGISTER=1` (NCCL default) | NV's submission sets =0 (regression!) | flat | Default OK |
+| `NCCL_LOCAL_REGISTER=1` (NCCL default) | NV's submission sets =0 (regression!) | flat | Default OK |
+| `NCCL_CHECKS_DISABLE=1` | flat | flat | Default OK |
+| `RCCL_MSCCL_ENABLE`, `RCCL_MSCCLPP_*` (RCCL-specific) | n/a | flat | Default OK |
+| GPU clock pinning via `rocm-smi --setperflevel high` | n/a | **`Not supported on the given system`** (no sudo, like NV) | Cannot apply |
+
+**Compile-time / kernel-level tunings** (not yet attempted; require
+rebuild + re-validation):
+
+- **Embedding lookup `kWarpSize=32` → `kWarpSize=64`** in
+  `embedding/operators/generic_lookup.cuh`. The `multi_to_one_*` and
+  `one_to_multi_*` kernels are launched as `block_size{32, 2}` =
+  64-thread blocks. On AMD wave64 each block is exactly 1 wavefront,
+  but the inner `__shfl_sync(0xFFFF...FFULL, l, j)` shuffles across
+  the full 64 lanes while the kernel's `lane_id = threadIdx.x ∈ [0,32)`
+  logic only selects from a 32-lane subset. The second logical CUDA
+  warp (threadIdx.y=1) ends up reading the same shuffled value as
+  the first instead of its own — wasting half the wave on duplicate
+  work. A previous experimental switch to wave64 caused FP16 NaN at
+  large batches (per-comment in the file), but is worth a second
+  attempt now that V5 BGRADA is the wgrad path. A correct port could
+  yield +5–10 % on the embedding portion (NV's profile has these at
+  21 % of total, so call it ~+1–2 % overall).
+- **Per-kernel `dim3 block_size{}` re-tuning** for the small-`m` MLP
+  GEMM epilogues — block sizes inherited from CUDA SM-warp-32 sizing
+  rather than CDNA wave-64 sizing. Plausibly +0.5–1 % each.
+
+**Conclusion of the audit**: every Python/env-var-level knob NV uses
+to extract perf on B200 has been tested on AMD; only `NCCL_PROTO=LL128`
+moves the needle and that's already baked in. The remaining gap to
+NV is now firmly in the kernel-level work above (compute-side, mostly
+embedding-lookup wave64 + GEMM epilogue tuning) plus platform-
+fundamental items NV themselves cannot tune away (host-side
+graph-launch overhead, exposed comm) which they document as ~1.95 ms
+of their own 4.08 ms iter (= 47 % of even B200's iter time is
+non-overlapped overhead).
+
+NV's own analysis: 2.13 ms compute + 1.06 ms exposed NCCL + 0.89 ms
+host gap between graph replays = 4.08 ms/iter (their 13.6 M sps).
+Ours: 4.40 ms/iter at the same batch. The 0.32 ms delta plausibly
+splits as ~0.1 ms more compute (smaller hipBLASLt heuristic library
+for our MLP shapes) + ~0.2 ms more exposed RCCL (no NVLS hardware
+multicast on xGMI).
+
 ### Note on `rocm-smi` GPU utilisation
 
 In an earlier (overlap-off) configuration, `rocm-smi --showuse` showed

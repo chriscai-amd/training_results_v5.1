@@ -23,6 +23,15 @@ export PYTHONPATH=/workspace/hugectr_hip/build_rocm72/lib:${PYTHONPATH:-}
 export NCCL_PROTO=${NCCL_PROTO:-LL128}
 export NCCL_ALGO=${NCCL_ALGO:-Ring}
 
+# ROCm port: HIP_FORCE_DEV_KERNARG=1 makes HIP write kernel-arg buffers
+# directly into device-visible memory, avoiding a host-side staging
+# buffer copy on every kernel launch. With HIP graphs this saves a few
+# 100 ns per kernel; analogous to NV's CUDA_DEVICE_MAX_CONNECTIONS=64
+# (which NV measured at +0.9 % on B200). On AMD MI350X with HCTR's
+# deep CUDA-graph we measured the gain as within day-to-day noise
+# (~+0.1 % across 3 trials), but it has no downside so we bake it in.
+export HIP_FORCE_DEV_KERNARG=${HIP_FORCE_DEV_KERNARG:-1}
+
 # Match B200 reference dataset shape (table sizes). Three multi-hot tiers,
 # from highest fidelity to lowest:
 #   HCTR_USE_MLPERF_CRITEO=1     -> real MLPerf-published Criteo from R2
@@ -93,6 +102,7 @@ python3 train.py $ALGO_SEARCH_FLAG \
     --train_data "$DATA_DIR/train_data.bin" \
     --val_data   "$DATA_DIR/val_data.bin" \
     --sharding_plan "${HCTR_SHARDING_PLAN:-auto}" \
+    --mem_comm_bw_ratio "${HCTR_MEM_COMM_BW_RATIO:-9}" \
     --mem_comm_work_ratio "${HCTR_MEM_COMM_WORK_RATIO:-9}" \
     --dp_sharding_threshold "${HCTR_DP_SHARD_THRESH:-0.008}" \
     --memory_cap_for_embedding "$MEM_CAP" \

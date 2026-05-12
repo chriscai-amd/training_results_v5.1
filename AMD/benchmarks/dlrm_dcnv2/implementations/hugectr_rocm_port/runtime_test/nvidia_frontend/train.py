@@ -328,8 +328,12 @@ solver = hugectr.CreateSolver(
     eval_intra_iteration_overlap=False,
     eval_inter_iteration_overlap=True,
     all_reduce_algo=hugectr.AllReduceAlgo.NCCL,
-    grouped_all_reduce=True,
-    num_iterations_statistics=20,
+    # ROCm port: HCTR_GROUPED_ALL_REDUCE knob lets us A/B test whether
+    # grouped (one big NCCL allreduce per iter) vs ungrouped (one allreduce
+    # per gradient bucket) is better on RCCL+MI350X. NV's submission uses
+    # grouped=True for B200; we default the same.
+    grouped_all_reduce=os.environ.get("HCTR_GROUPED_ALL_REDUCE", "1") == "1",
+    num_iterations_statistics=int(os.environ.get("HCTR_NUM_ITERATIONS_STATISTICS", "20")),
     perf_logging=False,
     drop_incomplete_batch=True,
     use_embedding_collection=True,
