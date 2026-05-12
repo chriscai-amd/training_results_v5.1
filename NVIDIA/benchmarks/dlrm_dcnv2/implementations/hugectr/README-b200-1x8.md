@@ -616,6 +616,7 @@ recommended config.
 | 11 | May 10   | Host-env stress sweep (60+ configs: glibc allocators, `OMP_*`, `KMP_AFFINITY`, `chrt` real-time, `MALLOC_*`, etc.) | (no change) | — | flat | All ±1 % noise. Application-level config space exhausted. |
 | 12 | May 11   | Validate virtualization hypothesis with direct `nsys` measurement (§8.2a):                       | — | — | — | `cudaGraphLaunch` p50 = 530 μs (vs 10–30 μs bare-metal), 16.0–16.5 % GPU idle/iter, all 8 ranks uniform. |
 | 13 | May 12   | Batch-size scaling falsification test (§8.2b): bs={0.5,1,2,4,8}× with linear fit                  | — | — | — | `t_iter = 0.995 ms + 50.5 ns × batch`; bs8x prediction within 1.3 % of measurement. |
+| 14 | May 12   | Per-component trace breakdown at bs=4× peak config (§8.2c)                                        | — | — | — | `cudaGraphLaunch` p50 = 534 μs at bs=4× vs 530 μs at bs=1× → identical, confirms batch-independent host const. Host overhead drops from 15 % → 4.6 % of iter time. |
 
 The relaxed-batch results (not at MLPerf spec batch, but on the same
 hardware/binary/config — only `BATCHSIZE` changes):
