@@ -90,7 +90,7 @@ if [ "${HCTR_ENABLE_ALGO_SEARCH:-0}" != "1" ]; then
     ALGO_SEARCH_FLAG="--disable_algorithm_search"
 fi
 
-python3 train.py $ALGO_SEARCH_FLAG \
+${HCTR_PROFILE_PREFIX:-} python3 train.py $ALGO_SEARCH_FLAG \
     --batchsize "$BATCH" \
     --batchsize_eval "$EVAL_BATCH" \
     --ev_size "$EV_SIZE" \

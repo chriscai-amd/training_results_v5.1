@@ -224,6 +224,83 @@ so future work can skip these):**
 | `MEM_COMM_BW_RATIO`/`WORK_RATIO` ratio ∈ {1.1, 1.8, 2.25, 4.5} | flat (3-trial avg 11.69 – 11.79 M sps) |
 | `HCTR_MAX_ITER` ∈ {500, 1000, 3000, 5000, 10000} (long-run sweep, fixed DISPLAY=200) | flat (per-200-iter wall 0.95 – 0.99 s; steady 11.27 – 11.52 M sps; mild ~2 % degradation at 10K+ iters) |
 
+### Per-component latency breakdown (rocprofv3 trace, 2026-05-12)
+
+Captured a 50-iter rocprofv3 `--kernel-trace` on the multi-GPU run by adding
+a `HCTR_PROFILE_PREFIX` knob to the run script that wraps the python3
+process. (Earlier attempts with `rocprof` v1 hung; `rocprofv3` works as long
+as it's positioned around the python launcher and the `.rocprofv3` cache dir
+in the python `cwd` is pre-created with write perms.) Analyzer is
+`scripts/analyze_trace.py` (uses RCCL kernels to delineate iters, then
+buckets all 91k kernels by name and computes per-iter steady-state).
+
+Steady-state (35 iters, avg of 8 GPUs, under rocprofv3 overhead):
+
+| Metric | AMD MI350X | NV B200 (b200/README) | Notes |
+|---|---|---|---|
+| Per-iter wall | 4.61 ms | 4.08 ms | -13% |
+| GPU busy (any kernel) | 3.18 ms (69 %) | 3.19 ms (78 %) | similar absolute |
+| Implied host gap | 1.43 ms (31 %) | 0.89 ms (22 %) | AMD is +0.54 ms host-overhead-bound |
+| RCCL on-GPU time | 1.58 ms (34 %) | 1.51 ms (37 %) | similar |
+| **RCCL exposed (compute idle)** | **1.58 ms (100 % of RCCL!)** | **1.06 ms (70 %)** | **AMD: 0 % of RCCL hidden in compute; NV: 30 % hidden** |
+| RCCL hidden in compute | 0 ms | 0.45 ms | |
+| MLP GEMMs (`Cijk_*`) summed across streams | 2.62 ms | ~0.86 ms (21 %) | AMD GEMMs ~3x slower wall |
+| Embedding ops | 0.92 ms | ~0.86 ms | similar |
+| Categories sum (overlap factor) | 6.10 ms (132 % of wall) | -- | confirms intra-stream overlap is happening |
+
+**The single biggest delta is RCCL/compute overlap.** On AMD, every RCCL
+kernel runs serially with all compute kernels — exposed comm = 100 % of
+RCCL time. On NV B200, 30 % of RCCL time is hidden behind compute on
+other streams (per their published profile).
+
+Root cause investigation:
+
+1. **Confirmed via per-iter overlap-amount calculation**: at iter 25 of the
+   trace, RCCL takes 1.495 ms and non-RCCL takes 1.069 ms, but their
+   intersection is exactly 0 µs. The 3 active streams (4323=compute,
+   5300=primary RCCL, 5315=secondary RCCL) interleave but never overlap.
+2. **RCCL launches saturate the GPU**: `ncclDevKernel_Generic_1` launches
+   with `Grid=16384–28672` blocks of 256 threads each. With MI350X's 256
+   CUs × 32 max waves/CU = 8192 max concurrent waves, RCCL alone needs
+   ≥4 GPU passes, fully occupying every CU for the duration. There's no
+   physical room for compute on a different stream to coexist.
+3. **Fixed a related bug found during this audit** (HuggingCTR's
+   `computation_stream_2_` was created without `hipStreamNonBlocking`,
+   making it a blocking stream that implicitly synchronises with stream 0).
+   Fix correctness-verified (loss 0.290070 unchanged) but no perf delta —
+   the root cause is RCCL CU saturation, not the blocking-stream flag.
+4. **CU-footprint reduction sweeps** (`NCCL_MIN/MAX_NCHANNELS` ∈ {4, 8, 16,
+   32, 64, 80, 96, 112, 128, 160, 192} and `NCCL_MAX_CTAS` ∈ {32, 64, 128,
+   192}) were all flat or regressive — RCCL's auto-pick of 112 channels
+   maximises bandwidth, and lowering it loses more in RCCL slowdown than it
+   gains in compute overlap.
+5. NV's overlap on B200 comes from `NCCL_NVLS_ENABLE=1` (NVLink Multicast),
+   which offloads the all-reduce reduction to NVSwitch hardware so the
+   on-GPU NCCL kernel becomes tiny and lets compute coexist. **AMD has no
+   NVLS / hardware-multicast equivalent on Infinity Fabric** in current
+   ROCm 7.2 RCCL (no `mscclpp` library shipped). This is a platform-
+   fundamental gap that cannot be closed at the application level.
+
+The MLP GEMM gap (2.62 ms AMD vs ~0.86 ms NV at 21 % share) is also
+substantial. Top GEMM kernels: `Cijk_Ailk_Bjlk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT256x128x64_MI16x16x1_*`
+and similar Tensile-generated MFMA kernels. NV's hand-tuned `cutlass3x_sm100_*`
+SM100 kernels are evidently denser per-CU. Closing this would require either
+hipBLASLt offline-tuning for our specific MLP shapes, or open-coded MFMA
+kernels for the small-`m` cases; both are tracked as Open Work.
+
+Implication for our 12.5 % gap to NV at the matched batch:
+
+```
+NV B200:  4.08 ms = 2.13 compute + 1.06 exposed RCCL + 0.89 host
+AMD MI350X (this trace): 4.61 ms = 1.60 compute + 1.58 exposed RCCL + 1.43 host
+         (note: total compute summed across streams is 4.5 ms but only takes 1.6 ms wall via overlap)
+```
+
+If we could hide just 50 % of our RCCL in compute (matching NV's 30 %), we'd
+save ~0.8 ms/iter, dropping to 3.81 ms = 14.5 M sps — already past NV's
+13.6 M sps. But the NVLS dependency makes this not actionable from inside
+the application.
+
 ### "23 M sps" — what we'd need to chase NV's published number
 
 NV's published MLPerf 5.1-0040 result on Gigabyte G894-AD1 (8 × B200) is
