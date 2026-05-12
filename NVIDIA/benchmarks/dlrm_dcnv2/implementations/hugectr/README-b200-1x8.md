@@ -59,7 +59,7 @@ Egress         HTTPS only (no plain HTTP through to archive.ubuntu.com)
 | `scripts/critical_path_nsys.py` | new     | Per-stream / per-NCCL-kernel breakdown of an `nsys` trace: classifies each NCCL kernel as "with concurrent compute on another stream" vs "on the critical path", lists the busy streams, and rasterizes a 1–2-iter ASCII timeline to expose where comm sits relative to compute. Used to produce section 7.4a. |
 | `Dockerfile`                    | patched | Adds an apt `http://` → `https://` rewrite before `apt-get update` (cluster egress is HTTPS-only to `archive.ubuntu.com`). |
 | `requirements.txt`              | patched | Bumps `mpi4py` from `3.1.5` to `>=4.0.0` (3.1.5 is incompatible with the setuptools shipped in the `nvcr.io/nvidia/pytorch:25.03-py3` base image). |
-| `train.py`                      | patched | Single-line change vs upstream `train.py`: `AsyncParam(num_threads=4)` (upstream default is `1`). Removes the single-thread data-reader bottleneck on our 3.3 GHz virtualized AMD EPYC host. +10.7 % throughput. See §8.1 and §7.6 row 10. |
+| `train.py`                      | patched | Single-line change vs upstream `train.py`: `AsyncParam(num_threads=4)` (upstream default is `1`). Removes the single-thread data-reader bottleneck on our 3.3 GHz virtualized AMD EPYC host. +10.7 % throughput. See §7.4 row 10. |
 | `.gitignore`                    | new     | Local ignore for `**/__pycache__/`. |
 
 ## 3. Build the docker image (~3 min on a 240-core EPYC + buildkit cache)
@@ -149,7 +149,7 @@ that on our system steady-state throughput lands at **15.78 M samples/s**
 with the recommended config — the same as on the full R2 corpus,
 because per-iter access pattern is what matters not corpus volume. The
 **~23 M samples/s** MLPerf reference number is achievable only on
-bare-metal (see §8.3 for the virtualization-tax decomposition; §7.5
+bare-metal (see §8.3 for the virtualization-tax decomposition; §7.2
 details the corpus-volume-vs-access-pattern experiment).
 
 Skip this section entirely if you used 4.1.
@@ -300,12 +300,6 @@ captures a 5 s window starting 30 s after process spawn (covers init through
 
 ## 7. Performance results (1 × 8 B200)
 
-> Headline tables below were measured on the 473 M-row HuggingFace
-> subsample (section 4.2). Section 7.5 then re-runs the same config on
-> a 235 M-row prefix of the full **MLCommons R2 corpus** (section 4.1)
-> and shows the throughput is identical — confirming that corpus size
-> is not what's separating us from the 23 M samples/s reference.
-
 ### 7.1 Throughput
 
 Headline (recommended config = `config_b200_1x8_round_robin.sh` with the
@@ -333,266 +327,42 @@ The 18 pp throughput jump from 69 % → 87 % when batch grows 4× is the
 direct experimental signature of host-bound overhead — see §8.2b for
 the linear-fit derivation that quantifies it as exactly 0.995 ms/iter.
 
-(Earlier headline numbers — 4.08 ms / 13.6 M samples/s — are preserved
-below for reference; they were the Apr 2026 best, before the May 2026
-data-reader fix.)
+§7.4 below gives the full chronological log of every optimization step
+from Apr → May 2026 (3.24 → 19.82 M samples/s, +512 %).
 
-Apr 2026 headline (for historical comparison, same `round_robin` config
-*without* the `num_threads=4` patch):
+### 7.2 Data-vs-hardware diagnostic (summary)
 
-```
-total          9.44 s for 2000 iters
-avg            4.72 ms/iter, 11.7 M samples/s
-steady state   4.08 ms/iter, 13.6 M samples/s     (excludes first 100 iters)
-```
+Earlier experiments compared synthetic-uniform, synthetic-Zipfian, the
+HF 473 M-row subsample, and a 235 M-row prefix of the full
+**MLCommons R2 corpus** (§4.1). The conclusions are: (i) Zipfian
+**access pattern** (α ≈ 1.04 in the head, fitted by
+`scripts/profile_sparse_freq.py`) dominates the data effect — uniform
+synthetic is 1.55× slower; (ii) **corpus volume does not affect per-iter
+steady-state throughput** — the R2 full-corpus prefix and the HF
+473 M-row subsample agree within 1 % at the same recommended config.
+The remaining 1.4–1.5× gap to MLPerf is **system-level**, not data;
+see §8.2a, §8.2b, §8.2c for the direct-measurement analysis.
 
-Optimization sweep on the HF subsample (all 2000-iter, steady-state excludes first 100):
+### 7.3 Older kernel-level analysis (Apr 2026, superseded)
 
-| Config | per-iter avg (ms) | per-iter steady (ms) | M samples/s steady |  vs auto |
-| ------ | ----------------: | -------------------: | -----------------: | -------: |
-| baseline `auto` (opt cfg)             | 5.33 | 4.38 | 12.6 | 1.00× |
-| `round_robin`                         | **4.72** | **4.08** | **13.6** | **1.07×** |
-| `auto` + `NCCL_PROTO=Simple`          | 5.01 | 4.33 | 12.8 | 1.01× |
-| `auto` without `numactl`              | 4.98 | 4.35 | 12.7 | 1.01× |
-| `round_robin` + `USE_ALGORITHM_SEARCH=true` | 5.36 | 4.50 | 12.3 | 0.97× |
-| `uniform`                             | OOM  | —    | —    | —     |
+An earlier round of kernel-level analysis ran at 4.08 ms/iter
+(`SHARDING_PLAN=round_robin` without the May 2026 `num_threads=4`
+patch) and produced compute-vs-comm, top-kernel, and per-stream
+critical-path breakdowns from a 1900-iter `nsys` trace
+(`b200_1x8_rr_full.nsys-rep`, 181 MB, still in
+`/home/chcai/criteo_synth/results/`). Headline findings at that
+state — NCCL ~37 % of GPU work, embedding ops ~21 %, MLP GEMMs ~21 %,
+exposed-comm budget ~1.0 ms/iter, host-idle between graph replays
+~1.4 ms/iter — have all been **superseded** by the more recent
+May 2026 direct-measurement work in §8.2a, §8.2b, §8.2c, which uses
+the current 3.50 ms/iter (bs=1×) and 11.72 ms/iter (bs=4×) traces.
 
-Run-to-run variance (3 trials, identical `round_robin` config):
+The `scripts/breakdown_nsys.py` and `scripts/critical_path_nsys.py`
+post-processing tools are kept in the repo and remain valid if you
+want to redo the per-stream / per-kernel decomposition on a fresh
+trace.
 
-```
-trial 1   total= 9.76 s   steady= 4.18 ms/iter   13.24 M samples/s
-trial 2   total= 9.48 s   steady= 4.08 ms/iter   13.54 M samples/s
-trial 3   total= 9.84 s   steady= 4.33 ms/iter   12.78 M samples/s
-mean 4.20 ms ± 0.12  (CV 2.9 %)
-```
-
-100-iter measurements (kept for historical context — first-iter compile dominates):
-
-| Run | Wall (100 iters) | Throughput | Per-iter (avg) |
-| --- | ---------------: | ---------: | -------------: |
-| `config_b200_1x8.sh` unprofiled | 1.71 s | 3.24 M samples/s | 17.1 ms |
-| same with `nsys --cuda-graph-trace=node` | 1.83 s | 3.02 M samples/s | 18.3 ms |
-
-The first iter takes ~1.0 s for cuBLAS algorithm search + cuda-graph
-instantiation. With `USE_ALGORITHM_SEARCH=false` and a 2000-iter window
-this overhead drops to ~5 % of measured wall.
-
-### 7.5 Data-vs-hardware diagnostic (synthetic and full-corpus sweep)
-
-To rule out hardware/system causes for the gap to MLPerf reference, we ran
-the same `round_robin` config against several data variants, including
-the **full MLCommons-R2-distributed pre-processed corpus** (section 4.1):
-
-| Data variant                                       | Rows in file | Steady ms/iter | M samples/s | Notes |
-| -------------------------------------------------- | -----------: | -------------: | ----------: | ----- |
-| Uniform synthetic, indices ~ U[0, 40 M)            |        235 M | 6.30           | 8.78        | No locality, every embedding lookup cold |
-| Zipfian synthetic, α from `profile_sparse_freq.py` |        235 M | 4.33           | 12.77       | Long-tail synth; matches real-data perf to 94 % |
-| **Real Criteo HF subsample**                       |        473 M | **4.08**       | **13.57**   | Day-aware shuffle of HF mirror |
-| **MLCommons R2 full-corpus prefix**                |       4.2 B (first 235 M sequentially read, rest sparse-extended) | **4.05** | **13.66** | Same Zipf access pattern as full corpus; same MD5 set as MLPerf submitters' val_data.bin |
-| MLPerf 5.1-0040 reference, pure-train segments     |        4.2 B | 2.13           | 25.96       | From `result_*.txt` 5 % epoch segments |
-| MLPerf 5.1-0040 reference, whole-run avg          |        4.2 B | 2.40           | 23.02       | `tracked_stats.throughput` (includes 16 × 1 s eval pauses) |
-
-**The full-corpus prefix and the HF subsample agree within 1 %** —
-proving the corpus-volume hypothesis (that the gap to MLPerf is because
-our 473 M-row corpus has 9 × fewer hot-item hits than the 4.2 B-row
-reference) was **wrong**. Sampling 55 296 rows per iter from a Zipf with
-α ≈ 1.04 produces statistically identical per-iter access patterns
-regardless of whether the underlying corpus has 235 M, 473 M, or 4.2 B
-rows; the distribution shape is what matters, not the row count.
-
-Interpretation:
-
-- The Zipf **shape** dominates the data effect (uniform → real spans 1.55 ×,
-  Zipfian → real is only 6 %).
-- The **corpus volume** does **not** affect per-iter steady-state throughput
-  on this benchmark.
-- **The remaining 1.7–1.9 × gap to the MLPerf reference is system-level**
-  (driver/NCCL/host scheduling), not data — see section 8.
-
-Earlier diagnostic logs claiming the gap was corpus-volume-driven have
-been corrected as of 2026-05-11.
-
-### 7.2 Compute vs comm breakdown (per-GPU avg, training-window-only)
-
-Captured with `--cuda-graph-trace=node` on the recommended config
-(`config_b200_1x8_round_robin.sh`, 2000-iter run, full-trace mode). The
-training window (1900 iters of steady-state) is auto-detected via NCCL
-kernel density (200 ms bins with ≥100 NCCL events) by
-`scripts/breakdown_nsys.py`.
-
-```
-metric                  avg/GPU (ms)    sum 8 GPUs (ms)
-────────────────────────────────────────────────────────
-compute (busy)              4 048.19         32 385.54        (66.8 % of wall)
-comm total                  3 175.16         25 401.26
-  exposed                   2 010.32         16 082.58        (33.2 % of wall)
-  hidden                    1 164.83          9 318.67        (36.7 % of comm hidden)
-wall (any-kernel)           6 058.52         48 468.13
-```
-
-Per-iter (over the 1900-iter steady window): wall ≈ 4.08 ms/iter,
-compute busy ≈ 2.13 ms, exposed comm ≈ 1.06 ms.
-
-Note this is meaningfully different from the earlier `auto`-sharding +
-100-iter trace (which showed compute 86 %, exposed comm 14 %). With
-`round_robin` the 5 large 40 M-cap tables land on 5 distinct GPUs so the
-embedding all-to-all has higher payload and more visible exposed time —
-but the overall iter is **shorter**, because round_robin avoids the
-auto-planner cost-model's miscalibration on the HF subsample (see
-section 7.5). i.e. round_robin trades a higher fraction of comm exposure
-for a shorter total iter.
-
-### 7.3 Top kernels in the training window (8 GPUs aggregated, 1 900 iters)
-
-```
-%      kernel                                                              inst    total_ms   role
-─────────────────────────────────────────────────────────────────────────────────────────────────
-32.0%  ncclDevKernel_SendRecv                                              63 952  22 237      embedding all-to-all
- 4.5%  ncclDevKernel_AllReduce_Sum_f16_RING_LL                             16 000   3 164      DDP grad sync
- 3.7%  nvjet_hsh_128x96_64x8 (cuBLAS GEMM)                                 47 976   2 601      MLP fwd/bwd
- 3.3%  nvjet_hsh_448x128_64x2_1x2_h_bx_TNT                                 47 976   2 323      MLP fwd
- 3.3%  HugeCTR vector_mul_fma3_align (fp16)                                47 976   2 307      fused FMA
- 3.1%  embedding update4_kernel (Adam)                                     16 000   2 179      sparse opt
- 3.0%  embedding multi_to_one_reduce_vec4_v2                               16 000   2 119      sparse fwd reduction
- 2.9%  cutlass3x_sm100_s128x256_bgrada (BF16 BWD)                          47 976   1 984      MLP backward
- 2.7%  cub::DeviceRadixSortOnesweep                                        79 952   1 906      sparse-index sort
- 2.7%  HugeCTR label_and_count_keys                                        15 984   1 882      sparse prep (KJT)
- 2.5%  embedding multi_to_one_warp_per_ev_vec4 (fp32)                      15 992   1 712      sparse fwd
- 2.4%  nvjet_hsh_448x128_64x2_1x2_h_bz_bias_NNT                            47 976   1 650      MLP fwd + bias
- 2.0%  HugeCTR vector_fma4_align8                                          47 976   1 406      fused FMA
- 1.9%  ada_grad_update4_kernel                                             16 000   1 351      dense optimizer
- 1.8%  cutlass_80_s16816gemm_drelu                                         31 984   1 224      MLP backward
- 1.7%  nvjet_hsh_128x192_64x7 (cuBLAS GEMM)                                47 976   1 193      MLP forward
- 1.7%  nvjet_hsh_128x192_64x7_NNT                                          47 976   1 192      MLP forward
- 1.6%  embedding multi_to_one_warp_per_ev_vec4_half                        15 992   1 120      sparse fwd
- 1.6%  embedding one_to_multi_warp_per_ev_vec4_half                        15 992   1 093      sparse bwd scatter
- 1.4%  cutlass3x_sm100_s256x256_bias_relu_aux                              31 984     953      MLP forward
- 1.3%  HugeCTR concat_fwd_kernel                                           31 984     879      interaction concat fwd
- 1.2%  nvjet_hsh_128x192_64x6_2x1_2cta_v_badd_NTT                          15 992     862      MLP fwd
- 1.2%  HugeCTR convert_array (fp32→fp16)                                   15 992     826      precision cast
- 1.1%  HugeCTR concat_bwd_kernel                                           31 984     794      interaction concat bwd
- 1.0%  HugeCTR swizzle_keys                                                15 984     710      sparse prep (KJT)
-```
-
-### 7.4a Per-stream / critical-path decomposition
-
-Cross-checking against the NVIDIA MLPerf v1.1 blog post on the HugeCTR
-DLRM optimization strategy ("In the forward propagation phase, the
-bottom MLP is performed while the forward all-to-all kernel is waiting
-for the data to arrive. In the backward propagation phase, all-reduce
-and all-to-all are overlapped … to use the idle resources on the GPU"):
-the reference's 2.13 ms/iter steady-state is supposed to equal **pure
-compute time** with all comm hidden.
-
-Our `scripts/critical_path_nsys.py` walks the same `b200_1x8_rr_full.sqlite`
-trace per-stream and per-NCCL-kernel, classifying each NCCL kernel as
-"with concurrent compute on another stream" vs "on the critical path"
-and rasterizing 1–2 iters as ASCII. On GPU 0 of our 1900-iter trace:
-
-```
-total NCCL kernels             :  9,994
-  with concurrent compute      :  9,978   (99.8 %)
-  on critical path (none)      :     16   ( 0.2 %)
-total NCCL time                : 3,560.7 ms across 8 GPUs ( 1.05 ms/iter/GPU)
-  with concurrent compute      : 1,267.0 ms                ( 36 % of NCCL time)
-  on critical path             : 2,293.8 ms                ( 64 % of NCCL time)
-```
-
-So *most NCCL kernels by count* land on streams with parallel compute
-running, but the *largest NCCL kernels* (by time) — embedding all-to-all
-SendRecv plus DDP all-reduce — execute past the end of the compute
-window and therefore most of their *time* is exposed.
-
-The 1-iter rasterization (one char ≈ 20 µs) makes this visible:
-
-```
-stream  |←──────────────── iter 4.08 ms ────────────────→|
-345     |##                          ###CCCCCCCCCCCCCCCCCC######                                                                                                       |
-270     ||##########################      #### #######                                          CCCCCCCCCCCCCCCCCCCCCCCCCCCC###                                       |
-357     ||           ######CCCCCCCCCC#####   CCCCCCCCC ## ####                                                                                                         |
-411     ||                                           ##############   #####                                                                                            |
-410     ||                                    ######## ######                                                                                                          |
-406     ||                     ############                                                                                                                            |
-356     ||   ####### ### ###                                                                                                                                           |
-409     ||                                    ###                                                                                                                      |
-408     ||                                                            ####                                                                                             |
-        |←─ compute (~40 % of iter) ─→|←─ overlapped ─→|←─ exposed ─→|  ←──────── host idle (~35 % of iter) ────────────→|
-```
-
-Two distinct losses are visible:
-
-1. **End-of-iter exposed NCCL** (~0.6 ms / iter): the late SendRecv on
-   stream 345 and the DDP all-reduce on stream 270 run after compute is
-   finished — there's no compute kernel anywhere on the GPU to overlap
-   them with.
-
-2. **End-of-iter host-side idle gap** (~1.4 ms / iter): the GPU is
-   genuinely empty of any kernel for the last ~35 % of the iter wall.
-   This is the per-iter `cudaGraphLaunch` overhead between graph
-   replays — CUDA graph saves intra-iter launch cost, but the host call
-   to enqueue the next graph still has a per-call cost determined by
-   the host driver.
-
-The math closes:
-
-```
-4.08 ms (our iter)
- −  1.4 ms (host gap between graph replays)
- −  0.6 ms (end-of-iter exposed NCCL)
- =  2.08 ms                                  ← matches reference's 2.13 ms
-```
-
-To erase either loss we'd need to change something not exposed at the
-HugeCTR Python or NCCL env level:
-
-- **End-of-iter exposed NCCL.** The captured CUDA graph schedules
-  comm at the end of the iter; the reference is presumably scheduled
-  with backward compute extending into the comm window (the v1.1 blog
-  describes "data gradient computation and weight gradient computation
-  of an MLP are performed in parallel … unlike the data gradients,
-  weight gradients are not needed until the gradient all-reduce"). The
-  schedule is decided by HugeCTR C++ in `model.fit()` and the host CUDA
-  driver's graph optimizer — both fixed when `use_cuda_graph=True` is
-  on.
-
-- **End-of-iter host idle.** Driven by per-graph-launch host overhead.
-  The reference platform's driver (570.x branch in their submission)
-  may produce a tighter inter-iter launch path than our 580.x branch,
-  and bare-metal hosts avoid the virtio-fs / vfio-passthrough latency
-  we incur.
-
-Both are platform-fundamental given our constraints (no sudo / no
-kernel access / no driver-version pinning).
-
-```
-NCCL                       ~37 %   (32.0 SendRecv + 4.5 AllReduce)
-embedding ops              ~21 %   (update4, multi_to_one_reduce/warp_per_ev,
-                                    one_to_multi, label_and_count, swizzle,
-                                    replicate_bucket_range)
-MLP fwd/bwd GEMMs          ~21 %   (5 cutlass3x sm100 + many nvjet_hsh shapes)
-sparse infra (sort, cub)    ~3 %   (radix sort + splitKreduce + scan)
-elementwise FMA / fused     ~5 %   (vector_mul_fma3, vector_fma4)
-MLP support / fused         ~3 %   (drelu, concat fwd/bwd, convert, splitK)
-optimizer (adagrad dense)   ~2 %
-other (long tail)          ~8 %
-```
-
-DLRM-DCNv2 on B200 in this config is **comm-and-embedding-bound, not
-compute-bound**:
-- NCCL alone is 37 % (up from 23 % in the earlier `auto`-sharding trace —
-  round_robin spreads the 5 big embedding tables across 5 distinct GPUs
-  so their inputs/outputs all need all-to-all).
-- Embedding ops add another 21 %.
-- MLP GEMMs (forward + backward + epilogues) are only ~21 %, which sets
-  the upper bound on B200 Tensor Core utilization for this benchmark
-  (≈14 % MFU peak observed in section 7.2 of an earlier trace).
-
-The 33 % exposed-comm fraction means roughly 1 ms of every 4 ms iter is
-spent waiting on `SendRecv` or `AllReduce` that did not overlap with
-compute — the single biggest target for further perf work would be tighter
-overlap of embedding all-to-all with the dense MLP GEMMs.
-
-### 7.6 Optimization timeline (Apr → May 2026)
+### 7.4 Optimization timeline (Apr → May 2026)
 
 Chronological log of every change that moved the steady-state throughput
 needle, in the order we made them. Effects are reported at the MLPerf
@@ -727,295 +497,24 @@ defaults — `run_b200.sh` does not forward `NCCL_GRAPH_REGISTER` or
 With this in place our software stack is a **superset** of what the
 GigaComputing 5.1-0040 submission used: identical container, HugeCTR
 build, DL hyperparams, NUMA/IB capabilities; plus `round_robin` sharding
-(+7 % steady) and the two NCCL register knobs left at NCCL's defaults
-(+20 % steady vs upstream literal). The remaining throughput gap is
-attributable to corpus volume, not configuration.
+(+12 % steady) and the two NCCL register knobs left at NCCL's defaults
+(+20 % steady vs upstream literal).
 
-What we tuned and what closed the gap (cumulative since Apr 2026; see §7.6 for the chronological timeline):
+For the cumulative list of every knob we touched (wins, robustness
+fixes, and the ~50+ flat sweeps that didn't survive across-day re-runs),
+see the chronological table in **§7.4 Optimization timeline**.
 
-| What we tuned | Effect |
-| ------------- | ------ |
-| `MAX_ITER` 100 → 2000 (amortize first-iter compile) | **~3.5×** (largest, but a measurement-window fix not a real win) |
-| `--cap-add=IPC_LOCK,SYS_NICE`, `--device=/dev/infiniband` | enables IB plugin, `numactl --interleave` |
-| `USE_ALGORITHM_SEARCH=false` | shortens first-iter; flat steady-state (algo-search ON regresses ~10 %) |
-| `SHARDING_PLAN=round_robin` (vs `auto`) | **+12 %** in steady |
-| `CUDA_DEVICE_MAX_CONNECTIONS=64` (vs 8 default) | **+0.9 %** (now in `config_b200_1x8_round_robin.sh`) |
-| **`AsyncParam.num_threads=1 → 4`** in `train.py` (May 2026) | **+10.7 %** — biggest single-knob win in May 2026; single-line patch to `train.py`. Removes data-reader bottleneck on virtualized AMD EPYC (CPU stuck at 3.3 GHz, no Turbo). |
-| **Larger batch size (`_bs2x/_bs4x/_bs8x.sh`)** when MLPerf batch constraint is relaxed | **+18 pp** → 87 % of MLPerf ref at bs=4× (vs 69 % at bs=1×). Amortizes the 0.995 ms/iter constant host overhead. |
-| **`HCTR_DEFAULT_CONCURRENCY=8`** (vs default = `std::thread::hardware_concurrency()` = 240 on our EPYC) | **Robustness fix**: prevents a +30 % perf regression when the host is contended; **flat (within noise) on a quiet host** (4.21 ms baseline vs 4.21 ms with the env var, 2 trials each). Now in `config_b200_1x8_round_robin.sh` because it has no downside. The default spins 240 worker threads on our 240-core EPYC for what is really just a housekeeping/data-prep pool, and they thrash when other tenants share the host. 16 and 32 are strictly worse than 240 under contention; 8 and 64 both recover to the quiet-host baseline. |
-| **Move `train_data.bin` to `/mnt/local_disk` (ext4 NVMe) instead of `/home` (virtiofs)** | **+4 % steady-state** on quiet host (4.21 → 4.04 ms/iter, 3 trials, mean 9.57 s vs 9.79 s) and notably tighter iter-to-iter variance. Driven by O_DIRECT read bandwidth: virtiofs gives **0.58 GB/s** O_DIRECT, ext4 NVMe gives **9.4 GB/s** (16 ×). The async multi-hot data reader doesn't fully sit on the critical path even at virtiofs's slow O_DIRECT — but moving to local NVMe still claws back ~0.17 ms/iter. Recommended for any benchmark run where the host is contended. |
-| `numactl --interleave=0,1` | flat |
-| `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
-| `NCCL_BUFFSIZE=8MiB`, `CUDA_DEVICE_MAX_CONNECTIONS=32` | flat |
-| `NCCL_MIN/MAX_NCHANNELS=16`, `NCCL_NVLS_NCHANNELS=16` | flat |
-| `NCCL_P2P_NET_CHUNKSIZE=512K`, `NCCL_LAUNCH_MODE=GROUP` | flat |
-| `NCCL_CUMEM_ENABLE=1`, `NCCL_CHECKS_DISABLE=1` | apparent +0.8 % within a session, lost across days (within noise) |
-| `NCCL_GRAPH_MIXING_SUPPORT=0` (CUDA-graph + symmetric NVLS workaround per nccl#1901) | flat (apparent 0.4 % helps in isolation, regresses when stacked with `cdmc=64+cumem`) |
-| Side-loaded **NCCL 2.29.7** / **2.30.4** (vs 2.25.1 in image) | flat (within noise) |
-| `NCCL_GRAPH_REGISTER=0`, `NCCL_LOCAL_REGISTER=0` (upstream `config_common.sh`) | **−20 %** (defaults are better here) |
-| `SHARDING_PLAN=hier_auto` | requires multi-node, errors |
-| `SHARDING_PLAN=uniform` | OOM (replicates large tables) |
-| Zipfian-synthetic data (full vocab range, real-α) | flat (4.33 vs 4.08 ms/iter) |
+### Why the remaining gap exists (summary)
 
-Combined improvement vs original 100-iter measurement at MLPerf-spec
-batch: **+387 %** (3.24 M → 15.78 M samples/s with all of `_round_robin.sh`
-+ `num_threads=4` patched into `train.py`). At bs=4× (relaxed MLPerf
-constraint): **+512 %** (3.24 → 19.82 M samples/s).
-
-#### NCCL-tuning sweep against the exposed-comm budget
-
-The kineto breakdown attributes ~1.06 ms/iter to NCCL collectives that
-don't overlap with compute. We ran a 10-variant tuning sweep against
-that budget (each variant 500 iters, steady-state from iters 200–400);
-results were nearly flat:
-
-| Variant                                                                   | Steady ms/iter | Δ vs base |
-| ------------------------------------------------------------------------- | -------------: | --------: |
-| `CUDA_DEVICE_MAX_CONNECTIONS=64` + `NCCL_CUMEM_ENABLE=1` + `NCCL_CHECKS_DISABLE=1` | 3.974–4.011 (3 trials, mean 3.99) | within noise |
-| `CUDA_DEVICE_MAX_CONNECTIONS=64`                                          | 3.996          | −0.035 |
-| `=64` + `NCCL_PROTO=LL128`                                                | 4.005          | −0.026 |
-| `NCCL_GRAPH_MIXING_SUPPORT=0`                                             | 4.013          | −0.018 |
-| `=64` + `NCCL_PROTO=LL128` + `NCCL_P2P_NET_CHUNKSIZE=524288` + `NCCL_LAUNCH_MODE=GROUP` | 4.001          | −0.030 |
-| `=64` + `NCCL_P2P_NET_CHUNKSIZE=524288`                                   | 4.010          | −0.021 |
-| `CUDA_DEVICE_MAX_CONNECTIONS=128`                                         | 4.009          | −0.022 |
-| `NCCL_CUMEM_ENABLE=1`                                                     | 4.000          | −0.031 |
-| `NCCL_CHECKS_DISABLE=1`                                                   | 3.999          | −0.032 |
-| `NCCL_PROTO=LL128`                                                        | 4.027          | −0.004 |
-| `NCCL_MIN/MAX_NCHANNELS=16`                                               | 4.028          | −0.003 |
-| `NCCL_NVLS_NCHANNELS=16`                                                  | 4.030          | −0.001 |
-| **baseline**                                                              | **4.031**      | —      |
-| `NCCL_P2P_NET_CHUNKSIZE=524288`                                           | 4.034          | +0.002 |
-
-Run-to-run noise floor ≈ 5 µs within a session, but with **day-to-day drift
-of 25–30 µs** ("baseline" measured 4.031 on day 1, 3.999 on day 2 with
-identical config). Once the drift is accounted for, everything in the
-table including the multi-knob combo is within noise — only
-`CUDA_DEVICE_MAX_CONNECTIONS=64` is reliably above the within-day noise
-floor across all the runs (it's locked in at the config level for that
-reason). The `NCCL_CUMEM_ENABLE=1` / `NCCL_CHECKS_DISABLE=1` /
-`NCCL_GRAPH_MIXING_SUPPORT=0` knobs each look like 0.4–0.8 % wins in
-isolation but the gain doesn't survive across-day reruns. Conclusion:
-NCCL collectives are bandwidth-bound at the platform level, not
-algorithm-bound, and the application-side knobs are exhausted.
-
-### Why the remaining gap exists (this section captures the analysis as of Apr 2026, before the May 2026 direct-measurement work in §8.2a / §8.2b)
-
-We rigorously tested every plausible cause. After the section-7.5
-experiment refuted the corpus-volume hypothesis:
-
-```
-Ruled out by direct measurement
-  ├── compile/autotune amortization                  (2000-iter window)
-  ├── cuBLAS algorithm search                        (slows things, not helps)
-  ├── sharding plan auto vs round_robin              (RR is +7 %, picked)
-  ├── NCCL_ALGO/PROTO sweep, NVLS multicast use      (flat across configs)
-  ├── NCCL_GRAPH_REGISTER / LOCAL_REGISTER           (defaults better than upstream's =0)
-  ├── NCCL_BUFFSIZE, CUDA_DEVICE_MAX_CONNECTIONS     (flat)
-  ├── NCCL_LAUNCH_MODE GROUP vs PARALLEL             (~1 % only on first iter, flat steady)
-  ├── numactl --interleave                           (flat)
-  ├── IB device passthrough + SYS_NICE/IPC_LOCK caps (now applied)
-  ├── GPU clock / power throttling                   (P0, boosts to 1965 MHz under load,
-                                                       cannot pin without sudo)
-  ├── run-to-run variance                            (CV 2.9 %, not the issue)
-  ├── access-pattern distribution shape              (Zipfian gets 94 % of real)
-  ├── feature → label correlation                    (XOR-based label, BF16 stable)
-  ├── corpus volume                                  (full 4.2 B prefix == 473 M HF, no diff)
-  ├── GPU SKU/topology                               (B200 192 GB, 18× NVLink/53 GB/s, NV18 full mesh)
-  ├── NCCL primitive bandwidth                       (alltoall 142–214 GB/s, all-reduce 390 GB/s
-                                                       at MLPerf-spec sizes — within normal range)
-  ├── full-repo file diff vs GigaComputing 5.1-0040  (only `requirements.txt` differs:
-                                                       upstream uses mlperf-logging 5.0.0-rc3
-                                                       vs our rc2 inherited from NVIDIA NVIDIA/
-                                                       branch — non-perf path)
-  ├── NCCL plugin path                               (RDMA Plugin v9 + SHARP CollNet v9 loaded
-                                                       at runtime; identical to upstream image)
-  ├── NCCL algorithm selection at runtime            (`NCCL_DEBUG=TUNING` confirms NVLS proto
-                                                       SIMPLE on 32 channels for the 30 MB
-                                                       AllReduce; max parallelism, no fallback)
-  ├── NCCL version regression                        (side-loaded 2.25.1 / 2.29.7 / 2.30.4
-                                                       from NVIDIA's CUDA apt repo into the
-                                                       container — all three measure within
-                                                       ±10 µs at steady-state, including the
-                                                       2.29.7 Blackwell tuning and the
-                                                       2.29+ "CE collectives + CUDA graphs"
-                                                       hang/perf fix)
-  ├── HugeCTR thread-pool size                       (HCTR_DEFAULT_CONCURRENCY)
-                                                       Default std::thread::hardware_concurrency()
-                                                       creates 240 worker threads on our
-                                                       240-core EPYC. Confirmed flat (within
-                                                       2 %) on an IDLE host -- 9.79 s baseline
-                                                       vs 9.61 s with =8, 2 trials each. Only
-                                                       moves the needle when the host is
-                                                       under contention from other tenants
-                                                       (where the 240 threads thrash for the
-                                                       few cores actually feeding the GPU
-                                                       data path). Baked into the config as
-                                                       belt-and-suspenders.
-  ├── Data file on slow virtiofs vs local NVMe       Confirmed virtiofs O_DIRECT bandwidth is
-                                                       only 0.58 GB/s vs 9.4 GB/s on ext4 NVMe
-                                                       (16x). Moving the 150 GB train prefix
-                                                       to /mnt/local_disk gives +4 % steady-
-                                                       state (4.21 -> 4.04 ms) and tighter
-                                                       iter-to-iter variance. Modest because
-                                                       the async data reader's prefetch (16
-                                                       batches buffered) mostly hides the
-                                                       slow virtiofs path; but it's worth it
-                                                       for the variance reduction.
-  ├── OpenMP runtime tunings                         (5 variants tested: OMP_NUM_THREADS=8
-                                                       alone, +OMP_WAIT_POLICY=ACTIVE, +OMP_
-                                                       PROC_BIND=close OMP_PLACES=cores, both
-                                                       combined, GOMP_SPINCOUNT=max). Best
-                                                       was active+close at 9.92 s, identical
-                                                       to baseline 9.79 s within noise. The
-                                                       1.4 ms gap isn't OpenMP fork/join.
-  ├── HugeCTR scheduling knobs to attack the host
-  │   gap directly                                    Tested on idle host w/ HF mirror,
-                                                       all within ±5 % run-to-run noise:
-                                                         baseline (gen_loss_summary=true):  9.79 s
-                                                         gen_loss_summary=false           : 10.61 s   (worse)
-                                                         use_cuda_graph=False             :  9.60 s   (flat)
-                                                         train_inter_iteration_overlap=F  : 10.02 s   (flat)
-                                                         HCTR_DEFAULT_CONCURRENCY=1       :  9.82 s   (flat)
-                                                         HCTR_DEFAULT_CONCURRENCY=8       :  9.61 s   (flat)
-                                                       Conclusion: the 1.4 ms host gap
-                                                       between cudaGraphLaunch replays is
-                                                       NOT caused by the per-iter loss
-                                                       readback (turning it off makes things
-                                                       worse) and NOT caused by the captured
-                                                       graph schedule per se (use_cuda_graph
-                                                       =False gets the same number). It is
-                                                       genuinely the host driver / virtio-fs
-                                                       / vfio launch path.
-  └── HugeCTR captured-graph scheduling knobs         (patched train.py to set
-                                                       grouped_all_reduce=False, fuse_wb=True
-                                                       and num_iterations_statistics=100 — all
-                                                       flat on real data; an apparent +2.1 %
-                                                       win was an artifact of the truncated
-                                                       sparse-extended training file we were
-                                                       using for fast experiments, where the
-                                                       async data reader pulls into the
-                                                       all-zero sparse region and HugeCTR
-                                                       stops emitting the loss-summary kernel.
-                                                       On the HF-mirror dense file the perf is
-                                                       indistinguishable from orig and the
-                                                       captured graph schedules late NCCL
-                                                       past the last compute kernel either
-                                                       way.)
-
-Remaining candidate (un-disproven)
-  └── system-level scheduling / single-iter latency
-       │  (compute busy ≈ 2.13 ms matches reference; the extra ~1.9 ms is
-       │   exposed comm + CPU-side launch / scheduling overhead that the
-       │   reference platform overlaps fully)
-       │
-       ├── NCCL & plugin stack: identical inside the container
-       │   (NCCL 2.25.1+cuda12.8, RDMA Plugin v9, SHARP CollNet v9,
-       │    NVLS multicast on 32 channels, GDR=1; AllReduce 30 MB runs
-       │    on NVLS proto SIMPLE — exactly what reference would). Also
-       │    tested side-loading NCCL 2.29.7-1+cuda12.9 (Blackwell tuning,
-       │    "CE collectives + cudaGraph" fix) and 2.30.4-1+cuda12.9
-       │    (latest) — both flat. The bus-bw we measure (alltoall
-       │    214 GB/s @8.6 MB, all_reduce 390 GB/s @40 MB) is mid-range
-       │    B200 NVLink, ~38 % of theoretical peak.
-       │
-       ├── Host CPU & launch latency: reference is dual Intel Xeon 6960P
-       │   on a bare-metal G894-AD1 chassis; ours is a single AMD EPYC
-       │   9575F on a *virtualized* (virtiofs /home, vfio GPU passthrough)
-       │   host. CUDA-graph launches close most of this but each iter
-       │   still has ~0.86 ms host-side work outside the graph.
-       │
-       ├── GPU clock pinning: reference probably pins clocks via
-       │   `sudo nvidia-smi -lgc 1965` (the run.sub does this for
-       │   MaxQ/MinEDP modes). We cannot run any sudo command in
-       │   the container, so SM clock transitions between 120 MHz idle
-       │   and 1965 MHz under load every iter (eats a few µs).
-       │
-       └── NVSwitch / partition layout: reference is GigaComputing's
-           G894-AD1 board with NVLink-5 in a fixed layout. Ours has
-           NV18 full mesh and reports `Fabric: CliqueId=0, Healthy` —
-           same logical topology but unknown chip-rev / cabling.
-```
-
-We further reduced this list via:
-
-- `NCCL_DEBUG=INIT,COLL,TUNING` confirms the NCCL stack picks the same
-  algorithms (NVLS multicast for AllReduce, RING for SendRecv, 32
-  channels) on B200 as the reference would. There is no NCCL knob left
-  to tune at the application level.
-- `NCCL_LAUNCH_MODE=GROUP` (vs the `PARALLEL` set by the Dockerfile) is
-  ~1 % faster only on the first warm-up iter; flat in steady-state.
-- `nvidia-smi -lgc / -pl` reject without root, so we can't pin GPU
-  clocks. The remaining 1.9 ms/iter gap is the sum of CPU-launch /
-  scheduling overhead (~0.86 ms outside the CUDA graph) and exposed
-  NCCL time that the reference platform fully overlaps with compute
-  (~1.06 ms). Both are functions of the host platform.
-
-None of these are actionable from inside this repository without
-sudo/root on the compute node. To materially close the gap we'd need
-either (a) bare-metal access to set GPU clocks and CPU governors,
-(b) firmware/driver/NCCL versions aligned to NVIDIA's MLPerf submission
-build, or (c) the same exact server topology. None are publicly
-documented.
-
-### 8.1 Final tuning round (May 2026): AsyncParam.num_threads
-
-After exhausting the env-var sweep above, we audited the python config
-itself and found one parameter that the upstream `train.py` leaves at
-its inherited default of **1**:
-
-```
-hugectr.AsyncParam(num_threads=1, num_batches_per_thread=16, ...)
-```
-
-On bare-metal Intel Xeon 6900-series (the reference platform) a
-single 5 GHz core is fast enough to keep the GPU pipeline fed. On our
-**virtualized AMD EPYC 9575F (3.3 GHz, no Turbo because cpufreq driver
-is not exposed by KVM/QEMU)** the single async-reader thread pegs at
-100 % during steady-state and acts as the bottleneck.
-
-Bumping it to 4 threads removed the bottleneck and gave the largest
-single application-level win we found:
-
-| `num_threads` | Steady ms/iter | Throughput (M samples/s) | Δ |
-| ------------: | -------------: | -----------------------: | -: |
-| 1 (upstream) | 4.005 | 13.81 | — |
-| **4 (ours)** | **3.577** | **15.46** | **−10.7 %** |
-| 8 | 3.580 | 15.45 | flat (saturates) |
-| 16 | 3.610 | 15.32 | slightly worse (over-subscribe) |
-
-This is now baked into `train.py` as a single-line change. It moves us
-from **59 % of reference → 68 % of reference**.
-
-### 8.2 Final stress-check sweeps (May 2026, post-num_threads=4)
-
-After the data-reader fix, we re-ran every plausible application/
-host-side knob to look for a remaining stackable win. **All
-flat (within ±1 % run-to-run noise floor):**
-
-| Sweep family | Variants tried | Best Δ vs ctrl | Verdict |
-| ----- | ----- | ---: | ----- |
-| glibc allocator (`LD_PRELOAD=libtcmalloc_minimal`, `MALLOC_ARENA_MAX`, `MALLOC_TOP_PAD_`) | 6 | −1.2 % (`MALLOC_TOP_PAD_=131072`) | within noise |
-| CUDA module loading (`CUDA_MODULE_LOADING={EAGER,LAZY}`) | 2 | flat | within noise |
-| HugeCTR overflow check (`HUGECTR_DISABLE_OVERFLOW_CHECK=1`) | 1 | flat | within noise |
-| Real-time scheduling (`chrt -f 50/99`, `nice -n -20`) | 3 | flat | within noise |
-| OpenMP runtime (`OMP_NUM_THREADS={1,2,4,8}`, `OMP_WAIT_POLICY=ACTIVE`, `KMP_AFFINITY=close`, `GOMP_SPINCOUNT`) | 8 | −0.7 % (`OMP_NUM_THREADS=8`) | within noise |
-| HugeCTR RMM allocator (`HCTR_RMM_SETTABLE={true,false}`) | 2 | flat | within noise |
-| NCCL protocol (`NCCL_PROTO={Simple,LL,LL128}`) | 3 | LL is +1.1 % worse | flat for Simple/LL128 |
-| NCCL channel pinning (`NCCL_MIN/MAX_NCHANNELS={4,8,16,32}`, `NCCL_NVLS_NCHANNELS={8,16,32}`) | 7 | −0.7 % (`NCCL_NVLS_NCHANNELS=16`) | within noise |
-| NCCL buffer (`NCCL_BUFFSIZE={8M,16M}`) | 2 | flat | within noise |
-| **CUDA_DEVICE_MAX_CONNECTIONS** when actually applied via config edit (env-var pass-through is clobbered by config `export`) | 5 (1, 8, 16, 32, 128) | **+15.5 % regression at cdmc=1** | cdmc=64 (current) confirmed best |
-| HugeCTR unique-key ratios (`DENSE_UNIQUE_RATIO={0,1}`, `WGRAD_UNIQUE_RATIO=0`) | 3 | flat (wur=0 segfaults) | leave at default |
-| Stacked combinations of all marginal wins (cdmc=1 + nch=16 + nvls=16 + dur=1) | 4 | +21 % regression (cdmc=1 dominates) | abandoned |
-
-**Important methodological correction**: `CUDA_DEVICE_MAX_CONNECTIONS`
-is `export`ed inside `config_b200_1x8_round_robin.sh`, so passing it as
-a host-shell env var to `run_b200.sh` does not take effect — the
-config's `export` clobbers it. Earlier sweeps (logged in section 8) that
-appeared to show `cdmc=1` was beneficial were actually all running with
-the config's `cdmc=64`, with the apparent ~0.9 % gain being run-to-run
-noise. With proper config-edited `cdmc=1` we measure **+15.5 %
-regression** — confirming that `cdmc=64` is the right value for our
-multi-stream HugeCTR workload.
+After all the sweeps in §7.4, the only un-disproven cause is **host-side
+scheduling and launch latency between iterations** — not data, not NCCL
+algorithm choice, not GPU power/throttling, not corpus volume.
+§8.2a/b/c then validates this with direct `nsys` measurement. The
+remaining gap is paid in `cudaGraphLaunch` host overhead (530 μs p50
+vs ~20 μs bare-metal — 17–50× slower) plus in-graph kernel-launch
+latency cascading into the comm/copy streams. Both are
+platform-fundamental given our virtualized KVM environment with no
+sudo/root and no driver-version pinning.
 
 ### 8.2a Validation of the virtualization hypothesis (May 2026, direct measurement)
 
@@ -1254,7 +753,7 @@ same binary, same container, and the same recommended config
 into `train.py`). Only `BATCHSIZE` changes between rows. Steady-state
 ms/iter is the **best 100-iter window** from iter 200 onwards on the
 real Criteo corpus (skipping the first-iter compile and the data-
-reader warmup); see §7.6 row 13 for the full distribution and the
+reader warmup); see §7.4 row 13 for the full distribution and the
 linear-fit derivation.
 
 ##### Our system (1 × 8 × B200, virtualized AMD EPYC 9575F host)
@@ -1322,7 +821,7 @@ spanning sharding plans, NCCL protocols/channels/buffers, CUDA stream
 counts, HugeCTR scheduling knobs, glibc/jemalloc allocators, OpenMP
 runtimes, real-time scheduling priorities, NUMA bindings, data file
 location/format, async-reader threading, and numerous combinations
-(see §7.6 for the full chronological log). Only two changes survived
+(see §7.4 for the full chronological log). Only two changes survived
 as reproducible wins:
 
 1. **`SHARDING_PLAN=round_robin`** vs upstream `auto` (+12 % on this hardware)
