@@ -222,6 +222,45 @@ so future work can skip these):**
 | `SKIP_ALLREDUCE=1` (debug, no DP allreduce) | −12 % (skipping allreduce hurts due to disabled overlap) |
 | `HCTR_LOOKUP_WARPS_PER_BLOCK` ∈ {1, 2, 4, 8} (default 2) | flat (5-trial avg 11.66 – 11.78 M sps) |
 | `MEM_COMM_BW_RATIO`/`WORK_RATIO` ratio ∈ {1.1, 1.8, 2.25, 4.5} | flat (3-trial avg 11.69 – 11.79 M sps) |
+| `HCTR_MAX_ITER` ∈ {500, 1000, 3000, 5000, 10000} (long-run sweep, fixed DISPLAY=200) | flat (per-200-iter wall 0.95 – 0.99 s; steady 11.27 – 11.52 M sps; mild ~2 % degradation at 10K+ iters) |
+
+### "23 M sps" — what we'd need to chase NV's published number
+
+NV's published MLPerf 5.1-0040 result on Gigabyte G894-AD1 (8 × B200) is
+**23.02 M sps**, sourced from `tracked_stats.throughput` in the actual
+submission `result_*.txt`. The MLLOG timestamps decode as:
+
+```
+init_stop                  → run_start              : 0 ms
+run_start                  → first eval (5% epoch)  : 8.34 s    → 209.8 M samples → 3793 iters → 2.20 ms/iter
+run_start                  → run_stop (89.99 % epoch): 164.07 s → 3.775 B samples → 68,275 iters
+tracked_stats.throughput   = 3.775 B / 164.07 s     = 23.02 M sps
+```
+
+Per-iter steady-state on B200 with the **full 4.2 B-row Criteo** is
+**2.20 ms** (excluding the 1 s/eval pauses). On the 235 M-row prefix or
+HF subsample, NV themselves measure **4.05–4.08 ms/iter** (b200/README
+section 7.5) — i.e. they too only hit 13.6 M sps on partial corpora.
+
+Verified on AMD: per-200-iter wall stays at 0.95–0.99 s from iter 500
+through iter 10,000 (essentially flat). There is **no hot-item-warming
+inflection** observable in the iter-count range we can run on a 187 GB
+RAM disk image (= 1 % of the full MLPerf corpus per epoch).
+
+The 1.7×–1.9× gap from 13.6 M sps to 23 M sps is documented (in NV's
+own b200/README) as a corpus-volume effect that only manifests once you
+read enough rows for the embedding L2-cache to warm fully. To chase
+that on AMD we'd need:
+
+1. ~4 TB of fast local storage to hold `train_data.bin` (R2 download).
+2. A ~10-min steady-state measurement window over ~75K iters.
+3. The same hardware-level NVLS/SHARP-equivalent (RCCL has neither).
+
+(1) and (2) we could do given enough time/disk; (3) is intrinsic to
+NVIDIA's NVLink-5/NVSwitch fabric on B200 and not reachable from AMD
+software. So the realistic AMD apples-to-apples reference remains
+NV-on-HF-subsample (13.57 M sps), where we are already at 11.88 M sps
+(87.5 %) at NV's batch and 14.05 M sps (104 %) at AMD's sweet-spot batch.
 
 **Conclusion of the audit**: every Python/env-var-level knob NV uses
 to extract perf on B200 has been tested on AMD; only `NCCL_PROTO=LL128`
