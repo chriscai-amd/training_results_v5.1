@@ -734,13 +734,28 @@ Ruled out by direct measurement
   ├── NCCL algorithm selection at runtime            (`NCCL_DEBUG=TUNING` confirms NVLS proto
                                                        SIMPLE on 32 channels for the 30 MB
                                                        AllReduce; max parallelism, no fallback)
-  └── NCCL version regression                        (side-loaded 2.25.1 / 2.29.7 / 2.30.4
+  ├── NCCL version regression                        (side-loaded 2.25.1 / 2.29.7 / 2.30.4
                                                        from NVIDIA's CUDA apt repo into the
                                                        container — all three measure within
                                                        ±10 µs at steady-state, including the
                                                        2.29.7 Blackwell tuning and the
                                                        2.29+ "CE collectives + CUDA graphs"
                                                        hang/perf fix)
+  └── HugeCTR captured-graph scheduling knobs         (patched train.py to set
+                                                       grouped_all_reduce=False, fuse_wb=True
+                                                       and num_iterations_statistics=100 — all
+                                                       flat on real data; an apparent +2.1 %
+                                                       win was an artifact of the truncated
+                                                       sparse-extended training file we were
+                                                       using for fast experiments, where the
+                                                       async data reader pulls into the
+                                                       all-zero sparse region and HugeCTR
+                                                       stops emitting the loss-summary kernel.
+                                                       On the HF-mirror dense file the perf is
+                                                       indistinguishable from orig and the
+                                                       captured graph schedules late NCCL
+                                                       past the last compute kernel either
+                                                       way.)
 
 Remaining candidate (un-disproven)
   └── system-level scheduling / single-iter latency
