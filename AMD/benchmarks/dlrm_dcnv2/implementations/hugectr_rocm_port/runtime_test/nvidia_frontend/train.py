@@ -406,8 +406,10 @@ ebc_config.shard(shard_matrix=shard_matrix, shard_strategy=shard_strategy)
 model.add(ebc_config)
 
 # configure compute knobs for bottom & top MLP layers
+# ROCm port: HCTR_ASYNC_WGRAD knob lets us turn off the dgrad/wgrad
+# stream split for diagnostic A/B testing (default ON, matching NVIDIA).
 compute_config = hugectr.DenseLayerComputeConfig(
-    async_wgrad=True,
+    async_wgrad=os.environ.get("HCTR_ASYNC_WGRAD", "1") == "1",
     fuse_wb=False,
 )
 
@@ -435,7 +437,13 @@ def _add_mlp_stack(top, bot, hidden_dims, last_act=True):
             cur = fc
     return cur
 
-if os.environ.get("HCTR_USE_FUSED_MLP", "0") == "1":
+# ROCm port: HCTR_USE_FUSED_MLP=1 enables fused for both bottom + top.
+# HCTR_FUSE_BOTTOM_MLP / HCTR_FUSE_TOP_MLP let us toggle each independently.
+_fuse_bottom = os.environ.get("HCTR_FUSE_BOTTOM_MLP",
+                              os.environ.get("HCTR_USE_FUSED_MLP", "0")) == "1"
+_fuse_top    = os.environ.get("HCTR_FUSE_TOP_MLP",
+                              os.environ.get("HCTR_USE_FUSED_MLP", "0")) == "1"
+if _fuse_bottom:
     model.add(hugectr.DenseLayer(
         layer_type=hugectr.Layer_t.MLP,
         bottom_names=["dense"], top_names=["mlp1"],
@@ -484,7 +492,7 @@ else:
         num_layers=int(os.environ.get("HCTR_DCN_NUM_LAYERS", "3")),
         compute_config=compute_config,
     ))
-if os.environ.get("HCTR_USE_FUSED_MLP", "0") == "1":
+if _fuse_top:
     model.add(hugectr.DenseLayer(
         layer_type=hugectr.Layer_t.MLP,
         bottom_names=["interaction1"], top_names=["mlp2"],

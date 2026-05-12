@@ -55,13 +55,20 @@ static void prewarm_all_blas_handles_once() {
   });
 }
 
-// ROCm port: per-device FP32 scratch for the V4 bprop_drelu_bgrad kernel.
-// One allocation per device, max-sized to handle any MLP layer's row count
-// (4096 floats = 16 KB / device is plenty -- DCN-v2's biggest m is 1024).
-// Allocated once via std::call_once before HIP graph capture begins (just
-// like g_handle_cache), so the per-iter launch path never hipMallocs.
+// ROCm port: per-device, per-slot FP32 scratch for the V5 bgrad/bgrada
+// kernels. We need TWO independent slots per device because, when fused
+// MLP runs with async_wgrad=true:
+//   - DRELU_BGRAD V5 (DGRAD epilogue) runs on the network's default stream
+//   - BGRADA      V5 (WGRAD epilogue) runs on the comp_overlap_stream
+// Both atomicAdd into a per-device scratch, so a single shared buffer
+// would be a *data race* across the two streams (and finalize would zero
+// the wrong rows). Slot 0 = DGRAD-side BGRAD, slot 1 = WGRAD-side BGRADA.
+// 4096 floats * 2 slots * 16 devices = 512 KB total -- negligible.
 constexpr int kBgradScratchMaxM = 4096;
-static std::array<float*, 16> g_bgrad_scratch{};
+constexpr int kBgradScratchSlots = 2;
+constexpr int kBgradSlotBgrad  = 0;  // for launch_bprop_drelu V5
+constexpr int kBgradSlotBgrada = 1;  // for launch_reduce_sum_columns V5
+static std::array<std::array<float*, kBgradScratchSlots>, 16> g_bgrad_scratch{};
 
 static void prewarm_bgrad_scratch_once() {
   static std::once_flag flag;
@@ -72,23 +79,29 @@ static void prewarm_bgrad_scratch_once() {
     hipGetDevice(&saved_dev);
     std::lock_guard<std::mutex> lk(g_handle_mu);
     for (int d = 0; d < n_devs && d < static_cast<int>(g_bgrad_scratch.size()); ++d) {
-      if (g_bgrad_scratch[d] != nullptr) continue;
       if (hipSetDevice(d) != hipSuccess) continue;
-      void* p = nullptr;
-      if (hipMalloc(&p, sizeof(float) * kBgradScratchMaxM) == hipSuccess) {
-        g_bgrad_scratch[d] = static_cast<float*>(p);
+      for (int s = 0; s < kBgradScratchSlots; ++s) {
+        if (g_bgrad_scratch[d][s] != nullptr) continue;
+        void* p = nullptr;
+        if (hipMalloc(&p, sizeof(float) * kBgradScratchMaxM) == hipSuccess) {
+          // Initialise to zero so the very first iter's atomicAdd accumulates
+          // into a clean buffer (subsequent iters rely on finalize zeroing).
+          hipMemset(p, 0, sizeof(float) * kBgradScratchMaxM);
+          g_bgrad_scratch[d][s] = static_cast<float*>(p);
+        }
       }
     }
     if (saved_dev >= 0) hipSetDevice(saved_dev);
   });
 }
 
-static float* get_bgrad_scratch_for_current_device() {
+static float* get_bgrad_scratch_for_current_device(int slot = kBgradSlotBgrad) {
   prewarm_bgrad_scratch_once();
   int dev_id = -1;
   hipGetDevice(&dev_id);
   if (dev_id < 0 || dev_id >= static_cast<int>(g_bgrad_scratch.size())) return nullptr;
-  return g_bgrad_scratch[dev_id];
+  if (slot < 0 || slot >= kBgradScratchSlots) return nullptr;
+  return g_bgrad_scratch[dev_id][slot];
 }
 
 static hipblasHandle_t get_or_create_blas_handle_for_current_device() {
@@ -172,22 +185,26 @@ __global__ void add_bias_per_row_v5_kernel(__half* __restrict__ D,
   int lane  = threadIdx.x;                    // 0..BLOCK_M-1 (= row in stripe)
   int wave  = threadIdx.y;                    // 0..(N_TILE/32 - 1)
   int i = blockIdx.x * BLOCK_M + lane;
-  if (i >= m) return;
+  bool in_row = (i < m);
 
-  // Load bias[i] once per block into shared mem (lane handles its own row).
+  // ROCm port: load bias[i] into shared mem BEFORE any early-return path,
+  // so __syncthreads sees all threads in the block. Earlier code did
+  // `if (i >= m) return; ... __syncthreads();` which is UB when only a
+  // subset of the block survives -- in particular, the final FC layer of
+  // the top MLP has m=1, so only 4 of 256 threads survive (lane=0 across
+  // 4 waves) and the barrier hangs / produces garbage. Found because
+  // fused_MLP+multi-GPU was diverging at iter ~50 with loss collapsing
+  // to log(2).
   __shared__ float s_bias[BLOCK_M];
-  if (wave == 0) s_bias[lane] = __half2float(bias[i]);
+  if (wave == 0 && in_row) s_bias[lane] = __half2float(bias[i]);
   __syncthreads();
+  if (!in_row) return;
   float b = s_bias[lane];
 
   int j_start = blockIdx.y * N_TILE + wave * 32;
   int j_end   = j_start + 32;
   if (j_end > n) j_end = n;
-  if (blockIdx.y * N_TILE + N_TILE > n) {
-    int total_end = (blockIdx.y + 1) * N_TILE;
-    if (total_end > n) total_end = n;
-    if (j_start >= total_end) return;
-  }
+  if (j_start >= n) return;
 
   constexpr float kFp16Max = 65504.0f;
   for (int j = j_start; j < j_end; ++j) {
@@ -361,9 +378,7 @@ __global__ void bgrad_finalize_v5_kernel(float* __restrict__ scratch,
   else if (total < -kFp16Max) total = -kFp16Max;
   dbias[i] = __float2half(total);
   // ROCm port: reset the scratch slot in the same kernel so the next
-  // V5 invocation doesn't need a separate hipMemsetAsync (which costs
-  // ~15-20 us per launch, three launches per iter for the three
-  // MultiCross v2 layers).
+  // V5 invocation doesn't need a separate hipMemsetAsync.
   scratch[i] = 0.0f;
 }
 
@@ -421,7 +436,10 @@ inline void launch_bprop_drelu(__half* D, const uint8_t* aux, __half* dbias,
     bprop_drelu_v1_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
     return;
   }
-  float* scratch = get_bgrad_scratch_for_current_device();
+  // DRELU_BGRAD V5 runs on the DGRAD stream. Use slot 0; BGRADA uses slot 1
+  // so they can run concurrently when async_wgrad=on without racing on the
+  // shared scratch buffer.
+  float* scratch = get_bgrad_scratch_for_current_device(kBgradSlotBgrad);
   if (!scratch) {
     constexpr int kBlock = 256;
     bprop_drelu_v1_kernel<true, kBlock><<<m, kBlock, 0, stream>>>(D, aux, dbias, m, n, aux_ld, kDiv);
@@ -458,15 +476,8 @@ __global__ void reduce_sum_columns_kernel(const T* __restrict__ A, T* dbias, int
     sum += to_f32<T>(A[i + static_cast<size_t>(j) * m]);
   }
   if constexpr (std::is_same<T, __half>::value) {
-    // ROCm port: pre-divide so the subsequent ncclSum across up to 16 ranks
-    // stays well below FP16 max (65504). Adagrad's update rule g / sqrt(g^2)
-    // is scale-invariant, so dividing per-rank dbias by a constant is
-    // mathematically equivalent to not dividing -- we only need this for
-    // FP16 ncclSum headroom.
     constexpr float kPreDivide = 256.0f;
     sum /= kPreDivide;
-    // Defensive: catch NaN (which would slip past `sum > MAX` since NaN
-    // comparisons are always false) and any inf, replace with zero.
     if (!isfinite(sum)) sum = 0.0f;
     constexpr float kFp16Max = 65504.0f;
     if (sum > kFp16Max) sum = kFp16Max;
@@ -480,7 +491,13 @@ inline void launch_add_bias_per_row(T* D, const T* bias, int m, int n, hipStream
   if (m == 0 || n == 0 || bias == nullptr) return;
   // FP16 path: V5-style 2D tile (BLOCK_M=64 rows x N_TILE=128 cols/block).
   // Fully coalesced 128-byte loads, bias broadcast via shared mem.
-  if constexpr (std::is_same<T, __half>::value) {
+  // Env knob HCTR_ADD_BIAS_KERNEL=v1 forces the legacy 16x16 kernel (used to
+  // bisect whether the V5 path is the source of fused-MLP+multi-GPU drift).
+  static const bool kUseV1 = []() {
+    const char* env = std::getenv("HCTR_ADD_BIAS_KERNEL");
+    return env && std::string(env) == "v1";
+  }();
+  if (!kUseV1 && std::is_same<T, __half>::value) {
     constexpr int BLOCK_M = 64;
     constexpr int N_TILE  = 128;          // 4 waves x 32 cols/wave
     constexpr int kWaves  = N_TILE / 32;  // = 4
@@ -493,7 +510,7 @@ inline void launch_add_bias_per_row(T* D, const T* bias, int m, int n, hipStream
                                 reinterpret_cast<const __half*>(bias), m, n);
     return;
   }
-  // FP32 fallback: legacy 16x16 thread-block kernel.
+  // FP32 / V1 fallback: legacy 16x16 thread-block kernel.
   dim3 block(16, 16, 1);
   dim3 grid((m + 15) / 16, (n + 15) / 16, 1);
   add_bias_per_row_kernel<T><<<grid, block, 0, s>>>(D, bias, m, n);
@@ -544,7 +561,10 @@ inline void launch_reduce_sum_columns(const T* A, T* dbias, int m, int k, hipStr
   // (FP32 doesn't have the FP16-overflow issue and the path is rare).
   if constexpr (std::is_same<T, __half>::value) {
     if (m <= kBgradScratchMaxM) {
-      float* scratch = get_bgrad_scratch_for_current_device();
+      // BGRADA runs on the WGRAD stream (overlap_stream when async_wgrad=on).
+      // Use slot 1 so we don't race with DRELU_BGRAD V5 (slot 0) which runs
+      // on the DGRAD stream concurrently.
+      float* scratch = get_bgrad_scratch_for_current_device(kBgradSlotBgrada);
       if (scratch) {
         constexpr int BLOCK_M = 64;
         constexpr int WAVES   = 4;
@@ -559,8 +579,9 @@ inline void launch_reduce_sum_columns(const T* A, T* dbias, int m, int k, hipStr
             reinterpret_cast<const __half*>(A), scratch, m, k, N_TILE);
         constexpr int kFinBlk = 256;
         int fin_grid = (m + kFinBlk - 1) / kFinBlk;
-        // Reuse the V5 finalize kernel with the same 256.0f pre-divide as
-        // the legacy reduce_sum_columns_kernel for FP16 ncclSum headroom.
+        // Pre-divide by 256 for FP16 ncclSum headroom (matches legacy
+        // reduce_sum_columns_kernel; Adagrad scale-invariance restored
+        // once gradient magnitude exceeds the eps regime).
         bgrad_finalize_v5_kernel<<<fin_grid, kFinBlk, 0, s>>>(
             scratch, reinterpret_cast<__half*>(dbias), m, 256.0f);
         return;
