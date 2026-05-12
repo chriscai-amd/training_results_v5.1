@@ -14,6 +14,8 @@ post-warmup / pre-final iterations averaged.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
+| 8 × MI350X, MULTI-HOT, **REAL MLPerf Criteo (R2-hosted, 200 GB / 219 M rows)**, batch 55,296 | **12.99 M samples/sec**, loss 0.298 → 0.284 | **real MLPerf-published binary, NV's exact batch — perf carries over from HF subsample (12.74 → 12.99, +2 %)** |
+| 8 × MI350X, MULTI-HOT, **REAL MLPerf Criteo (R2-hosted, 200 GB / 219 M rows)**, batch 110,592 | **15.57 M samples/sec**, loss 0.295 → 0.283 | sweet-spot batch on real data — slight regression vs HF synthetic (17.37) due to wider unique-ID footprint per batch (40 M cardinality vs synthetic's prime-mixed pattern) |
 | 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.74 M samples/sec** (3-run avg, σ ~0.05 %), loss 0.281 → 0.263 | **apples-to-apples NVIDIA B200 config** — V5 add_bias + scratch-zero-skip |
 | 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **17.37 M samples/sec**, loss 0.282 → 0.272 | **AMD sweet-spot batch — 28 % AHEAD of 8 × B200 on same HF data (13.57)** |
 | 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 15.03 M samples/sec, loss 0.282 → 0.274 | (overlap-off measurement; rerun pending) |
