@@ -646,7 +646,7 @@ What we tuned and what closed the gap:
 | `USE_ALGORITHM_SEARCH=false` | shortens first-iter; flat steady-state (algo-search ON regresses ~10 %) |
 | `SHARDING_PLAN=round_robin` (vs `auto`) | **+7 %** in steady |
 | `CUDA_DEVICE_MAX_CONNECTIONS=64` (vs 8 default) | **+0.9 %** (now in `config_b200_1x8_round_robin.sh`) |
-| **`HCTR_DEFAULT_CONCURRENCY=8`** (vs default = `std::thread::hardware_concurrency()` = 240 on our EPYC) | **+30 %** under host contention; flat on a quiet host. Now in `config_b200_1x8_round_robin.sh`. The default spins 240 worker threads on our 240-core EPYC for what is really just a housekeeping/data-prep pool, and they thrash when the host has other tenants. Also tested 16/32/64; 64 also gave the same win, 16/32 were strictly worse than the 240 default. |
+| **`HCTR_DEFAULT_CONCURRENCY=8`** (vs default = `std::thread::hardware_concurrency()` = 240 on our EPYC) | **Robustness fix**: prevents a +30 % perf regression when the host is contended; **flat (within noise) on a quiet host** (4.21 ms baseline vs 4.21 ms with the env var, 2 trials each). Now in `config_b200_1x8_round_robin.sh` because it has no downside. The default spins 240 worker threads on our 240-core EPYC for what is really just a housekeeping/data-prep pool, and they thrash when other tenants share the host. 16 and 32 are strictly worse than 240 under contention; 8 and 64 both recover to the quiet-host baseline. |
 | `numactl --interleave=0,1` | flat |
 | `NCCL_PROTO=Simple,LL128`, `NCCL_ALGO=NVLS,…` | flat |
 | `NCCL_BUFFSIZE=8MiB`, `CUDA_DEVICE_MAX_CONNECTIONS=32` | flat |
@@ -743,16 +743,17 @@ Ruled out by direct measurement
                                                        2.29+ "CE collectives + CUDA graphs"
                                                        hang/perf fix)
   ├── HugeCTR thread-pool size                       (HCTR_DEFAULT_CONCURRENCY)
-                                                       NOT ruled out -- this is the one
-                                                       application-level lever that *did*
-                                                       move the needle. Default value
-                                                       std::thread::hardware_concurrency()
+                                                       Default std::thread::hardware_concurrency()
                                                        creates 240 worker threads on our
-                                                       240-core EPYC; they thrash when the
-                                                       host is contended. Setting it to 8
-                                                       gives a reproducible +30 % under
-                                                       contention and is now baked into
-                                                       config_b200_1x8_round_robin.sh.
+                                                       240-core EPYC. Confirmed flat (within
+                                                       2 %) on an IDLE host -- 9.79 s baseline
+                                                       vs 9.61 s with =8, 2 trials each. Only
+                                                       moves the needle when the host is
+                                                       under contention from other tenants
+                                                       (where the 240 threads thrash for the
+                                                       few cores actually feeding the GPU
+                                                       data path). Baked into the config as
+                                                       belt-and-suspenders.
   └── HugeCTR captured-graph scheduling knobs         (patched train.py to set
                                                        grouped_all_reduce=False, fuse_wb=True
                                                        and num_iterations_statistics=100 — all
