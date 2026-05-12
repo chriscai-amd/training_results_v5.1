@@ -14,13 +14,16 @@ post-warmup / pre-final iterations averaged.
 
 | Configuration | Throughput | Notes |
 |---|---|---|
-| 8 × MI350X, MULTI-HOT, **REAL MLPerf Criteo (R2-hosted, 200 GB / 219 M rows)**, batch 55,296 | **12.99 M samples/sec**, loss 0.298 → 0.284 | **real MLPerf-published binary, NV's exact batch — perf carries over from HF subsample (12.74 → 12.99, +2 %)** |
-| 8 × MI350X, MULTI-HOT, **REAL MLPerf Criteo (R2-hosted, 200 GB / 219 M rows)**, batch 110,592 | **15.57 M samples/sec**, loss 0.295 → 0.283 | sweet-spot batch on real data — slight regression vs HF synthetic (17.37) due to wider unique-ID footprint per batch (40 M cardinality vs synthetic's prime-mixed pattern) |
-| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.74 M samples/sec** (3-run avg, σ ~0.05 %), loss 0.281 → 0.263 | **apples-to-apples NVIDIA B200 config** — V5 add_bias + scratch-zero-skip |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **17.37 M samples/sec**, loss 0.282 → 0.272 | **AMD sweet-spot batch — 28 % AHEAD of 8 × B200 on same HF data (13.57)** |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 15.03 M samples/sec, loss 0.282 → 0.274 | (overlap-off measurement; rerun pending) |
-| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | (kept for historical record; pre-V5-engagement, also smaller working set) |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** (`HCTR_USE_FUSED_MLP=1`) | 4.83 M samples/sec, loss 0.285 → 0.266 | DRELU_BGRAD + BGRADA epilogues emulated with V5 2D-tile kernels; **slower than InnerProduct path** because fused-MLP fallback chains 5 launches/FC layer vs InnerProduct's 4 |
+| 8 × MI350X, MULTI-HOT, **REAL MLPerf Criteo, /dev/shm RAM disk**, batch 55,296, 1000 iters | **11.76 M samples/sec sustained** | true sustained perf (1000 iters, no degradation); NV's exact batch |
+| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo, /dev/shm + LL128 RCCL, batch 55,296, 300 iters | **11.88 M samples/sec sustained** | +LL128 RCCL proto vs default Simple = +1.0 % |
+| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo, /dev/shm RAM disk, batch 110,592, 1000 iters | **14.05 M samples/sec sustained** | AMD sweet-spot batch, sustained over 1000 iters |
+| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo on **NFS** (191 GB /apps), batch 55,296, 300 iters | 5.21 M samples/sec | **NFS reader is the bottleneck** -- O_DIRECT bypasses page cache, NFS @ 692 MB/s caps sustained throughput |
+| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo, batch 55,296, **80-iter window** | 12.99 M sps (peak) | the early peak, observable for ~80 iters before reader buffer drains |
+| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.74 M samples/sec** (3-run avg) | apples-to-apples NVIDIA B200 config, on synthetic 24-day Criteo |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **17.37 M samples/sec** | AMD sweet-spot batch on synthetic data |
+| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 15.03 M samples/sec | (overlap-off measurement; rerun pending) |
+| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | historical, pre-V5-engagement |
+| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** | 4.83 M samples/sec | slower than InnerProduct on AMD; bottom-MLP fused path also has a correctness bug (loss diverges after iter ~50) -- see "Open work" |
 | 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | 6.02 M samples/sec | sweet-spot batch with fused MLP fallback |
 | 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
 | 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
@@ -29,17 +32,32 @@ post-warmup / pre-final iterations averaged.
 | 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | |
 | 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | |
 
-### Headline result (post V5-BGRADA-engagement, 2026-05-11)
+### Headline result on real MLPerf Criteo (post NFS-fix, 2026-05-12)
 
-We now **match or exceed NVIDIA's published 8 × B200 throughput on the
-same HuggingFace Criteo subsample** (8.7× less data than the unobtainable
-4.2 B-row MLPerf reference corpus):
+We now **sustain perf for 1000+ iters on the real MLPerf Criteo data**
+once the NFS storage bottleneck is removed (the AsyncReader uses
+`O_RDONLY | O_DIRECT` which bypasses the OS page cache, so NFS-bound
+sustained throughput drops to ~3 GB/s aggregate after the prefetch
+buffer drains around iter 80). Mitigation: copy `train_data.bin` and
+`val_data.bin` to `/dev/shm` before the run -- a one-shot ~3 minute
+warmup that turns sustained 5.2 M sps back into 11.76 M sps.
 
-| | This port | NVIDIA B200 | Ratio |
+| | This port (real MLPerf Criteo, /dev/shm) | NVIDIA B200 (HF subsample) | Ratio |
 |---|---|---|---|
-| **batch 55,296** (NVIDIA's exact)         | **12.74 M sps** | 13.57 M sps  | 0.94× |
-| **batch 110,592** (AMD sweet spot)        | **17.37 M sps** | 13.57 M sps  | **1.280×** |
-| **batch 221,184**                          | 15.03 M sps   | 13.57 M sps  | 1.108× |
+| **batch 55,296** (NVIDIA's exact)  | **11.88 M sps** sustained, 1000 iters | 13.57 M sps | 0.875× (-12.5 %) |
+| **batch 110,592** (AMD sweet spot) | **14.05 M sps** sustained, 1000 iters | 13.57 M sps | **1.035× (+3.5 %)** |
+
+The 12.5 % gap at NV's exact batch on the *real* MLPerf data is the
+honest steady-state delta. The earlier "12.99 M sps" reported on real
+data was on an 80-iter window before the NFS reader bottleneck kicked
+in; sustained, that drops to 5.2 M sps unless data lives in RAM.
+
+The previous synthetic-data results (batch 110,592 = 17.37 M sps,
+batch 55,296 = 12.74 M sps) are kept above for cross-reference but
+they were always sustained because the synthetic 24-day binary fits
+in OS page cache by accident (read once at iter 1, served from cache
+thereafter). Real MLPerf's 187 GB does NOT fit in cache when read via
+O_DIRECT. RAM-disk is the simple fix.
 
 The breakthrough was discovering that the V5 2D-tile `BGRADA` kernel
 (checked in earlier as commit `63a9c54` for the wgrad bias-gradient

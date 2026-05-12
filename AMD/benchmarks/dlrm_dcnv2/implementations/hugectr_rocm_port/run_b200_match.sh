@@ -15,14 +15,32 @@ pip install --quiet mpi4py mlperf-logging 2>&1 | tail -3 || true
 export LD_LIBRARY_PATH=/opt/rocm/lib:/workspace/hugectr_hip/build_rocm72/lib
 export PYTHONPATH=/workspace/hugectr_hip/build_rocm72/lib:${PYTHONPATH:-}
 
-# Match B200 reference dataset shape (table sizes). Pick single-hot vs
-# synthetic multi-hot (sum=130 keys, 576 B/row) based on HCTR_USE_MULTI_HOT.
+# ROCm port: RCCL tunings that bumped sustained perf from 11.76 -> 11.88 M sps
+# at NV's batch (55,296) on /dev/shm. AMD's RCCL default is Simple proto, which
+# is fine but LL128 is ~1 % faster for our small grouped-allreduce shapes
+# (~6 MiB total for the 5 top-MLP wgrads + 3 bottom-MLP wgrads). Ring is
+# already RCCL's default for 8-rank intra-node.
+export NCCL_PROTO=${NCCL_PROTO:-LL128}
+export NCCL_ALGO=${NCCL_ALGO:-Ring}
+
+# Match B200 reference dataset shape (table sizes). Three multi-hot tiers,
+# from highest fidelity to lowest:
+#   HCTR_USE_MLPERF_CRITEO=1     -> real MLPerf-published Criteo from R2
+#                                    (downloaded from training.mlcommons-storage.org).
+#                                    This is what NVIDIA's submission actually consumes.
+#   HCTR_USE_FULL_CRITEO=1       -> our 24-day prime-mixed synthetic from HF day_*.gz
+#                                    (482 M rows; close to NVIDIA's HF-subsample run).
+#   default (HCTR_USE_MULTI_HOT) -> day_0-only synthetic.
+# All three tiers share the 912 B/row, 214 keys/row format that Layer_t.MLP expects.
 export HCTR_USE_SUBSAMPLED_CRITEO=1
 export HCTR_USE_REAL_TABLE_SIZES=1
 if [ "${HCTR_USE_MULTI_HOT:-0}" = "1" ]; then
-    if [ "${HCTR_USE_FULL_CRITEO:-0}" = "1" ] && [ -d /criteo/hugectr_bin_mh_full ]; then
+    if [ "${HCTR_USE_MLPERF_CRITEO:-0}" = "1" ] && [ -d /criteo/mlperf ]; then
+        DATA_DIR=/criteo/mlperf
+        echo "[ok] data shape = MULTI-HOT REAL MLPERF CRITEO (R2-hosted, 214 keys/row, 912 B/row)"
+    elif [ "${HCTR_USE_FULL_CRITEO:-0}" = "1" ] && [ -d /criteo/hugectr_bin_mh_full ]; then
         DATA_DIR=/criteo/hugectr_bin_mh_full
-        echo "[ok] data shape = MULTI-HOT FULL CRITEO (24 days, 214 keys/row, 912 B/row)"
+        echo "[ok] data shape = MULTI-HOT FULL CRITEO (24 days synthetic, 214 keys/row, 912 B/row)"
     else
         DATA_DIR=/criteo/hugectr_bin_mh
         echo "[ok] data shape = MULTI-HOT day_0 only (214 keys/row, 912 B/row)"
