@@ -1043,6 +1043,75 @@ Inside GPU busy, the new mix (auto sharding):
   other (sort, label_count, etc.)                        ≈ 0.28    15 %
 ```
 
+##### Exposed (non-overlapped) NCCL time at bs=1× auto + tmpfs
+
+`scripts/critical_path_nsys.py` walks the trace stream-by-stream and
+classifies every NCCL kernel as either "with concurrent compute on
+another stream" (hidden) or "on the critical path" (exposed).
+Numbers below are GPU 0 over the 4-second trace window (~1 880 iters
+at 2.13 ms/iter):
+
+```
+total NCCL kernels             :   7,944
+  with concurrent compute      :   7,812 (98.3 %)  ← hidden behind compute
+  on critical path (none)      :     132 ( 1.7 %)  ← exposed
+
+total NCCL time                :   1 007.86 ms
+  with concurrent compute      :     812.14 ms (80.6 %)  ← hidden
+  on critical path             :     195.72 ms (19.4 %)  ← exposed
+                                  ─────────
+per-iter equivalents (GPU 0):
+  total NCCL / iter            :   ≈ 0.54 ms   (∼25 % of iter time)
+  hidden NCCL / iter           :   ≈ 0.43 ms   (∼20 % of iter)
+  exposed NCCL / iter          :   ≈ 0.10 ms   ( ∼5 % of iter)
+```
+
+**Side-by-side with the OLD bs=1× config** (rr + virtiofs, §7.4a era
+trace from April 2026):
+
+| Metric (per iter, GPU 0) | OLD (rr + virtiofs) | NEW (auto + tmpfs) | Δ |
+| ------------------------ | ------------------: | -----------------: | --: |
+| total NCCL time / iter | 1.05 ms | **0.54 ms** | **−49 %** |
+| **exposed NCCL / iter** | **1.06 ms** | **0.10 ms** | **−90 %** |
+| % of NCCL time exposed | 64 % | 19 % | −45 pp |
+| % of iter spent on exposed NCCL | 26 % of 4.08 ms | **5 %** of 2.10 ms | −21 pp |
+
+The **10× reduction in exposed NCCL** comes from two stacking effects:
+
+1. **Less NCCL work to hide** (−49 % total NCCL/iter). `auto` sharding
+   data-parallel-replicates 13 of 26 tables (the small high-frequency
+   ones; see §8.3.0 / sharding-plan dump), so per-iter `ncclSendRecv`
+   payload shrinks proportionally. Fewer NCCL bytes ⇒ smaller NCCL
+   kernels ⇒ easier to hide.
+
+2. **The remaining NCCL hides much better** (19 % exposed vs 64 %
+   exposed before). With less NCCL to fit, the compute kernels on
+   stream 250 (cutlass GEMM) and stream 362 (cub sort) provide
+   enough cover for almost all of it. Only ~132 of 7 944 NCCL kernels
+   (1.7 % by count, 19 % by time) still sit on the critical path —
+   the late `SendRecv` + `AllReduce` at iter boundaries.
+
+A 3-iter ASCII timeline from the trace (one char ≈ 53 μs;
+`#` = compute, `C` = NCCL):
+
+```
+stream 250 (compute, cutlass):
+  |### ################ #####     CCCC ####### ############### #####     CCCCC##### ## ############# #####  |
+stream 348 (NCCL SendRecv):
+  ||###CCC#                ##CC########  ###CC##              #CC########  ###CCC#              ##CC      |
+stream 362 (cub sort):
+  |#   ###############          ##  ##  ##############         ###    ###   ##############          ##     |
+stream 363 (scan + NCCL):
+  ||   ##CCC###CC#####                   #CCC##C######                     ##CC##CCC####                   |
+stream 380 (GEMM nvjet):
+  ||                  ###### ###                       ###### ###                     ####### ##           |
+```
+
+Every `C` on the comm streams (348, 363) has a `#` on one of streams
+250/362/380 at the same timestamp — i.e., overlapped. The exposed
+NCCL is the small set of tail-of-iter `C`s with no concurrent `#`
+anywhere.
+
 Comparison to MLPerf 5.1-0040 reference: their pure-train iter is
 2.13 ms; our new 2.10 ms is **1.4 % faster** at the same
 batch / hyperparams / DL config. The reference uses the same `auto`
