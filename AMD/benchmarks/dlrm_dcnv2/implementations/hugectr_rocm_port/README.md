@@ -23,8 +23,8 @@ comparable to NV's published B200 numbers.
 |---:|---:|---:|---:|---:|---|
 | **55,296** (1×, NV's MLPerf-spec) | 6,912 | 4.28 | **12.92** | **81.9 %** of 15.78 | DYN_QUEUES baked in (+8.9 % vs prior 11.86) |
 | 110,592 (2×) | 13,824 | 7.35 | **15.04** | **82.6 %** of 18.20 | +8.3 % vs prior 13.89 |
-| **221,184 (4×)** | 27,648 | 13.69 | **16.15** | **81.5 %** of 19.82 | DYN_QUEUES + BLOCK_SYNC=0; +6.2 % vs prior 15.21 |
-| 442,368 (8×) | 55,296 | 26.90 | **16.44** | **85.7 %** of 19.19 | new sweet-spot under DYN_QUEUES; +8.4 % vs prior 15.17 |
+| 221,184 (4×) | 27,648 | 13.47 | **16.43** | **82.9 %** of 19.82 | DYN_QUEUES + concat vec8 (+3.1 % vs no-vec8) |
+| **442,368 (8×, peak)** | 55,296 | 26.54 | **16.67** | **86.9 %** of 19.19 | DYN_QUEUES + concat vec8 + binaryOp vec8 (+1.5 % session vs prior 16.42) |
 
 NVIDIA B200 reference numbers in the table above come from the
 companion `b200/.../README-b200-1x8.md` doc, where NVIDIA's own engineers
@@ -801,32 +801,71 @@ Now baked into `run_b200_match.sh` as the default. Discovered while
 replicating NV's b200/README §8.2c per-component breakdown at the
 peak-throughput batch.
 
-### Final cumulative results (post-Phase-11, 2026-05-12)
+### Phase 12 — int4-vectorized __half elementwise kernels (commits `4fb17c3`, `<NEW>`, 2026-05-12)
 
-After all eleven phases, on real MLPerf Criteo (HF subsample, /dev/shm),
+After capturing a fresh `rocprofv3 --hip-trace --kernel-trace` at the
+peak-config (bs8x = 442,368, all Phase-11 knobs on, with HIPBLASLT
+tuning override), three "Tensor-namespace" __half element-wise kernels
+were identified as having sub-optimal HBM utilization on AMD CDNA3 (using
+8-byte int2 or scalar __half loads instead of the 16-byte int4 limit).
+Two were rewritten to use int4 (= 8 × __half) loads/stores; the third
+(half4 ReLU) measured flat after node-effect controls.
+
+**`concat_fwd_kernel_vec8` / `concat_bwd_kernel_vec8`** in
+`HugeCTR/src/layers/concat_layer.cu`. Profile showed 4 calls/iter at
+~327 µs/call = **4.9 % of bs8x iter (1.31 ms)**. New kernel uses int4
+loads + stores per inner iteration, falling back to scalar tail when
+unaligned. Compile-time `if constexpr` keeps the int4 path out of the
+float instantiation.
+- 3-trial averages, real MLPerf data, /dev/shm, DYN_QUEUES baseline:
+  - bs1x:  13.05 → 13.04 M sps (flat — concat is sub-100 µs at small batch)
+  - bs4x:  15.94 → **16.43 M sps (+3.06 %)**
+  - bs8x:  16.38 → **16.69 M sps (+1.84 %)**
+- HCTR_CONCAT_KERNEL=v1 reverts for diagnostic A/B.
+
+**`binaryOp_kernel_vec8_half`** in
+`HugeCTR/include/prims/mlcommon_linalg_hip.cuh` — used by HugeCTR's
+MultiCross `matrix_add` (~277 µs/iter at bs8x). int4 loads + 8 op-lambda
+calls per thread + int4 stores. Same compile-time SFINAE / aligned-pointer
+gate; HCTR_BINARYOP_KERNEL=v1 reverts.
+- 4-trial per-node-controlled comparison at bs8x: **+0.5 %** consistent
+  across both nodes (375: +0.50 %, 372: +0.57 %). Loss preserved.
+
+**`half8_relu_kernel`** in `HugeCTR/src/layers/relu_layer.cu`: rewrote
+ReluLayer<__half> to use int4 (= half8) loads instead of int2 (= half4).
+- 4-trial per-node-controlled comparison at bs8x: **flat (-0.08 %)** —
+  half4 already saturates kernel HBM bandwidth at the small DLRM-DCNv2
+  layer widths (128–1024 elements). Code kept opt-in via
+  HCTR_RELU_KERNEL=vec8; default = v1.
+
+Cumulative session impact at bs8x: 16.42 → **16.67 M sps (+1.5 %)** =
+85.7 % → **86.9 %** of NV B200's bs8x peak (19.19 M sps).
+
+### Final cumulative results (post-Phase-12, 2026-05-12)
+
+After all twelve phases, on real MLPerf Criteo (HF subsample, /dev/shm),
 FP16 mixed, multi-hot, 8 × MI350X auto sharding, HIP graph + overlap on,
-DYN_QUEUES on:
+DYN_QUEUES on, vec8 elementwise on:
 
 | Batch (global) | Per-GPU batch | ms/iter | **AMD M sps** | NV B200 (same HF data) | Ratio |
 |---:|---:|---:|---:|---:|---:|
 | 55,296 (1×) | 6,912 | 4.28 | **12.92** | 15.78 | **81.9 %** |
 | 110,592 (2×) | 13,824 | 7.35 | **15.04** | 18.20 | **82.6 %** |
-| 221,184 (4×) | 27,648 | 13.69 | **16.15** | 19.82 | **81.5 %** |
-| **442,368 (8×)** | 55,296 | 26.90 | **16.44** | 19.19 | **85.7 %** ← peak ratio |
+| 221,184 (4×) | 27,648 | 13.47 | **16.43** | 19.82 | **82.9 %** |
+| **442,368 (8×)** | 55,296 | 26.54 | **16.67** | 19.19 | **86.9 %** ← peak ratio |
 
 Cumulative improvement vs the phase 2 first-converging baseline of
 **5.85 M sps**: **+121 %** at NVIDIA's exact batch (55,296) and
-**+181 %** at our peak (8×, batch 442,368). Cumulative improvement
-vs the pre-Phase-11 baseline at the same batches: **+8.9 % / +6.0 % /
-+8.4 %** — Phase 11 alone added more headline throughput than the
-combined NCCL/HCTR/HIP env-knob sweeps from May.
+**+185 %** at our peak (8×, batch 442,368). Cumulative improvement
+vs the pre-Phase-11 baseline at the same batches: **+8.9 % / +8.3 % /
++8.0 % / +9.9 %** (Phases 11 + 12 combined).
 
 NV's published 23.02 M sps is on the full 4.2 B-row MLPerf corpus
 (unreproducible without ~4 TB local storage); on equivalent data
 their B200 measures 13.57 M sps at MLPerf-spec batch 55,296. We
-hit 12.92 M sps (= 81.9 % of NV at the matched batch) and 16.44 M sps
-at our peak (= 1.04× of NV's 13.57 reference; 85.7 % of NV's own
-peak at bs4x). The remaining ~14–18 % gap is platform-fundamental
+hit 12.92 M sps (= 81.9 % of NV at the matched batch) and 16.67 M sps
+at our peak (= 1.23× of NV's 13.57 reference; 86.9 % of NV's own
+peak at bs8x). The remaining ~13–18 % gap is platform-fundamental
 (no NVLS hardware multicast on xGMI, ~12 µs higher per-kernel launch
 latency, no GPU clock pinning without sudo).
 
