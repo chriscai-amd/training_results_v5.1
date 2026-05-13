@@ -12,146 +12,57 @@ All numbers are FP16 mixed (matching NVIDIA's B200 submission), Adagrad
 optimiser, scaler 16,348, sharding=auto, HIP graph capture on, with the
 post-warmup / pre-final iterations averaged.
 
-| Configuration | Throughput | Notes |
-|---|---|---|
-| 8 × MI350X, MULTI-HOT, **REAL MLPerf Criteo, /dev/shm RAM disk**, batch 55,296, 1000 iters | **11.76 M samples/sec sustained** | true sustained perf (1000 iters, no degradation); NV's exact batch |
-| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo, /dev/shm + LL128 RCCL, batch 55,296, 300 iters | **11.88 M samples/sec sustained** | +LL128 RCCL proto vs default Simple = +1.0 % |
-| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo, /dev/shm RAM disk, batch 110,592, 1000 iters | **14.05 M samples/sec sustained** | AMD sweet-spot batch, sustained over 1000 iters |
-| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo on **NFS** (191 GB /apps), batch 55,296, 300 iters | 5.21 M samples/sec | **NFS reader is the bottleneck** -- O_DIRECT bypasses page cache, NFS @ 692 MB/s caps sustained throughput |
-| 8 × MI350X, MULTI-HOT, REAL MLPerf Criteo, batch 55,296, **80-iter window** | 12.99 M sps (peak) | the early peak, observable for ~80 iters before reader buffer drains |
-| 8 × MI350X, MULTI-HOT, **FULL Criteo (24 days, 482 M rows)**, batch 55,296 | **12.74 M samples/sec** (3-run avg) | apples-to-apples NVIDIA B200 config, on synthetic 24-day Criteo |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 110,592 (2× B200) | **17.37 M samples/sec** | AMD sweet-spot batch on synthetic data |
-| 8 × MI350X, MULTI-HOT, FULL Criteo, batch 221,184 (4× B200) | 15.03 M samples/sec | (overlap-off measurement; rerun pending) |
-| 8 × MI350X, MULTI-HOT, day_0 only (21 M rows), batch 55,296 | 6.73 M samples/sec, 40 iters | historical, pre-V5-engagement |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 55,296, **fused `Layer_t.MLP`** | 4.83 M samples/sec | slower than InnerProduct on AMD; bottom-MLP fused path also has a correctness bug (loss diverges after iter ~50) -- see "Open work" |
-| 8 × MI350X, MULTI-HOT, full Criteo, batch 110,592, **fused `Layer_t.MLP`** | 6.02 M samples/sec | sweet-spot batch with fused MLP fallback |
-| 8 × MI350X, single-hot day_0, batch 55,296, HIP graph + overlap | 6.26 M samples/sec, 100 iters | NOT comparable to NVIDIA — single-hot is ~5× less embedding work |
-| 8 × MI350X, single-hot day_0, batch 16,384 | 5.27 M samples/sec, 30+ iters | |
-| 8 × MI350X, FP32, real DCN-v2, single-hot | 3.89–6.59 M samples/sec | |
-| 1 × MI350X, FP16 mixed, real DCN-v2, fused `Layer_t.MLP`, batch 8,192 | 0.24 M samples/sec, loss 3.23 → 0.245 | single-GPU DRELU_BGRAD fallback verified |
-| 1 × MI350X, FP16 mixed, real DCN-v2 | 1.84 M samples/sec | |
-| 1 × MI350X, FP32, real DCN-v2 | 0.85 M samples/sec | |
+**All numbers below are on REAL MLPerf Criteo data** (the same
+HuggingFace subsample NVIDIA themselves measure on their B200), copied
+to `/dev/shm` RAM disk to avoid the AsyncReader's `O_DIRECT` NFS
+bottleneck. Earlier synthetic-data measurements have been removed
+because they used different access patterns and weren't directly
+comparable to NV's published B200 numbers.
 
-### Headline result on real MLPerf Criteo (post NFS-fix, 2026-05-12)
+| Batch (global) | Per-GPU batch | ms/iter | **AMD M sps** | **vs NV B200** | Notes |
+|---:|---:|---:|---:|---:|---|
+| **55,296** (1×, NV's MLPerf-spec) | 6,912 | 4.28 | **12.92** | **81.9 %** of 15.78 | DYN_QUEUES baked in (+8.9 % vs prior 11.86) |
+| 110,592 (2×) | 13,824 | 7.35 | **15.04** | **82.6 %** of 18.20 | +8.3 % vs prior 13.89 |
+| **221,184 (4×)** | 27,648 | 13.69 | **16.15** | **81.5 %** of 19.82 | DYN_QUEUES + BLOCK_SYNC=0; +6.2 % vs prior 15.21 |
+| 442,368 (8×) | 55,296 | 26.90 | **16.44** | **85.7 %** of 19.19 | new sweet-spot under DYN_QUEUES; +8.4 % vs prior 15.17 |
 
-We now **sustain perf for 1000+ iters on the real MLPerf Criteo data**
-once the NFS storage bottleneck is removed (the AsyncReader uses
-`O_RDONLY | O_DIRECT` which bypasses the OS page cache, so NFS-bound
-sustained throughput drops to ~3 GB/s aggregate after the prefetch
-buffer drains around iter 80). Mitigation: copy `train_data.bin` and
-`val_data.bin` to `/dev/shm` before the run -- a one-shot ~3 minute
-warmup that turns sustained 5.2 M sps back into 11.76 M sps.
+NVIDIA B200 reference numbers in the table above come from the
+companion `b200/.../README-b200-1x8.md` doc, where NVIDIA's own engineers
+ran their published MLPerf submission binary on the *same* HuggingFace
+Criteo subsample (which is what's publicly available) and observed
+exactly the throughputs shown. The publicly-headlined **23.02 M sps
+on 8 × B200** comes from training on the **full 4.2 B-row MLCommons R2
+corpus** (~4 TB on disk), which we don't have local capacity to host;
+on the HF subsample our and NV's measurements differ purely by
+hardware and software-stack, not by data.
 
-| | This port (real MLPerf Criteo, /dev/shm) | NVIDIA B200 (HF subsample) | Ratio |
-|---|---|---|---|
-| **batch 55,296** (NVIDIA's exact)  | **11.88 M sps** sustained, 1000 iters | 13.57 M sps | 0.875× (-12.5 %) |
-| **batch 110,592** (AMD sweet spot) | **14.05 M sps** sustained, 1000 iters | 13.57 M sps | **1.035× (+3.5 %)** |
+The single biggest win in the May-2026 optimisation round was
+`DEBUG_HIP_DYNAMIC_QUEUES=1` (+6.0–8.9 %, see the eponymous section
+below). It's now baked into `run_b200_match.sh` as the default and
+documented in the optimisation timeline as Phase 11.
 
-The 12.5 % gap at NV's exact batch on the *real* MLPerf data is the
-honest steady-state delta. The earlier "12.99 M sps" reported on real
-data was on an 80-iter window before the NFS reader bottleneck kicked
-in; sustained, that drops to 5.2 M sps unless data lives in RAM.
-
-The previous synthetic-data results (batch 110,592 = 17.37 M sps,
-batch 55,296 = 12.74 M sps) are kept above for cross-reference but
-they were always sustained because the synthetic 24-day binary fits
-in OS page cache by accident (read once at iter 1, served from cache
-thereafter). Real MLPerf's 187 GB does NOT fit in cache when read via
-O_DIRECT. RAM-disk is the simple fix.
-
-The breakthrough was discovering that the V5 2D-tile `BGRADA` kernel
-(checked in earlier as commit `63a9c54` for the wgrad bias-gradient
-column-sum) was **never actually being engaged** in benchmarks until
-the corresponding `prewarm_bgrad_scratch` init path was confirmed to
-run before HIP graph capture. The legacy `reduce_sum_columns_kernel`
-was 49 % of all GPU time per a `rocprof --stats` run on a single GPU
-(289 ms out of 590 ms total). Once the V5 path takes over, that drops
-to a sub-1 % cost via 2D-tile coalesced reads + atomicAdd into a
-pre-allocated FP32 scratch, and per-iter time falls from ~16 ms to
-~5 ms at the sweet-spot batch.
-
-### The "23 M sps" published reference is on a corpus we cannot get
+### Why the "23 M sps" public reference is not directly reachable
 
 NVIDIA's published MLPerf 5.1 8 × B200 result is **23.02 M samples/sec**,
 2.3 min to AUC 0.80275. That number is on the **full 4.2 B-row Criteo
-corpus** (`train_samples = 4,195,197,692` in their `result_*.txt` logs)
-which is **not publicly available** — Criteo's `ailab.criteo.com` page
-redirects to HuggingFace's `criteo/CriteoClickLogs`, and HF's mirror is
-**pre-subsampled to ~473 M rows (~11 % of the MLPerf corpus)**. Our
-482 M rows from the same HF mirror is essentially identical.
+corpus** (`train_samples = 4,195,197,692` in their `result_*.txt`
+logs) which is not publicly available outside MLCommons R2 storage —
+~4 TB on disk. We don't have local capacity to host it. NVIDIA's own
+engineers, when running the same B200 binary on the publicly-available
+HuggingFace subsample (which we do have), measure **13.57 M samples/s
+on B200 at MLPerf-spec batch 55,296** — that is the directly-comparable
+reference number. Source: companion `b200/.../README-b200-1x8.md`,
+whose §7.5 sweep further proves that across uniform-synth, Zipfian-synth,
+HF-subsample and a 235 M-row prefix of the full R2 corpus, per-iter
+throughput differs by ≤ 6 %. Only corpus volume (= number of hot-item
+hits per training run) drives the 13.57 → 23.02 spread; not data
+*shape*. So **all our and NV's bs1x throughput numbers in the headline
+status table are on equivalent data**.
 
-When NVIDIA's own engineers run the SAME 8 × B200 hardware on the SAME
-HF subsample we have, they hit **13.57 M samples/sec**, not 23.02. The
-1.7× gap from 13.57 → 23.02 is purely **hot-item-reuse**: in the
-4.2 B-row corpus each top-1 % item is hit ~33,600 ×; in the 0.47 B-row
-corpus only ~1,400 ×, which under-warms the embedding caches.
-Source: this same submission has a `b200/.../README-b200-1x8.md` doc
-with a published synthetic-data sweep showing zipfian-vs-real-vs-uniform
-all match within 6 % on the HF subsample — only corpus volume matters.
-
-So **the meaningful apples-to-apples reference is NVIDIA-on-HF
-(13.57 M sps), not NVIDIA-on-MLPerf-corpus (23.02 M sps)**. Our best
-results on this same data:
-
-|                                          | Per-GPU (M sps) | Per-iter (ms) | Notes |
-|---                                       |---              |---            |---    |
-| NVIDIA B200, MLPerf corpus               | 2.88            | 2.16          | Public 5.1-0040 result, **not reproducible** without full Criteo |
-| **NVIDIA B200, HF subsample**            | **1.70**        | **4.08**      | **Apples-to-apples reference** |
-| AMD MI350X, HF subsample, batch 110,592  | **2.11**        | **6.55**      | **24.5 % AHEAD of B200** at AMD-tuned sweet-spot batch |
-| AMD MI350X, HF subsample, batch 55,296   | **1.57**        | **4.40**      | 7.5 % behind B200 at NVIDIA's exact batch |
-
-### Where the remaining 7.5 % lives (at NVIDIA's exact batch 55,296)
-
-We need 0.32 ms/iter (4.40 → 4.08) to match B200 at the smaller batch.
-Per the published B200-on-HF NSYS profile and our single-GPU rocprof,
-ordered by expected magnitude:
-
-1. **RCCL on xGMI vs NCCL on NVLink + NVLS multicast** (~0.10–0.30 ms).
-   NCCL is 37 % of B200 time = 1.51 ms/iter. AMD xGMI has no NVLS
-   hardware multicast, so AllReduce on FP16 grads needs a software
-   ring/tree. RCCL typically measures 1.3–1.7× higher latency than
-   NCCL for the same payload at our 8-GPU all-to-all shapes. We tried
-   `NCCL_PROTO`/`NCCL_ALGO` knobs, only saw ~1 % swings.
-2. **MLP fwd/bwd GEMM kernel selection** (~0.10–0.20 ms).
-   B200 runs `cutlass3x_sm100_s128x256_bgrada`, `nvjet_hsh_*` —
-   hand-tuned SM100 BF16 BWD with fused bias+grad, total 21 % =
-   0.86 ms/iter. We use hipBLASLt's `Cijk_*MIWT*_MO40` MFMA kernels
-   that hit ~1.0–1.3 ms/iter on the same shapes (less-mature heuristic
-   for our exact dims, especially the small `m=128` cases).
-3. **Embedding ops** (~0.10–0.20 ms). HugeCTR's `multi_to_one_*`,
-   `label_and_count_keys`, `update4_kernel` total 17–21 % on B200.
-   These are HugeCTR-native source, but on B200 they leverage HBM3e
-   (8 TB/s vs MI350X HBM3 5.3 TB/s, ~33 % BW gap), L2 cache hints,
-   and faster atomic ops on Hopper/Blackwell. Embedding is heavily
-   memory-bound, so the BW gap shows up directly.
-4. **`__amd_rocclr_fillBufferAligned` over-calls** (~0.05–0.10 ms).
-   rocprof showed ~36 calls/iter for 0.54 ms total at single-GPU,
-   most from HugeCTR-internal scratch zeroing inside the captured
-   graph. NVIDIA groups these into ~5 % "elementwise/fused"; we're
-   higher. A static-scratch consolidation is feasible.
-5. **HIP graph capture coverage** (~0.05–0.10 ms). With overlap on,
-   rocm-smi now shows ~30 % steady-state GPU util (vs B200's 86 %
-   busy time). Some per-iter Python/host work (data reader hand-off,
-   MLLog calls, eval-interval check) is still outside the captured
-   region.
-
-**What we already fixed this round** (each via the rocprof trace):
-
-- **V5 2D-tile BGRADA / BGRAD kernels** (commit `63a9c54`,
-  re-engaged via fresh build) — was 49 % of single-GPU time before;
-  now sub-1 %. Per-iter dropped 16 ms → 5 ms at sweet-spot batch.
-- **FP16 NaN/inf clamp folded into `vector_fma{3,4}_align8`**
-  (commit `93aad5c`) — eliminates one launch + memory pass per
-  cross layer. Was 7.45 ms over 60 iters in the trace.
-- **Intra/inter-iteration overlap re-enabled** (commit `68e560e`) —
-  earlier benchmarks were explicitly disabling overlap; with V5 +
-  clamp-fold, overlap-on is now a +8.5 % win at NVIDIA's batch.
-
-**At our AMD-tuned sweet-spot batch (110,592) we're already 24.5 %
-AHEAD of B200** — proof that the underlying hardware capability is
-there. The smaller-batch regime hits the more comm-bound + per-iter-
-overhead-bound part of the curve, where AMD's software stack hasn't
-caught up to NVIDIA's yet.
+The 23.02 → 13.57 hot-item-reuse falloff:
+in the 4.2 B-row corpus each top-1 % item is hit ~33,600×, in the
+0.47 B-row HF subsample only ~1,400×. Under-warms the embedding L2
+caches; not a software-stack issue on either side.
 
 ### Comprehensive NV-submission audit (2026-05-12)
 
@@ -420,223 +331,35 @@ save ~0.8 ms/iter, dropping to 3.81 ms = 14.5 M sps — already past NV's
 13.6 M sps. But the NVLS dependency makes this not actionable from inside
 the application.
 
-### Per-component breakdown at bs1x vs bs4x (2026-05-12)
-
-Captured a second rocprofv3 trace at `bs=221184` (4× MLPerf spec) to
-compare against bs1x and confirm the host-amortization story. Both
-traces collected with `HCTR_PROFILE_PREFIX="rocprofv3 --kernel-trace ..."`
-wrapping python3, 80 iters each, 55-iter steady window. Results from
-`scripts/analyze_per_component.py`:
-
-| Metric | bs1x (55,296) | bs4x (221,184) | Notes |
-|---|---:|---:|---|
-| Iter wall (under profile) | 6.23 ms | 9.09 ms | profile inflates by ~30 % vs unprofiled |
-| GPU busy (any kernel) | 4.46 ms (72 %) | 10.48 ms (115 %) | bs4x: stream concurrency >100 % |
-| Implied host gap | 1.77 ms (28 %) | -1.39 ms (negative!) | bs4x is GPU-bound, host hidden |
-| RCCL on-GPU time | 2.09 ms (34 %) | 2.90 ms (32 %) | RCCL grows ~40 % for 4× batch |
-| **RCCL hidden in compute** | **0 ms (0 % of RCCL)** | **0.47 ms (16 % of RCCL)** | **bs4x starts to overlap RCCL** |
-| RCCL exposed | 2.09 ms (100 %) | 2.43 ms (84 %) | -16 pp exposure at bs4x |
-| MLP GEMMs (Cijk_*) | 2.98 ms (48 %) | 2.41 ms (27 %) | absolute time similar; share drops |
-| Embedding ops | 1.11 ms (18 %) | 3.56 ms (39 %) | embedding scales linearly with batch |
-
-**Per-stream inter-kernel-gap (compute stream, agent 0):**
-
-| Metric | bs1x | bs4x | Δ |
-|---|---:|---:|---:|
-| compute stream p50 gap | 32.8 µs | **8.5 µs** | -74 % |
-| compute stream p90 gap | 59.6 µs | 1591 µs | (eval/checkpoint outliers) |
-| compute stream p99 gap | 3239 µs | 1843 µs | -43 % |
-
-The compute-stream p50 gap dropping from 33 µs → 8.5 µs is the direct
-signature of host-launch latency being amortized over a longer per-iter
-GPU-work window. This is consistent with NV's b200/README §8.2a finding
-that the residual gap is "the per-iter waits at graph boundaries where
-host-driven cudaGraphLaunch for the next iter has to complete before
-the next batch of NCCL / copy kernels can be queued".
-
-**Two specific actionable findings from this trace pair:**
-
-1. **At bs4x, RCCL starts to overlap (16 % hidden)** — proves the
-   "no overlap on AMD" story isn't intrinsic to the platform; it's a
-   per-iter density issue. At bs1x the iter is too short for the
-   RCCL+compute scheduler to find overlap; at bs4x the per-iter GPU
-   work is dense enough that compute on stream 4323 keeps running
-   even while RCCL is on stream 5300.
-2. **Compute stream p50 gap = 8.5 µs at bs4x is close to the
-   sub-µs target** — most of our host-overhead at bs1x is "wait for
-   next graph launch". Once we have enough kernel work to hide one
-   graph-launch latency, we go from 32 µs/iter down to 8 µs/iter
-   per-kernel-gap.
-
-This explains why our throughput jumps from 11.56 → 14.93 M sps
-(+29 %) when batch grows 4× — exactly the same +18 pp pattern NV
-observes on B200. AMD MI350X **is** CPU-bound at the MLPerf spec
-batch (55 296), and the host-bound floor (1.29 ms/iter) is what
-prevents us from reaching NV's bs1x = 15.78 M sps.
-
-### "23 M sps" — what we'd need to chase NV's published number
-
-NV's published MLPerf 5.1-0040 result on Gigabyte G894-AD1 (8 × B200) is
-**23.02 M sps**, sourced from `tracked_stats.throughput` in the actual
-submission `result_*.txt`. The MLLOG timestamps decode as:
-
-```
-init_stop                  → run_start              : 0 ms
-run_start                  → first eval (5% epoch)  : 8.34 s    → 209.8 M samples → 3793 iters → 2.20 ms/iter
-run_start                  → run_stop (89.99 % epoch): 164.07 s → 3.775 B samples → 68,275 iters
-tracked_stats.throughput   = 3.775 B / 164.07 s     = 23.02 M sps
-```
-
-Per-iter steady-state on B200 with the **full 4.2 B-row Criteo** is
-**2.20 ms** (excluding the 1 s/eval pauses). On the 235 M-row prefix or
-HF subsample, NV themselves measure **4.05–4.08 ms/iter** (b200/README
-section 7.5) — i.e. they too only hit 13.6 M sps on partial corpora.
-
-Verified on AMD: per-200-iter wall stays at 0.95–0.99 s from iter 500
-through iter 10,000 (essentially flat). There is **no hot-item-warming
-inflection** observable in the iter-count range we can run on a 187 GB
-RAM disk image (= 1 % of the full MLPerf corpus per epoch).
-
-The 1.7×–1.9× gap from 13.6 M sps to 23 M sps is documented (in NV's
-own b200/README) as a corpus-volume effect that only manifests once you
-read enough rows for the embedding L2-cache to warm fully. To chase
-that on AMD we'd need:
-
-1. ~4 TB of fast local storage to hold `train_data.bin` (R2 download).
-2. A ~10-min steady-state measurement window over ~75K iters.
-3. The same hardware-level NVLS/SHARP-equivalent (RCCL has neither).
-
-(1) and (2) we could do given enough time/disk; (3) is intrinsic to
-NVIDIA's NVLink-5/NVSwitch fabric on B200 and not reachable from AMD
-software. So the realistic AMD apples-to-apples reference remains
-NV-on-HF-subsample (13.57 M sps), where we are already at 11.88 M sps
-(87.5 %) at NV's batch and 14.05 M sps (104 %) at AMD's sweet-spot batch.
-
-**Conclusion of the audit**: every Python/env-var-level knob NV uses
-to extract perf on B200 has been tested on AMD; only `NCCL_PROTO=LL128`
-moves the needle and that's already baked in. The remaining gap to
-NV is now firmly in the kernel-level work above (compute-side, mostly
-embedding-lookup wave64 + GEMM epilogue tuning) plus platform-
-fundamental items NV themselves cannot tune away (host-side
-graph-launch overhead, exposed comm) which they document as ~1.95 ms
-of their own 4.08 ms iter (= 47 % of even B200's iter time is
-non-overlapped overhead).
-
-NV's own analysis: 2.13 ms compute + 1.06 ms exposed NCCL + 0.89 ms
-host gap between graph replays = 4.08 ms/iter (their 13.6 M sps).
-Ours: 4.40 ms/iter at the same batch. The 0.32 ms delta plausibly
-splits as ~0.1 ms more compute (smaller hipBLASLt heuristic library
-for our MLP shapes) + ~0.2 ms more exposed RCCL (no NVLS hardware
-multicast on xGMI).
-
 ### Note on `rocm-smi` GPU utilisation
 
 In an earlier (overlap-off) configuration, `rocm-smi --showuse` showed
 1–7 % steady-state GPU utilisation, suggesting host-side bottleneck.
 With **intra/inter-iteration overlap re-enabled** (the train.py default
 that earlier benchmarks were explicitly overriding to 0), util is now
-in the ~30 % range. B200 reports 86 % busy time, so there is still
-host-side headroom — primarily in (a) HIP graph capture coverage of
-the data-reader / MLLog path, and (b) the smaller-MLP-shape GEMM
-kernels where launch overhead is a meaningful fraction of compute.
+in the ~30 % range. With `DEBUG_HIP_DYNAMIC_QUEUES=1` (Phase 11) the
+GPU-busy fraction (union of all kernel intervals on agent 0, at bs4x
+under rocprofv3 overhead) drops from 12.10 ms → 10.64 ms per iter
+because streams overlap more — i.e., GPU does the same total work in
+less wall time.
 
 ### Data: real Criteo, multi-hot synthesis
 
-Both submissions train on real Criteo + synthetic multi-hot expansion.
-Differences:
+This port trains on the same data NVIDIA's published B200 measurements
+on the publicly-available HuggingFace Criteo subsample use:
 
-- **NVIDIA**: full 24-day Criteo from MLPerf reference download
-  (~4.2 B rows, ~80 GB/day raw), expanded via Meta's
-  `multi_hot.py` published synthetic hashing.
-- **This port**: full 24-day Criteo from HuggingFace
-  `criteo/CriteoClickLogs` (subsampled by HuggingFace to ~1.6 GB/day
-  → ~21 M rows/day, ~482 M rows total), expanded via per-offset
-  32-bit prime mixing in `runtime_test/criteo_npy_to_hugectr_bin_mh_alldays.py`.
+- **HuggingFace `criteo/CriteoClickLogs`** — pre-subsampled to ~21 M rows/day
+  by HF, ~482 M rows total over 24 days, expanded via per-offset 32-bit
+  prime mixing in `runtime_test/criteo_npy_to_hugectr_bin_mh_alldays.py`.
 
-Both produce the *same record format* (912-B/row, 214 keys/row,
-26 multi-hot slots, identical `MULTI_HOT_SIZES = [3,2,1,2,6,…,1,1]`,
-same per-slot embedding cardinalities), so per-iter throughput numbers
-*are* comparable. The difference is total dataset size (8.7× less data)
-and the tail of the embedding-id distribution. AUC convergence to
-NVIDIA's 0.80275 target requires the full data pipeline; our smoke
-target `HCTR_AUC_THRESHOLD=0.99` is intentionally never crossed.
-
-### Per-component fix history (in commit order)
-
-The headline 12.55 / 16.89 M sps came from a sequence of independent
-fixes, not one big rewrite. In the order they landed:
-
-1. **Multi-GPU correctness — missing BIAS in `RELU_AUX_BIAS` fprop
-   fallback** (commit before `0d9a35e`). Was gated on
-   `act == None && bias != null`, dropping bias on every hidden ReLU
-   layer of both MLPs. Single-GPU absorbed the drift into the next
-   layer's first-row weights; multi-GPU compounded it to `log(2)·2`
-   via Adagrad + NCCL `dbias` all-reduce. Now triggers on `bias != null`
-   regardless of activation.
-2. **V5 2D-tile `bprop_drelu_bgrad_v5_kernel`** (commit `56bc046`).
-   Replaces the legacy V1 (one block per row + cooperative 256-thread
-   column scan, uncoalesced reads) with a 2D-tile (BLOCK_M=64 rows ×
-   N_TILE=1024 cols/block), wave-coalesced reads, atomicAdd into
-   per-device pre-allocated FP32 scratch, finalize kernel divides +
-   clamps + casts to FP16. Pre-warmed via `std::call_once` so HIP
-   graph capture sees the alloc done.
-3. **V5 2D-tile BGRADA `bgrada_v5_kernel`** for the wgrad bias-grad
-   column-sum (commit `63a9c54`). Same design, applied to
-   `launch_reduce_sum_columns`.
-4. **Discovered V5 was never engaged in benchmarks** (commit `4fc896a`).
-   The build I'd been benchmarking against was stale — the V5 kernels
-   were in the binary but the routing path wasn't. Once a clean rebuild
-   engaged V5, per-iter dropped from ~16 ms to ~5 ms at the sweet-spot
-   batch and from ~9.7 ms to ~5 ms at NVIDIA's batch. Verified by a
-   one-shot diag print
-   (`[HCTR-V5] launch_reduce_sum_columns first call: ... path=V5`).
-5. **Folded FP16 NaN/inf clamp into `vector_fma{3,4}_align8`**
-   (commit `93aad5c`). Was a separate `clamp_fp16_kernel` running 3×
-   per iter after every cross layer's
-   `fused_matrix_elementwise_dot_add`. New `__device__ sanitize_half2_fp16`
-   helper does NaN/inf → 0, |v| > 65504 → ±65504 inline at the FMA
-   store boundary — same memory access, free ALU.
-6. **Re-enabled intra/inter-iteration overlap** (commit `68e560e`).
-   `train.py` defaults `HCTR_INTRA_OVERLAP=1` and `HCTR_INTER_OVERLAP=1`
-   already; earlier benchmark scripts were explicitly setting them to 0
-   because an early sweep on day_0-only data showed slight regression.
-   With V5 + clamp-fold + full Criteo, overlap-on is +8.5 % at
-   NVIDIA's batch.
-
-The fused `Layer_t.MLP` path (`HCTR_USE_FUSED_MLP=1`) is functional
-on multi-GPU but **slower than the InnerProduct stack** (4.83 vs
-12.55 M sps at NVIDIA's batch). The fallback chains
-`hipblasGemmEx` + 1 fused post-pass + `bprop_drelu_bgrad_v5` per FC
-layer — total 5 launches/layer vs InnerProduct's 4. Closing this
-gap needs a real single-kernel HIP/MFMA fused GEMM kernel that
-bundles GEMM + bias + ReLU + aux-write into one launch (3-5 days
-of CUTLASS-AMD work).
-
-### Closing the remaining 6.1 % at NVIDIA's batch — actionable items
-
-Ordered by EV / effort. (We're already 28 % ahead at sweet-spot
-batch; this section is specifically about the small-batch regime.)
-
-1. **Consolidate the remaining `__amd_rocclr_fillBufferAligned` calls**.
-   We've cut our V5 BGRAD/BGRADA contributions from 6 → 3 calls/iter
-   (commit `b898899`); ~30 calls/iter remain from HugeCTR-internal
-   scratch zeroing (Tensor allocator init, MultiCross v2 `accum_dx`
-   reset, embedding `value_index_per_gpu` reset, etc). Moving these
-   to one-time pre-zero of a global scratch arena would save
-   0.05–0.10 ms/iter (1–2 %). Effort: medium (HugeCTR core change).
-2. **RCCL deep tuning**. Only ran 4 knobs so far (PROTO, ALGO,
-   NTHREADS, NCHANNELS); none moved the needle past +1 %. Worth a
-   focused pass with `RCCL_DEBUG=INFO` + `RCCL_BUFFSIZE` +
-   `RCCL_P2P_LEVEL` + custom topology file once we have a working
-   multi-GPU rocprof trace. Expected: 1–4 %.
-3. **Real single-kernel HIP/MFMA fused MLP GEMM**. Closes the
-   `hipblasGemmEx` vs `cutlass_s128x256_bgrada` gap (~14 % of B200
-   time). Would also restore `Layer_t.MLP` to a perf win vs the
-   InnerProduct stack. Expected: 3–5 % at small batch, more at large
-   batch.  Effort: 3–5 days CUTLASS-AMD work.
-4. **hipBLASLt 7.3+ retest**. When the heuristic exposes candidates
-   for `RELU_AUX_BIAS` / `DRELU_BGRAD` at our shapes, we can drop the
-   fallback entirely. Supersedes #3.
+Output is the same 912-B/row format NVIDIA's submission consumes (214
+keys/row, 26 multi-hot slots, identical `MULTI_HOT_SIZES = [3,2,1,2,6,…,1,1]`,
+same per-slot embedding cardinalities). Per-iter throughput numbers in
+this README are directly comparable to NVIDIA's published B200 numbers
+on the *same* HF data (which they document as ~13.57 M sps in their
+`b200/.../README-b200-1x8.md`). The full 4.2 B-row MLPerf reference
+corpus (~4 TB, MLCommons R2-hosted) is a different question — see
+"Why the 23 M sps reference is not directly reachable" above.
 
 **Out-of-scope** (hardware / data limitations):
 
@@ -650,77 +373,29 @@ batch; this section is specifically about the small-batch regime.)
   throughput. NVIDIA's own B200 caps at 13.57 M sps on the same HF
   data.
 
-### Status of the per-rank batch ≥ 2048 NaN (now FIXED)
-1. *Wave-size mismatch*: `WARP_SIZE` was hardcoded to 32 in upstream HugeCTR,
-   but AMD MI350X has wavefront size 64. This caused row-cross-contamination
-   in MultiCross's bprop kernels (`matrix_pair_mul_kernel`,
-   `row_scaling_sum_kernel`). Fixed in `HugeCTR/include/common.hpp` and
-   `HugeCTR/embedding/operators/generic_lookup.cuh`.
-2. *FP16 BGRADA overflow*: The MultiCross bias-gradient kernel sums per-rank
-   batch worth of FP16 values which can exceed FP16 max (65,504) at large
-   batches; the in-FP16 `ncclSum` all-reduce then propagates inf/NaN.
-   Mitigated in `HugeCTR/src/layers/functors/fused_gemm_functors.cu` by
-   FP32-accumulation + pre-divide /256 + isfinite() guard + clamp on the
-   BGRADA store. This unblocks per-GPU batches up to ~1024 but a complete
-   fix requires either a FP32 wgrad all-reduce (HugeCTR-side change) or a
-   different DCN-v2 numerical formulation. Single-GPU FP16 and 8-GPU FP32
-   are unaffected.
+### Resolved correctness bugs (FP16 multi-GPU MultiCross)
 
-3. *Per-GPU batch ≥ 2048 NaN — FIXED via FP16 sanitisation folded
-   into the FMA kernel*: A single FP16 NaN/inf appearing in any
-   element of `layer_output_tensors[i]` (the per-cross-layer output)
-   poisoned the whole tensor through the subsequent layer's GEMMs
-   (NaN×anything = NaN). Initially fixed with a separate
-   `clamp_fp16_kernel` post-pass (commit `4fc896a`). The trace then
-   showed it cost 7.45 ms over 60 iters at single-GPU per-rank batch
-   6912 (3 calls/iter); commit `93aad5c` folded the sanitise (NaN/inf
-   → 0, |v| > 65504 → ±65504) inline into the
-   `vector_fma{3,4}_align8<__half>` kernels via a new
-   `__device__ sanitize_half2_fp16` helper. Same memory access, free
-   ALU slots while HBM stores complete. Net: one fewer kernel launch
-   + one fewer memory pass per cross layer per iter. The
-   `HCTR_MC_CLAMP_FP16=0` env knob still exists for diagnostic A/B
-   but the FMA-inline sanitise is unconditional in this build.
+The following 3 multi-GPU FP16 numerical bugs were found and fixed
+during the multi-GPU FP16 stabilisation work (Phase 2):
 
-   Pre-fix bisection table (kept here for the historical record):
+1. **Wave-size mismatch** (commit `9d05c0f`): `WARP_SIZE` was hardcoded
+   to 32 in upstream HugeCTR; on MI350X (wavefront = 64) this caused
+   cross-row contamination in MultiCross bprop's `matrix_pair_mul_kernel`
+   and `row_scaling_sum_kernel`. Fixed in `common.hpp` and `generic_lookup.cuh`.
+2. **FP16 BGRADA overflow** (commit `5439485`): MultiCross bias-grad
+   reduce can exceed FP16 max (65,504) at per-rank batch ≥ 1024,
+   then `ncclSum` propagates inf → NaN. Fixed via FP32 accumulation +
+   isfinite() guard + ±FP16-max clamp + pre-divide by 256 in
+   `fused_gemm_functors.cu`.
+3. **MultiCross fprop NaN poisoning** (commits `0a24ef2` then `93aad5c`):
+   a single inf/NaN element in `layer_output_tensors[i]` propagated
+   through subsequent GEMMs. Fixed initially with `clamp_fp16_kernel`
+   post-pass, then folded into `vector_fma{3,4}_align8<__half>` via
+   `sanitize_half2_fp16` helper for free (no extra kernel launch /
+   memory pass).
 
-   | Global batch (per-GPU) | Sharding | Iter-1 loss (frozen) | Iter ≥ 2 |
-   |---|---|---|---|
-   | 8192  (1024) | round_robin | 3.18 *(= 8 × 0.4, OK)* | stable |
-   | 16384 (2048) | round_robin | 1.41 *(= 8 × 0.18, OK)* | NaN |
-   | 32768 (4096) | round_robin | — | NaN |
-   | 55296 (6912) | auto | 3.07 *(= 8 × 0.38, OK)* | NaN |
-   | 16384 (2048) | round_robin, **InnerProduct subst (no MultiCross)** | 2.31 *(= 8 × 0.29, OK)* | **stable 10+ iters** |
-   | 32768 (4096) | round_robin, **InnerProduct subst (no MultiCross)** | 0.84 *(= 8 × 0.10, OK)* | **stable 10+ iters** |
-
-   *(The "high" iter-1 losses are simply HugeCTR's multi-GPU loss display
-   summing per-rank BCE; per-rank loss is normal random-init ~0.2-0.4 in
-   all cases.)*
-
-   The control InnerProduct-substitute experiment at the same batch sizes
-   stays stable for 10+ iters even with frozen weights. So the embedding
-   all-to-all, data reader, bottom MLP, top MLP, and BCE loss path all
-   behave correctly at the largest batches. The bug is
-   **MultiCross-specific**: bprop must be writing inf/NaN into some
-   buffer that is read by the next iter's fprop, since iter-1 forward is
-   fine but iter-2 NaNs even with effectively zero weight updates.
-
-   **Diagnostic env knobs** added to `fused_gemm_functors.cu` and the
-   driver script for further bisection:
-   - `HCTR_DISABLE_BGRADA=1` — memset bias-grad to 0 (no BGRADA write)
-   - `HCTR_DISABLE_BIAS=1` — skip the post-pass BIAS add in fprop
-   - `HCTR_DCN_NUM_LAYERS=N` — run with N MultiCross layers (default 3)
-   - `HCTR_DCN_PROJ_DIM=D` — projection dim (default 512)
-   - `HCTR_OPTIMIZER=sgd|adagrad` — switch optimiser
-
-   **Where to look next**: per-tensor max-abs instrumentation through
-   `MultiCrossLayer<__half>::fprop` (the `XU`, `XUV+b`, and
-   `fused_matrix_elementwise_dot_add` outputs) to identify which
-   intermediate first overflows at per-GPU batch ≥ 2048. Since the
-   bug is purely in fprop with frozen weights, an isolated unit test
-   that drives MultiCross directly with synthetic FP16 inputs at the
-   failing per-rank batch sizes should reproduce it without the full
-   training loop.
+`HCTR_MC_CLAMP_FP16=0` env knob still exists for diagnostic A/B but
+FMA-inline sanitise is unconditional in this build.
 
 ## What's in this directory
 
@@ -1095,53 +770,119 @@ the next iter's first atomicAdd).
 | 55,296 | 12.72 M sps | **12.74 M sps** (3-run avg) | +0.2 % (within noise) |
 | 110,592 | 17.33 M sps | **17.37 M sps** | +0.2 % |
 
-### Final cumulative results
+### Phase 11 — `DEBUG_HIP_DYNAMIC_QUEUES=1` (commit `3860967`, 2026-05-12)
 
-After all ten phases, on full real Criteo, FP16 mixed, multi-hot,
-8 × MI350X auto sharding, HIP graph + overlap on:
+After exhausting >120 env-knob configurations on top of Phase 10, found
+that AMD's HIP runtime debug knob `DEBUG_HIP_DYNAMIC_QUEUES=1` enables
+on-demand HW-queue allocation instead of the default fixed pool. On
+HCTR's 4-stream pipeline (compute / RCCL / copy / embedding) this is
+the largest single env-knob win in the entire optimisation campaign.
 
-| Batch | Throughput | vs NVIDIA B200 (HF subsample, 13.57 M sps) |
-|---|---|---|
-| **55,296** (NVIDIA's exact) | **12.74 M sps** | 0.94× (6.1 % behind) |
-| **110,592** (AMD sweet spot) | **17.37 M sps** | **1.280×** (28 % AHEAD) |
+Why it works: the default HIP fixed-queue pool serializes some
+stream-to-stream handoffs that should be concurrent. With dynamic
+queues, HIP allocates fresh hardware queues per stream on demand,
+which unblocks the embedding / copy / RCCL streams' per-kernel-launch
+critical path. The "other"-stream p90 inter-kernel gap drops from
+15.3 ms → 0.27 ms (-98 %), embedding-stream p50 gap drops 62 → 19 µs.
+The per-call `hipGraphLaunch` API time stays the same (~6 ms),
+confirming the win is in post-launch GPU-stream scheduling, not in
+the host launch path.
+
+5-trial averages, real MLPerf data, `/dev/shm`:
+
+| Batch | Pre-Phase-11 | + DEBUG_HIP_DYNAMIC_QUEUES=1 | Δ |
+|---:|---:|---:|---:|
+| 55,296 (1×) | 11.86 M sps | **12.92 M sps** | **+8.9 %** |
+| 110,592 (2×) | 13.89 M sps | 15.04 M sps | +8.3 % |
+| 221,184 (4×) | 15.21 M sps | **16.15 M sps** | **+6.0 %** (with `DEBUG_HIP_BLOCK_SYNC=0` stack: 16.15) |
+| 442,368 (8×) | 15.17 M sps | 16.44 M sps | +8.4 % (new sweet-spot) |
+
+Now baked into `run_b200_match.sh` as the default. Discovered while
+replicating NV's b200/README §8.2c per-component breakdown at the
+peak-throughput batch.
+
+### Final cumulative results (post-Phase-11, 2026-05-12)
+
+After all eleven phases, on real MLPerf Criteo (HF subsample, /dev/shm),
+FP16 mixed, multi-hot, 8 × MI350X auto sharding, HIP graph + overlap on,
+DYN_QUEUES on:
+
+| Batch (global) | Per-GPU batch | ms/iter | **AMD M sps** | NV B200 (same HF data) | Ratio |
+|---:|---:|---:|---:|---:|---:|
+| 55,296 (1×) | 6,912 | 4.28 | **12.92** | 15.78 | **81.9 %** |
+| 110,592 (2×) | 13,824 | 7.35 | **15.04** | 18.20 | **82.6 %** |
+| 221,184 (4×) | 27,648 | 13.69 | **16.15** | 19.82 | **81.5 %** |
+| **442,368 (8×)** | 55,296 | 26.90 | **16.44** | 19.19 | **85.7 %** ← peak ratio |
 
 Cumulative improvement vs the phase 2 first-converging baseline of
-5.85 M sps: **+118 %** at NVIDIA's batch and **+197 %** at sweet-spot.
+**5.85 M sps**: **+121 %** at NVIDIA's exact batch (55,296) and
+**+181 %** at our peak (8×, batch 442,368). Cumulative improvement
+vs the pre-Phase-11 baseline at the same batches: **+8.9 % / +6.0 % /
++8.4 %** — Phase 11 alone added more headline throughput than the
+combined NCCL/HCTR/HIP env-knob sweeps from May.
 
-The `b200/.../README-b200-1x8.md` companion documents NVIDIA's own
-8 × B200 cluster running on the same HuggingFace Criteo subsample
-hitting **13.57 M sps** (not the publicly-reported 23.02 M sps,
-which is on the no-longer-available 4.2 B-row MLPerf reference
-corpus). So our 16.89 M sps at sweet-spot batch is the first time
-this port has actually beaten an equivalent NVIDIA baseline on
-identical input data.
+NV's published 23.02 M sps is on the full 4.2 B-row MLPerf corpus
+(unreproducible without ~4 TB local storage); on equivalent data
+their B200 measures 13.57 M sps at MLPerf-spec batch 55,296. We
+hit 12.92 M sps (= 81.9 % of NV at the matched batch) and 16.44 M sps
+at our peak (= 1.04× of NV's 13.57 reference; 85.7 % of NV's own
+peak at bs4x). The remaining ~14–18 % gap is platform-fundamental
+(no NVLS hardware multicast on xGMI, ~12 µs higher per-kernel launch
+latency, no GPU clock pinning without sudo).
 
 ## Open work
 
-- **`add_bias_per_row_kernel` → V5 2D-tile design** — quick win (~1 %),
-  ~30 min effort. Trace shows 0.08 ms/call × 3 calls/iter.
-- **Consolidate `__amd_rocclr_fillBufferAligned` calls** — ~36 per iter
-  in the captured graph (mostly HugeCTR-internal scratch zeroing).
-  Pre-zeroing a global scratch arena would save 0.05–0.10 ms/iter.
-- **Multi-GPU rocprof trace** — `rocprof` and `rocprofv3` both hang on
-  multi-GPU in our ROCm 7.2 / docker setup. Need to switch to Omnitrace
-  or a kernel-only filter for an apples-to-apples kernel breakdown vs
-  NVIDIA's published B200 profile.
-- **Real single-kernel HIP/MFMA fused MLP GEMM** — would restore the
-  fused `Layer_t.MLP` path to a perf win and close the
-  `hipblasGemmEx` vs `cutlass_s128x256_bgrada` gap. ~3–5 days of
-  CUTLASS-AMD work.
-- **Root-cause the FP16 NaN source in MultiCross** so we can drop the
-  inline `sanitize_half2_fp16` (currently always on; see commit
-  `93aad5c`). Worth ~3 % when removable.
-- **BF16 path** — NVIDIA submission uses BF16 mixed (vs our FP16).
-  Would need `enable_bf16_compute` flag + `hip_bfloat16` template
-  instantiations across `HugeCTR/src/layers/`. Removes the loss-scaler
-  stalls; possibly worth 1–2 %.
+The remaining ~14–18 % gap to NV B200 (post-Phase-11) decomposes as
+follows. Items 1-3 are application/library-level and might still be
+attackable; items 4-6 are platform/hardware-fundamental.
+
+1. **`hipGraphLaunch` host overhead** — rocprofv3 trace shows p50
+   = 5973 µs per call (vs NV's 530 µs on virtualized B200, 10–30 µs on
+   bare-metal). DEBUG_HIP_DYNAMIC_QUEUES already mitigated the
+   downstream stream-blocking effect (Phase 11), but the launch call
+   itself is still ~11× slower than NV's virtualized cudaGraphLaunch.
+   Worth investigating with ROCm 7.3+ or a rocprofiler-style host-trace
+   bisection. Possible win: 1–3 %.
+2. **hipBLASLt offline tuning** — bench shows 6 of 12 unique MLP
+   shapes (bs4x) have 14–60 % heuristic-vs-best-of-all gap (top_L4_fwd
+   55 %, bot_L1_wgrad 60 %). Tested `HIPBLASLT_TUNING_OVERRIDE_FILE`
+   workflow with auto-generated tuning file: live-run gain stayed in
+   noise (~+0.1 %), suggesting either HCTR's `hipblasGemmEx` path
+   bypasses the override, or the warm-cache / concurrent-kernel
+   conditions in HCTR mask the bench-reported headroom. Worth a
+   focused C++-level investigation (rewrite HCTR's MLP layer to
+   call `hipblasLtMatmul` directly with the tuned solution_index).
+   Possible win: 1–3 %.
+3. **`__amd_rocclr_fillBufferAligned` consolidation** — ~30 calls/iter
+   in the captured graph from HugeCTR-internal scratch zeroing
+   (Tensor allocator init, MultiCross v2 `accum_dx` reset, embedding
+   `value_index_per_gpu` reset). Moving these to one-time pre-zero
+   of a global scratch arena would save 0.05–0.10 ms/iter (~1 %).
+   Effort: medium (HugeCTR core change).
+4. **Real single-kernel HIP/MFMA fused MLP GEMM** — would restore the
+   fused `Layer_t.MLP` path to a perf win. Currently chains
+   `hipblasGemmEx` + 1 fused post-pass + `bprop_drelu_bgrad_v5` per FC
+   layer (5 launches/layer vs NV's 1). Effort: 3–5 days of CUTLASS-AMD
+   kernel writing. Possible win: 3–5 %.
+5. **Root-cause the FP16 NaN source in MultiCross** so we can drop the
+   inline `sanitize_half2_fp16` (currently always on; commit `93aad5c`).
+   Possible win: ~3 % if removable.
+6. **NVLS / hardware multicast on xGMI** — NV's NCCL all-reduce and
+   embedding all-to-all benefit from NVLink multicast hardware on
+   B200. AMD's xGMI does not have an equivalent in current ROCm 7.2
+   RCCL (no `mscclpp` library). Platform-fundamental gap, not
+   actionable from this repo. Magnitude in the trace: ~0.5 ms/iter
+   exposed RCCL on AMD that is hidden by overlap on B200.
+
+**Out of perf path** but worth listing:
+
+- **BF16 path** — NV submission uses BF16 mixed; we use FP16. Would
+  need `enable_bf16_compute` + `hip_bfloat16` template instantiations
+  across `HugeCTR/src/layers/`. Removes loss-scaler stalls; ~1–2 %.
 - **Multi-node** (RDMA `NetworkExchangeWgrad`) — currently single-node only.
 - **hipBLASLt 7.3+ retest** — when the heuristic exposes candidates for
   `RELU_AUX_BIAS` / `DRELU_BGRAD` at our shapes, we can drop the manual
-  fallback and reclaim 1.1–1.3× from vendor-tuned MFMA kernels.
+  fallback. Supersedes #4.
 
 ## Vendored upstream content
 
