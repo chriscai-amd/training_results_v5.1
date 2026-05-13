@@ -438,29 +438,148 @@ storage-induced artifact as a sharding win.
 
 #### Change 2: Data in container tmpfs (RAM), bypassing NVMe O_DIRECT
 
-HCTR's `AsyncReader` uses `O_DIRECT` reads — these bypass the Linux
-page cache entirely and go straight to the underlying storage. On
-our `/mnt/local_disk` (ext4 on NVMe), O_DIRECT reads max out at
-**12 GB/s** (measured directly with `dd ... iflag=direct`). At bs=1×
-the data demand is 25 MB / iter, easily within NVMe headroom; at
-bs=4× it climbs to ~100 MB / iter and at bs=8× to ~200 MB / iter,
-saturating the NVMe.
+**TL;DR.** HCTR opens the train file with `O_DIRECT`, which deliberately
+bypasses the kernel page cache and goes straight to the underlying
+storage. On our cluster the storage maxes out at **12 GB/s O_DIRECT** —
+exactly the GPU's compute-rate at MLPerf-spec batch — so the I/O path
+races the GPU and any queue-depth stall pushes iter time past 3 ms.
+Moving the file into a docker `--tmpfs` mount (RAM-backed) makes the
+"storage" infinitely fast, removing the race.
 
-**Fix:** copy the train + val files into a `--tmpfs` mount inside
-the docker container (RAM-backed, no O_DIRECT-vs-cache distinction
-because tmpfs is RAM). After this, the data reader serves from RAM
-at ≥ 50 GB/s and no longer rate-limits at any batch size.
+##### Why HCTR uses `O_DIRECT`
+
+```c
+// inside libhuge_ctr_shared.so AsyncDataReader (multi-hot)
+fd = open(filename, O_RDONLY | O_DIRECT);
+```
+
+`O_DIRECT` is an explicit "don't go through the page cache" — every
+read is a fresh DMA from the storage device into the AsyncReader's
+pinned host buffer, with no double-buffering. The intent is sound:
+
+- On a multi-TB Criteo corpus, you don't want every byte read to
+  pollute the page cache; the data is too big to fit and the policy
+  would just churn the cache.
+- The H2D copy stream (GPU side) can pipeline tightly with the
+  storage DMA — there's exactly one buffer, in pinned host memory,
+  written by the NVMe driver and read by the GPU's H2D engine.
+
+The downside on our cluster: **the data path is gated by the
+underlying storage's raw bandwidth**, not by RAM bandwidth.
+
+##### Measured bandwidth ceilings on this hardware
+
+```
+                                  raw bandwidth   per-iter at bs=1× (25 MB/iter)
+                                  ─────────────   ────────────────────────────────
+/home virtiofs O_DIRECT             0.58 GB/s     43 ms          ← unusable
+/mnt/local_disk ext4 NVMe O_DIRECT  12.0 GB/s     2.08 ms        ← matches GPU
+/mnt/local_disk ext4 NVMe (page-   22.2 GB/s     1.12 ms        ← unreachable
+   cached, regular read())                                       (HCTR uses O_DIRECT)
+Container --tmpfs (RAM)             ≥ 50 GB/s     < 0.5 ms       ← effectively zero
+```
+
+Measured directly with `dd ... iflag=direct bs=64M`:
+
+```
+$ dd if=/mnt/local_disk/.../train_data.bin of=/dev/null bs=64M count=200 iflag=direct
+13 GB copied, 1.11 s, 12.0 GB/s          ← O_DIRECT ceiling
+$ dd if=/mnt/local_disk/.../train_data.bin of=/dev/null bs=64M count=200
+13 GB copied, 0.60 s, 22.2 GB/s          ← page-cached ceiling
+```
+
+At bs=1× the GPU compute floor for the new `auto`-sharded config is
+~1.94 ms (the kernel-busy time in §8.2d). The NVMe O_DIRECT ceiling
+is **2.08 ms / iter — only 0.14 ms slower than the GPU**. The two are
+racing, and queue-depth jitter on the NVMe side pushes the measured
+iter to 3.50 ms with margin to spare. At bs=4× / bs=8× the storage
+demand (100 / 200 MB per iter) genuinely exceeds the NVMe ceiling.
+
+##### Why tmpfs wins (three mechanisms)
+
+**(a) `O_DIRECT` on tmpfs is a no-op.** The kernel can't DMA-to-storage
+when the file lives entirely in RAM, so the `O_DIRECT` flag is
+silently ignored and the read becomes a normal `memcpy` from the
+tmpfs's RAM pages into the AsyncReader's pinned host buffer. That's
+a RAM-to-RAM copy at memory-bandwidth (~50 GB/s effective), not a
+storage DMA at 12 GB/s.
+
+**(b) No block-layer queueing, no NVMe driver scheduling.** NVMe
+O_DIRECT reads have to go through the kernel block layer, then through
+the NVMe queue scheduler, then to the device. Each step adds latency
+and serialization. At bs=1× the AsyncReader issues `num_threads=4 ×
+num_batches_per_thread=16 = 64` in-flight prefetch ops, each ~400 KB.
+The NVMe queue has finite depth (typically 1023 entries) and each op
+has ~10-30 μs of submission+completion latency — so 64 ops × ~20 μs =
+~1.3 ms of latency we can't hide behind GPU compute. tmpfs has none
+of this — reads are just memcpys with a few-hundred-nanosecond syscall
+overhead.
+
+**(c) No tail latency / no contention.** NVMe bursts run faster than
+their sustained ceiling (cache hits in the NVMe controller, queue
+re-ordering), but they also have tail-latency events: garbage
+collection, controller saturation, multi-thread queue conflicts when
+4 reader threads issue concurrently. We measured these as the slow
+half of the bimodal iter-time distribution on `/mnt/local_disk` at
+bs≥2× (mean 16.5 ms, best 11.6 ms at bs=4×). tmpfs is deterministic
+RAM access — no garbage collection, no queue saturation, no tail.
+
+##### Direct trace evidence
+
+§8.2d's side-by-side trace shows what removing the I/O race does:
+
+| Trace metric (bs=1×) | NVMe O_DIRECT | tmpfs | Reason |
+| -------------------- | ------------: | ----: | ------ |
+| GPU busy fraction (avg 8 GPUs) | 84.0 % | **93.0 %** | reader returns instantly → next iter's H2D queues sooner → GPU has more queued work to overlap |
+| GPU idle per iter | 0.65 ms | **0.16 ms** | (above × iter time) — the same 555 μs cudaGraphLaunch now hides behind GPU work |
+| inter-kernel p99 — copy stream | 3.3 ms | **1.6 ms** | tmpfs reads can't stall (no NVMe queue) |
+| inter-kernel p99 — NCCL stream | 1.9 ms | **0.8 ms** | NCCL doesn't wait for stalled copy ops as often |
+| **`cudaGraphLaunch` p50** | **530 μs** | **555 μs** | **unchanged** — this is the host-side virtualization tax, NOT the data path. Tmpfs doesn't help here, but the rest of the iter shrank enough that the same host overhead now hides. |
+
+The first four rows are direct consequences of removing the I/O race.
+The last row confirms `cudaGraphLaunch` (§8.2a) is genuinely a
+separate, batch- and storage-independent virtualization overhead.
+
+##### Storage scaling across all our batch sizes
 
 | Storage | bs=1× iter (rr) | bs=1× iter (auto) | bs=4× iter (auto) |
-| ------- | -----: | -----: | -----: |
-| `/home` virtiofs O_DIRECT (0.58 GB/s) | 4.21 ms | (slower) | OOM-like |
-| `/mnt/local_disk` ext4 NVMe O_DIRECT (12 GB/s) | 3.50 ms | ~2.5 ms | 11.16 ms |
-| **Container `--tmpfs` (RAM, ≥ 50 GB/s effective)** | **3.38 ms** | **2.10 ms** | **7.00 ms** |
+| ------- | --------------: | ----------------: | ----------------: |
+| `/home` virtiofs O_DIRECT (0.58 GB/s) | 4.21 ms | (slower) | hangs |
+| `/mnt/local_disk` ext4 NVMe O_DIRECT (12 GB/s) | 3.50 ms | ~2.50 ms | 11.16 ms |
+| **Container `--tmpfs` (RAM)** | **3.38 ms** | **2.10 ms** | **7.00 ms** |
 
-The Slurm `/dev/shm` is per-job namespaced (cleaned between `srun`
-steps), but a docker-internal `--tmpfs /ramdata:size=250g` mount
-plus a bind-mount of `/mnt/local_disk` (read-only persistent source)
-lets us copy → train in the same step:
+The win is **largest at bs=1× with auto** (2.50 → 2.10 ms = −16 %)
+and at **bs=4×** (11.16 → 7.00 ms = −37 %) — exactly where the GPU
+was previously bottlenecking on NVMe bandwidth. With `round_robin` at
+bs=1× the bottleneck was NCCL, not I/O, so tmpfs only buys a small
+3.50 → 3.38 ms = −3 % (NVMe wasn't yet saturated).
+
+##### When tmpfs is a no-op
+
+For completeness: tmpfs is only a win when storage is genuinely
+bottlenecking. On a setup where the GPU compute time per iter is
+**much larger** than the storage time per iter, the AsyncReader's
+prefetch hides the I/O entirely and tmpfs has nothing to fix.
+Examples:
+
+- Smaller GPUs (e.g., A100) — the GPU is slow enough that NVMe at
+  12 GB/s is comfortably faster than compute.
+- Smaller batch sizes than bs=1× / 55 296 — proportionally less
+  data per iter.
+- Storage faster than 12 GB/s — e.g., a Gen5 NVMe RAID-0 array can
+  reach 40+ GB/s O_DIRECT, comparable to RAM.
+
+On B200 at bs ≥ 1× with a single ~12 GB/s NVMe and HCTR's O_DIRECT
+reader, **the storage is genuinely the bottleneck**, and moving
+to tmpfs collapses it.
+
+##### Reproduction recipe
+
+Slurm's per-job `/dev/shm` namespace doesn't help — a docker
+`-v /dev/shm:/data:ro` bind-mount gets the host's view (without the
+file we just copied). Use a docker-internal `--tmpfs /ramdata` plus a
+bind-mount of `/mnt/local_disk` (or any persistent NVMe location) as
+the source, and copy → train in the same docker invocation:
 
 ```bash
 docker run --rm \
@@ -468,14 +587,17 @@ docker run --rm \
     -v /mnt/local_disk/home/chcai/criteo_full:/persist:ro \
     ... mlperf-nvidia:recommendation-hugectr \
     bash -c "
-        cp /persist/train_data.bin /ramdata/train_data.bin
+        cp /persist/train_data.bin /ramdata/train_data.bin  # ~30 s one-time
         cp /persist/val_data.bin   /ramdata/val_data.bin
-        # then run mpirun ... train.py --train-data /ramdata/train_data.bin ...
+        mpirun -n 1 --allow-run-as-root bash run_and_time.sh \
+               --train-data /ramdata/train_data.bin \
+               --val-data /ramdata/val_data.bin
     "
 ```
 
 (See `criteo_synth/results/bs4x_shm_inline2.sh` for the full wrapper.
-The 200 GB copy takes ~30 s on first init; one-time cost.)
+RAM cost: 218 GB (200 train + 18 val). Available on hosts with
+≥ 256 GB free; falls back to `/mnt/local_disk` otherwise.)
 
 #### Combined effect
 
