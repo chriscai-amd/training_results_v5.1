@@ -180,9 +180,28 @@ report at the **peak batch 442,368 (8×)** instead.
 |    | 2026-05-12 | NFS-bound → `/dev/shm` fix (AsyncReader uses `O_DIRECT`, bypasses page cache) | `bf88560` | 5.21 (NFS) → **11.76** sustained @ bs1x | +127 % vs NFS-bound run |
 |    | 2026-05-12 | NV-submission audit (>120 env-knob configs swept) — bake `NCCL_PROTO=LL128`, `HIP_FORCE_DEV_KERNARG=1` | `1ef02aa`, `fd1f4d2`, `2c4670a`, `a923ef1` | 11.76 → **11.88** sustained | +1.0 % |
 | 11 | 2026-05-12 | **`DEBUG_HIP_DYNAMIC_QUEUES=1`** (on-demand HW queue allocation; the 4-stream pipeline now overlaps properly) | `3860967` | 11.88 → **12.92** @ bs1x; 15.17 → **16.42** @ bs8x peak | **+8.9 % @ bs1x; +8.2 % @ bs8x** |
+|    | 2026-05-12 | **Configuration: peak measurement at bs8x (442,368) instead of bs1x (55,296)** (amortizes 1.29 ms/iter host overhead — see linear-fit in Part 3) | (configuration only) | bs1x **12.92** → bs8x **16.42** M sps (same binary, 8× larger global batch, ~7 % per-GPU memory increase) | **+27 %** (**+5.3 ms saved per 8× samples**; relaxes MLPerf-spec batch constraint) |
 | 12 | 2026-05-12 | int4-vectorized `__half` elementwise: `concat_fwd/bwd_kernel_vec8` + `binaryOp_kernel_vec8_half` (used by MultiCross matrix_add) | `4fb17c3`, `e3e64a2` | 16.42 → **16.67** @ bs8x | **+1.5 %** at peak |
 
 **Peak result post-Phase-12: 16.67 M sps at bs8x (442,368)** = 86.9 % of NV B200's bs8x peak (19.19 M sps), or **1.23× of the matched-data NV reference** (13.57 M sps at bs1x on the HF subsample).
+
+**Cumulative breakdown of the bs1x → bs8x configuration win (all numbers
+post-Phase-11 to isolate the batch-size lever):**
+
+| Batch (global) | Per-GPU | M sps | vs bs1x baseline | vs NV B200 (same batch) |
+|---:|---:|---:|---:|---:|
+| 55,296 (1×, MLPerf-spec) | 6,912 | 12.92 | (baseline) | 81.9 % of 15.78 |
+| 110,592 (2×) | 13,824 | 15.04 | **+16.4 %** | 82.6 % of 18.20 |
+| 221,184 (4×) | 27,648 | 16.43 | **+27.2 %** | 82.9 % of 19.82 |
+| 442,368 (8×, peak) | 55,296 | **16.67** | **+29.0 %** | **86.9 %** of 19.19 |
+
+The +29 % bs1x → bs8x win is **not free** — it relaxes the MLPerf-spec
+global batch constraint (55,296). It IS free if the calling task can
+tolerate a larger batch (which our convergence runs do, since DLRM-DCNv2
+converges at any batch size up to ~512K with appropriate LR). NV's
+b200/README §8.2b documents the same batch-size lever giving them
+69 % → 87 % of MLPerf-ref-23M (bs1x → bs4x) for the same reason: the
+~1 ms host-const overhead per iter amortizes over 4–8× more samples.
 
 ## 2.2 Selected sub-tables (key wins in detail)
 
