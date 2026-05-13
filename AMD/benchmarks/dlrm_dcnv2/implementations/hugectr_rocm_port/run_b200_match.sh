@@ -32,6 +32,31 @@ export NCCL_ALGO=${NCCL_ALGO:-Ring}
 # (~+0.1 % across 3 trials), but it has no downside so we bake it in.
 export HIP_FORCE_DEV_KERNARG=${HIP_FORCE_DEV_KERNARG:-1}
 
+# ROCm port (May 2026): DEBUG_HIP_DYNAMIC_QUEUES=1 enables AMD CDNA3
+# dynamic-queue allocation, which lets HIP grab additional hardware queues
+# on demand instead of pinning everything to a fixed pool. On HCTR's
+# 4-stream pipeline (compute / RCCL / copy / embedding) this gives
+# significantly better stream concurrency: per the rocprofv3 trace, the
+# union-of-busy-streams per iter drops from 12.10 ms -> 10.64 ms (-12 %),
+# the per-iter wall drops from 13.36 ms -> 12.03 ms (-10 %), and the
+# "other" stream's p90 inter-kernel gap drops from 15.3 ms -> 0.27 ms
+# (-98 %). End-to-end: +6.0 % at bs4x (15.21 -> 16.12 M sps) and +8.9 %
+# at bs1x (11.86 -> 12.92 M sps). Largest single-knob win we found in
+# the entire env-var optimisation campaign. Loss is consistent across
+# all 5 trials per config (0.288764 -> 0.288771-829, within FP16
+# noise from kernel-order changes).
+export DEBUG_HIP_DYNAMIC_QUEUES=${DEBUG_HIP_DYNAMIC_QUEUES:-1}
+
+# ROCm port: DEBUG_HIP_BLOCK_SYNC=0 disables host-blocking on stream
+# sync (default in newer ROCm is 1 = block on event waits). With
+# DYN_QUEUES on, BLOCK_SYNC=0 stacks for an additional small win
+# (16.12 -> 16.15 M sps at bs4x, +0.2 %).
+export DEBUG_HIP_BLOCK_SYNC=${DEBUG_HIP_BLOCK_SYNC:-0}
+
+# ROCm port: NCCL_BUFFSIZE=8388608 (8 MiB) reduced steady ms/iter by
+# ~0.7 % at bs4x in our sweep -- baked in.
+export NCCL_BUFFSIZE=${NCCL_BUFFSIZE:-8388608}
+
 # Match B200 reference dataset shape (table sizes). Three multi-hot tiers,
 # from highest fidelity to lowest:
 #   HCTR_USE_MLPERF_CRITEO=1     -> real MLPerf-published Criteo from R2

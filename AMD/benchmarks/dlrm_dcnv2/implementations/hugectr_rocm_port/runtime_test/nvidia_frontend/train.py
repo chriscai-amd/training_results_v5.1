@@ -414,7 +414,11 @@ model.add(ebc_config)
 # stream split for diagnostic A/B testing (default ON, matching NVIDIA).
 compute_config = hugectr.DenseLayerComputeConfig(
     async_wgrad=os.environ.get("HCTR_ASYNC_WGRAD", "1") == "1",
-    fuse_wb=False,
+    # ROCm port: HCTR_FUSE_WB knob lets us A/B test weight+bias-grad fusion.
+    # NV's submission uses fuse_wb=False; on AMD where each kernel-launch
+    # has ~5 us host overhead and we have ~177 kernels per iter at bs1x,
+    # collapsing one extra kernel per MLP layer (8 MLP layers) saves ~40 us.
+    fuse_wb=os.environ.get("HCTR_FUSE_WB", "0") == "1",
 )
 
 # HugeCTR ROCm port: HCTR_USE_FUSED_MLP=1 enables the fused Layer_t.MLP

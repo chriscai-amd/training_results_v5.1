@@ -224,6 +224,57 @@ so future work can skip these):**
 | `MEM_COMM_BW_RATIO`/`WORK_RATIO` ratio ∈ {1.1, 1.8, 2.25, 4.5} | flat (3-trial avg 11.69 – 11.79 M sps) |
 | `HCTR_MAX_ITER` ∈ {500, 1000, 3000, 5000, 10000} (long-run sweep, fixed DISPLAY=200) | flat (per-200-iter wall 0.95 – 0.99 s; steady 11.27 – 11.52 M sps; mild ~2 % degradation at 10K+ iters) |
 
+### `DEBUG_HIP_DYNAMIC_QUEUES=1` -- the +6-9 % AMD-only breakthrough (2026-05-12)
+
+While replicating NV's b200/README §8.2c per-component breakdown at
+peak-throughput batch (bs4x = 221,184), found that AMD-specific HIP
+runtime knob `DEBUG_HIP_DYNAMIC_QUEUES=1` enables on-demand HW-queue
+allocation instead of the default fixed pool. On HCTR's 4-stream
+pipeline (compute / RCCL / copy / embedding) this gives substantial
+stream-concurrency gains:
+
+5-trial averages, real MLPerf data, /dev/shm RAM disk, MLPerf-spec
+HCTR config (`auto` sharding, fp16 mixed, scaler 16348):
+
+| Batch | Baseline | + DYN_QUEUES=1 | Δ | + DYN_QUEUES + BLOCK_SYNC=0 |
+|---|---:|---:|---:|---:|
+| **bs1x** (55,296)  | 11.86 M sps | **12.92 M sps** | **+8.9 %** | (not tested) |
+| **bs4x** (221,184) | 15.21 M sps | **16.12 M sps** | **+6.0 %** | **16.15 M sps (+6.2 %)** |
+
+Per-iter side-by-side from rocprofv3 trace at bs4x (80 iters, agent 0):
+
+| Metric | bs4x BASELINE | bs4x DYN_QUEUES=1 | Δ |
+|---|---:|---:|---:|
+| iter cycle mean | 13.36 ms | **12.03 ms** | **-10 %** |
+| GPU busy / iter (union of streams) | 12.10 ms | **10.64 ms** | -12 % |
+| GPU idle / iter | 1.26 ms | 1.39 ms | +0.13 ms |
+| `hipGraphLaunch` p50 | 5.97 ms | 6.01 ms | flat (this is the per-call API duration; the launch is async, so does not block iter wall) |
+| `hipStreamSynchronize` p99 | 1.36 ms | 1.82 ms | +0.46 ms |
+| Compute stream p50 inter-kernel gap | 7.1 µs | 11.3 µs | +4 µs |
+| **"other" stream p90 inter-kernel gap** | **15.3 ms** | **0.27 ms** | **-98 %** ← biggest single-stream change |
+| Embedding stream p50 inter-kernel gap | 62.1 µs | 19.4 µs | -69 % |
+
+Numerical correctness preserved -- final loss 0.288764 → 0.288771-829
+(within FP16 noise from kernel-order changes), trend consistent across
+5 trials per config.
+
+**Why this works**: the default HIP fixed-queue pool serializes some
+stream-to-stream handoffs that should be concurrent. `DYN_QUEUES=1`
+lets HIP allocate fresh hardware queues per stream on demand, which
+unblocks the embedding / copy / RCCL streams' per-kernel-launch
+critical path. The per-call `hipGraphLaunch` API time stays the same
+(~6 ms), confirming the win is in the post-launch GPU stream
+scheduling, not in the host launch path.
+
+**vs NV B200 after this fix:**
+
+| Batch | NV B200 | AMD | AMD/NV |
+|---|---:|---:|---:|
+| bs1x (55,296)  | 15.78 M sps | **12.92** | **81.9 %** (was 73.3 %) |
+| bs4x (221,184) | 19.82 M sps | **16.15** | **81.5 %** (was 76.9 %) |
+
+Baked into `run_b200_match.sh` as default for all subsequent runs.
+
 ### Batch-size scaling + linear-fit (2026-05-12, post-rocprofv3)
 
 NV's `b200/README` §8.2b uses a `t_iter = c + α · batch` falsification
