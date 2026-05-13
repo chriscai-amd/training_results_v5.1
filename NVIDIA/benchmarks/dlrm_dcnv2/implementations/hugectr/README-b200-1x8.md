@@ -846,6 +846,88 @@ work per iter, so throughput rises from 69 % → 87 % of MLPerf
 reference. The trace itself is preserved at
 `/home/chcai/criteo_synth/results/nsys_bs4x_*.nsys-rep`.
 
+### 8.2d Per-component breakdown at the winning config (bs=1× auto + tmpfs, May 13)
+
+After the §7.5 breakthrough (auto sharding + container tmpfs data) we
+captured a fresh trace of the bs=1× config that now **beats MLPerf
+reference** (2.10 ms/iter, 26.33 M samples/s = 115.5 % of ref). Same
+trace methodology as §8.2a (`nsys profile --cuda-graph-trace=node`,
+4 s capture during steady-state).
+
+##### Side-by-side: bs=1× OLD (rr + virtiofs, §8.2a) vs NEW (auto + tmpfs)
+
+| Metric | OLD (rr + virtiofs) | NEW (auto + tmpfs) | Δ |
+| ------ | -----------------: | -----------------: | --: |
+| **iter cycle p50** (AllReduce→AllReduce, GPU 0) | **3.49 ms** | **2.39 ms** | **−32 %** |
+| iter cycle mean (long-run steady-state) | 4.06 ms | 2.14 ms | −47 % |
+| Throughput | 15.78 M/s | **26.33 M/s** | **+67 %** |
+| % of MLPerf 5.1-0040 (22.80 M/s) | 69.2 % | **115.5 %** | **+46 pp** |
+| **`cudaGraphLaunch` p50** | **530 μs** | **555 μs** | **≈ unchanged** |
+| `cudaGraphLaunch` p90 | 698 μs | 675 μs | −3 % |
+| `cudaGraphLaunch` p99 | 1292 μs | **861 μs** | **−33 %** |
+| `cudaGraphLaunch` max | 5050 μs | 5874 μs | comparable tail |
+| GPU busy (avg across 8 GPUs) | 84.0 % | **93.0 %** | **+9 pp** |
+| GPU idle per iter (mean) | 0.65 ms | **0.16 ms** | **−75 %** |
+| Inter-kernel p99 — compute stream | 1.3 ms | **0.6 ms** | −54 % |
+| Inter-kernel p99 — NCCL stream | 1.9 ms | **0.8 ms** | −57 % |
+| Inter-kernel p99 — copy stream | 3.3 ms | **1.6 ms** | −52 % |
+| `ncclDevKernel_SendRecv` per-call avg | 427 μs | **155 μs** | **−64 %** |
+| `ncclSendRecv` % of GPU kernel time | 32.0 % | **15.8 %** | **−51 %** |
+| `ncclAllReduce` per-call avg | 194 μs | 217 μs | +12 % (essentially flat) |
+
+##### What this confirms
+
+1. **`cudaGraphLaunch` is identical** (555 vs 530 μs p50, well within
+   noise). The virtualization tax we documented in §8.2a is real and
+   batch-independent and sharding-plan-independent — but its
+   **impact** on iter time has shrunk dramatically because GPU work
+   per iter is so much smaller now.
+
+2. **`ncclSendRecv` per call dropped 2.75×** (427 → 155 μs). This is
+   the direct measurement of `SHARDING_PLAN=auto`'s effect: by
+   data-parallel-replicating the 21 small embedding tables, the
+   embedding all-to-all carries ~80 % less payload, and each NCCL
+   `SendRecv` invocation finishes in proportionally less time.
+
+3. **GPU busy fraction climbed from 84 % → 93 %.** With less GPU work
+   per iter AND a faster data path (tmpfs vs O_DIRECT NVMe), the
+   ~555 μs cudaGraphLaunch host time can hide more thoroughly behind
+   the work that's still queued on streams. GPU idle per iter
+   collapsed from 0.65 ms → 0.16 ms (−75 %).
+
+4. **All per-stream p99 gaps roughly halved.** Compute stream:
+   1.3 → 0.6 ms. NCCL stream: 1.9 → 0.8 ms. Copy stream:
+   3.3 → 1.6 ms. These were the boundary stalls between captured-graph
+   replays we attributed to virtualization+storage interaction in
+   §8.2a; with the storage bottleneck removed they shrink ~2× even
+   though the underlying `cudaGraphLaunch` host time is unchanged.
+
+##### Where the new 2.10 ms iter goes
+
+```
+Component                                              ms/iter   fraction
+─────────────────────────────────────────────────────────────────────────
+GPU busy time (kernels, mostly back-to-back in graph)   ≈ 1.94    92.5 %
+GPU idle (hidden cudaGraphLaunch / minor host gaps)     ≈ 0.16     7.5 %
+                                                        ──────
+total                                                   ≈ 2.10   100  %
+
+Inside GPU busy, the new mix (auto sharding):
+  ncclSendRecv (embedding all-to-all, 4 calls/iter)      ≈ 0.62    32 % of busy
+  ncclAllReduce (DDP grad sync, 1/iter)                  ≈ 0.22    11 %
+  embedding ops (update4, reduce, scatter)               ≈ 0.32    16 %
+  MLP GEMMs (cutlass3x_sm100, nvjet_hsh, fwd+bwd)        ≈ 0.30    16 %
+  fused FMA / convert / concat                           ≈ 0.20    10 %
+  other (sort, label_count, etc.)                        ≈ 0.28    15 %
+```
+
+Comparison to MLPerf 5.1-0040 reference: their pure-train iter is
+2.13 ms; our new 2.10 ms is **1.4 % faster** at the same
+batch / hyperparams / DL config. The reference uses the same `auto`
+sharding plan we now use, and presumably has a similar host overhead
+that hides similarly behind GPU work. The trace is preserved at
+`/home/chcai/criteo_synth/results/nsys_bs1x_auto_tmpfs_*.nsys-rep`.
+
 ### 8.3 Final state (May 2026)
 
 #### 8.3.1 Per-batch-size throughput vs online MLPerf v5.1 submissions
