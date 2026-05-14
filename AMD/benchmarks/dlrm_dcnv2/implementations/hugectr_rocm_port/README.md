@@ -282,6 +282,80 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14p.2 — CK-Tile MLP backward dgrad: numerically correct, perf-neutral at bs=1×, regression at bs=8× (2026-05-14)
+
+Implemented Phase 14n.9 Item #1 partial path: replace hipBLASLt's MLP backward
+*dgrad* with CK-Tile. Math worked out cleanly with no extra transpose:
+
+  bottom_bprop[m, n_in] = sum_{n_out} grad_top[m, n_out] * kernel[n_in, n_out]
+
+maps to the existing `(A=Row, B=Col, C=Row)` config by viewing HCTR's
+`in_size × out_size` row-major kernel as `out_size × in_size` col-major
+(same memory). Caller passes `M=batch, N_dgrad=in_size, K_dgrad=out_size`.
+
+#### Implementation details
+
+- New entry point `hctr_cktile_gemm_dgrad_fp16(grad_top, kernel, bottom_bprop, M, N_dgrad, K_dgrad, stream)`
+- Reuses `KernelBias` (the AddOnly variant) with a pre-allocated zero-bias
+  buffer — upstream CK-Tile's `Ds tuple size > 0` static_assert prevents a
+  truly bias-less GEMM, so `bias = 0` is the workaround. Numerically
+  identical to plain GEMM (verified bit-exact on 32,768 elements at
+  `M=6912, in=512, out=256` vs CPU reference and `hipblasGemmEx`).
+- New init API `hctr_cktile_init_dgrad_zero_bias(max_n)` called from
+  `MLPLayer::initialize()` BEFORE graph capture starts (fixed an early
+  `hipMalloc inside graph capture` runtime crash). Per-device buffer.
+- `mlp_layer.cu::bprop()` gates on `HCTR_USE_CK_TILE_MLP=1 +
+  HCTR_USE_CK_TILE_DGRAD=1`. When predicate matches:
+  1. Calls `layer_functors_.bprop(..., skip_dgrad=true)` for wgrad+dRELU
+  2. Runs CK-Tile dgrad on the same stream
+  3. On any CK-Tile error, falls back to inline `hipblasGemmEx` dgrad
+- Shape predicate (`M>=64, N_dgrad>=64, K_dgrad>=32`) matches 6 of 8 MLP
+  layers at our bs=1× config; bot[0] (in=13) and top[4] (out=1) skip and
+  remain on hipBLASLt.
+
+#### Results
+
+| Batch | Config | Throughput | Loss | Δ vs baseline |
+|---|---|---:|---:|---:|
+| bs=1× | baseline (CK-Tile OFF) | 12.66 M sps | 0.291052 | — |
+| bs=1× | + CK-Tile dgrad | **12.69 M sps** | 0.291049 | **+0.3 % (noise)** |
+| bs=8× | baseline (CK-Tile OFF) | 17.93 M sps | 0.292 ✓ | — |
+| bs=8× | + CK-Tile dgrad | **13.47 M sps** | 0.292357 | **-24.9 % REGRESSION** |
+
+Numerical correctness is perfect — loss matches baseline to 4 decimal
+places at both batches. **No throughput improvement**, and a substantial
+regression at bs=8×.
+
+#### Why no win — and why the code stays gated-off but kept
+
+CK-Tile uses a single fixed tile config (128×128×32 with 2×2×1 warps,
+32×32×16 MFMA — the Phase 14i.2 sweet spot for fprop at bs=8×). For
+**dgrad** the operand shapes are quite different from fprop:
+
+- bs=1× dgrad: `M=864, K=256-1024, N=128-1024` (small per-GPU batch, hipBLASLt's algorithm search picks tiny tiles per shape; CK-Tile's 128-tile is comparable)
+- bs=8× dgrad: `M=55,296, K=256-1024, N=128-1024` (large M; hipBLASLt picks much larger M-tiles, e.g. `MT256x128x64` from the kernel-trace — CK-Tile's fixed `128×128` is severely under-tiled along M, ~2× more grid blocks than ideal, plus no persistent / split-K tuning)
+
+The Phase 14n.9 ranking explicitly noted that the hipBLASLt "18-tile
+config explosion" is the *kernel-count* problem, not a *kernel-time*
+problem on the critical path. Replacing dgrad alone with CK-Tile reduced
+kernel count (4 layers × 1 kernel each instead of N) but each CK-Tile
+launch is at least as long as the corresponding hipBLASLt suite, and at
+bs=8× considerably longer.
+
+Code is **gated default-OFF behind `HCTR_USE_CK_TILE_DGRAD=1`** so the
+baseline is unchanged. Kept in tree because:
+
+1. The math + layout interpretation work and are unit-tested (see
+   `/home/chcai/cktile_dgrad_test.cpp` standalone validator).
+2. Future work — multi-tile-config CK-Tile dispatch, OR pairing with
+   CK-Tile *wgrad* + *bgrad* + *dRELU* fusion into a single megakernel
+   — could net positive. The current entry-point + integration is the
+   reusable scaffold.
+3. The findings update Phase 14n.9 ranking: dgrad-alone is no longer
+   listed as a likely win for bs=1× (kept as 0% expected contribution).
+
+---
+
 ### Phase 14p.1 — CK-Tile fwd path RESTORED against new CShuffleEpilogueProblem API (2026-05-14)
 
 The Phase 14n.8 CK-Tile fused-fwd implementation broke when upstream CK-Tile
