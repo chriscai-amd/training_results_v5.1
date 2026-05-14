@@ -263,26 +263,6 @@ Per-stream effect at bs4x rocprofv3 trace (with vs without DYN_QUEUES):
 | 221,184 (4×) | 15.21 M sps | 16.15 M sps | +6.0 % |
 | 442,368 (8×) | 15.17 M sps | 16.42 M sps | +8.2 % |
 
----
-
-#### Consolidation note (2026-05-14)
-
-§2.2 used to detail every Phase from 12 through 14p.2 (28 entries). Per
-the bs=1× MLPerf-spec focus, only the two entries above (Phase 6 and
-Phase 11) cleared the **>5 % bs=1× throughput gain** bar — every other
-Phase contributed either a smaller bs=1× delta (Phase 12 / 14a / 13 :
-+1–2 % bs=1×), a non-bs=1× win (Phase 14b/c FUSE_TOP/FUSE_WB engaged
-only at bs ≥ 4×; Phase 14n.8 CK-Tile fwd at bs=8×), or was an
-investigation / scaffold / negative-result phase (Phase 14e–14n.x
-RCCL audit + CK-Tile POC chain + stream-parallelism analysis;
-Phase 14p / 14p.1 / 14p.2 NV-port fidelity audit + CK-Tile dgrad
-implementation + ROCm 7.2 hipEventWaitExternal regression discovery).
-
-The full per-phase log (all 28 removed entries with their commit hashes
-and per-batch deltas) is preserved in the **§2.1 Master timeline table**
-above — every commit hash there links straight to the GitHub diff so
-the historical record is still 1-click-auditable.
-
 ## 2.3 Negative results (notable knobs that did NOT help)
 
 These were measured but didn't survive a controlled re-test, so they're
@@ -308,13 +288,6 @@ work from re-testing.
 | Top-MLP fused (`HCTR_FUSE_TOP_MLP=1`) | NV uses fused MLP path | -6 % on AMD (loss correct but fused path's `hipblasGemmEx` chain is slower than InnerProduct's MFMA) |
 
 ## Part 3 — Per-component analysis vs NV B200 (bs=1×)
-
-Trace-driven kernel-time decomposition at the **MLPerf-spec batch
-(bs=1×, 55 296)**. Earlier prior-peak (bs=4×) and current-peak (bs=8×)
-breakdowns have been removed for focus — they're trivially recoverable
-by re-running `scripts/analyze_per_component.py` against the
-`rocprof_bs4x_*/` and `rocprof_bs8x_phase13/` trace dirs that remain
-in-tree.
 
 ### 3.1 Latest status — bs=1× throughput gap vs NV B200
 
