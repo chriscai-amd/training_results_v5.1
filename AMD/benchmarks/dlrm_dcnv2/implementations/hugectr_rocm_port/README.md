@@ -282,6 +282,70 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.9 — bs=1× kernel-by-kernel diff vs B200 + actionable plan (2026-05-14)
+
+User asked to focus on closing bs=1× gap and matching B200 stream parallelism.
+Captured fresh AMD bs=1× trace post Phase 14n.8 + ran direct kernel-category
+diff against the B200 reference trace at iter 15-17:
+
+| Category | AMD kerns | AMD time | NV kerns | NV time | Gap |
+|---|---:|---:|---:|---:|---:|
+| **rccl** (a2a + allreduce) | 15 | **10,228 µs** | 18 | 1,411 µs | **+8,817 µs** |
+| **embedding** | 78 | 3,199 µs | 29 | 1,311 µs | **+1,888 µs** |
+| **mlp_bwd_dgrad** | 89 | 1,960 µs | 15 | 508 µs | **+1,452 µs** (74 more) |
+| mlp_fwd | 35 | 2,611 µs | 75 | 1,066 µs | +1,545 µs |
+| hctr_other (incl ReLU) | 43 | 1,430 µs | 0 | 0 µs | +1,430 µs |
+| mlp_bwd_wgrad | 40 | 1,066 µs | 66 | 2,394 µs | -1,328 µs (we win) |
+| mlp_bgrada (AMD-only) | 12 | 450 µs | 0 | 0 µs | +450 µs |
+| memset | 69 | 287 µs | 0 | 0 µs | +287 µs |
+| relu_standalone (AMD-only) | 41 | 259 µs | 0 | 0 µs | +259 µs |
+| sparse_prep | 78 | 907 µs | 129 | 1,671 µs | -764 µs (we win) |
+| **TOTAL aggregate** | **190 kerns/iter** | **7,736 µs/iter** | **141 kerns/iter** | **3,873 µs/iter** | +3,863 µs (2× more) |
+
+#### Top actionable bs=1× items by aggregate time
+
+1. **RCCL +8,817 µs** — vendor-level (no AMD lever; NV uses NVLS hardware multicast). All RCCL knobs/CU-mask/MSCCLPP/2.28 attempts have been flat (Phase 14a-h). Wait for AMD MI400 NVLS-equivalent.
+
+2. **Embedding +1,888 µs (+49 kerns)** — AMD embedding kernels are slower per-call. Would need rewrite of `embedding::ragged_static_embedding_*` kernels with int4-vectorized loads (Open Item #6 in Part 4).
+
+3. **MLP backward +1,452 µs (+74 kerns)** — hipBLASLt's algorithm search picks **18 different tile configs** for what should be 4 layers × dgrad. NV's CUTLASS3 fuses dgrad+bgradA+drelu+wgrad into 1 kernel/layer (5 total). **CK-Tile MLP backward (deferred) would close this** — fwd path already done (Phase 14n.8 +19% at bs=8×).
+
+4. **HCTR/ReLU other +1,430 µs (43 kerns)** — at bs=1× we use InnerProduct path (no fused ReLU). FUSE_TOP_MLP=1 alone reduces these but is -5% perf overall. CK-Tile fwd at bs=1× is -8%. Both lose because per-call overhead > savings at small per-GPU batch.
+
+5. **memset +287 µs (+69 kerns)** — `__amd_rocclr_fillBufferAligned` from wgrad scratch zeroing. ~30 µs wall (parallelized). Tractable in 1-2 days via scratch buffer pooling.
+
+#### Stream parallelism: 4 active streams (AMD) vs 10 (NV)
+
+AMD's critical stream 4335 carries 315 of 570 kerns (55%). NV's main stream
+carries 45 of 127 (35%) — **NV spreads work across 10 streams**, AMD
+serializes onto 4 (= 4 hardware queues).
+
+Why AMD stays at 4: HIP graph capture flattens multi-stream dispatch (Phase
+14n.dbg discovery). cublas_handle_wgrad_'s stream binding is ignored under
+graph capture. **Phase 14n.5 pipeline-level split scaffold is in but
+gated** behind `HCTR_SPLIT_NETWORK_GRAPH=1` — the GraphScheduleable cross-graph
+sync API is reusable for future structural fixes.
+
+#### Realistic bs=1× path forward (estimated effort + impact)
+
+| # | Item | Effort | bs=1× delta | Confidence |
+|---:|---|---|---:|---|
+| 1 | **CK-Tile MLP backward** (replace hipBLASLt dgrad/wgrad with controllable-stream kernels, eliminate 18-tile-config explosion) | 3-5 days | +5-8% | HIGH (matches what NV does with CUTLASS3) |
+| 2 | **Memset consolidation** (scratch buffer pool) | 1-2 days | +0.5-1% | MED (small wall time impact) |
+| 3 | **Pipeline-level fwd/bwd split via CK-Tile** (Item D + CK-Tile bypass of hipblas pinning — combo with CK-Tile bwd from #1) | +2 days on top of #1 | +3-5% (stream parallelism) | MEDIUM |
+| 4 | int4-vectorized embedding kernels | 3-5 days | +5-10% | HIGH but parallel work |
+| 5 | RCCL reduction (vendor) | unknown | +20-30% | LOW (vendor blocker) |
+
+**Conservative cumulative target (items 1-4 in 1-2 weeks)**: +13-24% at bs=1×, taking us from 13.0 → 15.0+ M sps and matching/beating NV B200 reference at bs=1× on the same MD5-verified MLPerf data.
+
+#### Production state preserved
+
+- Baseline (default OFF): **13.027 M sps, loss 0.2917** ✓
+- All experimental code gated behind explicit env vars (default OFF)
+- Phase 14n.4/5 split-network code path lost during disk-quota incident; gated, low impact (was already disabled by hard-coded `false` flag)
+
+---
+
 ### Phase 14n.8 — Item A1 FULLY WORKING: CK-Tile MLP integrated end-to-end, +19% at bs=8× (2026-05-14)
 
 **🎉 BREAKTHROUGH** — Item A1 (CK-Tile fused MLP) now **fully working with correct
