@@ -282,6 +282,81 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.3 — Item A1 weight pre-transpose: plumbing complete, convergence pending (2026-05-13, very late)
+
+**Major plumbing landed**, but CK-Tile output still numerically wrong.
+
+#### What landed
+
+1. **Custom transpose kernel** in `cktile_mlp_kernel.cu`:
+   ```cpp
+   __global__ void cktile_transpose_weight_kernel(
+       const __half* d_W, __half* d_WT, int K, int N) {
+       int k = blockIdx.x * blockDim.x + threadIdx.x;
+       int n = blockIdx.y * blockDim.y + threadIdx.y;
+       if (k < K && n < N) {
+           d_WT[n * K + k] = d_W[k * N + n];  // K×N row-major → K×N col-major
+       }
+   }
+   ```
+
+2. **Public API**: `hctr_cktile_transpose_weight_fp16(d_W, d_WT, K, N, stream)`
+   exported via `cktile_mlp_kernel.hpp`.
+
+3. **Per-layer scratch buffers** in `MLPLayer<__half>`:
+   - Added `cktile_kernel_T_buffers_` and `cktile_kernel_T_allocated_` vectors
+   - Allocated in `initialize()` (BEFORE graph capture starts; required because
+     `hipMalloc` throws "operation not permitted when stream is capturing"
+     during graph capture)
+   - Freed in destructor
+
+4. **CK-Tile fwd routing in `mlp_layer.cu::fprop()`**:
+   - When `HCTR_USE_CK_TILE_MLP=1 + HCTR_CK_TILE_FORCE=1`:
+     - Call `hctr_cktile_transpose_weight_fp16(kernel, kernel_T, K, N, stream)` (transpose)
+     - Call CK-Tile fused GEMM with `kernel_T` as col-major B
+   - Falls back to legacy `layer_functors_.fprop()` if buffer not allocated
+
+#### Test result @ bs=1× with `HCTR_FUSE_TOP_MLP=1 + HCTR_USE_CK_TILE_MLP=1 + HCTR_CK_TILE_FORCE=1`
+
+```
+Throughput:   11.897 M sps (-8.6% vs baseline 13.021)
+Loss:         0.5937 (vs baseline 0.2917) ← STILL DIVERGED
+Per-iter:     4.65 ms
+```
+
+**Progress vs prior attempts**:
+- Original col-major B (no transpose): loss 0.6055
+- Row-major B (V1 pipeline): loss 1.386 = log(2), all zero
+- **NEW: pre-transpose + col-major B: loss 0.5937** — slightly closer, but still wrong
+
+#### Remaining numerical issue (~half day debug)
+
+The transpose kernel is logically correct (verified by inspection). CK-Tile
+with `BLayout=ColumnMajor + stride_B=K` should now compute Y = X @ W
+correctly given the pre-transposed buffer. Yet output is wrong.
+
+Possible causes (to investigate next):
+1. Bias broadcast direction wrong with col-major C (CK-Tile's
+   CShuffleEpilogue MultiD might broadcast across N or M depending on
+   layout — needs verification against POC v8)
+2. `stride_Ds = {0}` may not give the broadcast we want for col-major C
+3. Transpose kernel may execute AFTER the GEMM under graph capture race
+4. CK-Tile's `MakeKernelArgs` may interpret `stride_B = K` differently when
+   layout is ColumnMajor (vs RowMajor where stride is the row pitch)
+
+#### Production safety preserved
+
+- Baseline (CK-Tile OFF): **13.021 M sps, loss 0.2917 ✓**
+- All CK-Tile code gated behind `HCTR_USE_CK_TILE_MLP=1 + HCTR_CK_TILE_FORCE=1`
+  (both default OFF), no production impact.
+
+#### Memory cost
+
+When CK-Tile enabled: 4 layers × ~K×N halves of scratch ≈ 4-8 MB total per GPU
+(insignificant vs the ~80 GB of HBM available).
+
+---
+
 ### Phase 14n.2 — Stream-parallelism deeper validation + Item A1/D path forward (2026-05-13, late)
 
 Two more tests further validated the bs=1× path forward.
