@@ -282,6 +282,77 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.dbg — Item B routing verification + CUDA-graph stream-flatten finding (2026-05-13)
+
+**KEY NEGATIVE FINDING — saves time on similar future attempts.**
+
+Force-enabled async wgrad in `FullyConnectedLayer<__half>::bprop` (no env
+gate) and verified via debug printf that:
+
+```
+[DBG-bprop] dev=0 use_async_wgrad=1 cublas_handle_=0x3c05820 cublas_handle_wgrad_=0x3c5fd30
+                                    ↑ different addresses
+```
+
+`cublas_handle_wgrad_` IS a separate handle (bound to `computation_stream_2_`
+via `gpu_resource.cpp:68`). My `bprop` IS dispatching the wgrad GEMMs through
+this distinct handle.
+
+**However, the rocprofv3 trace shows wgrad GEMMs (`Cijk_Alik_Bljk` pattern)
+are STILL all on stream 4323 — the same default stream as the forward GEMMs**:
+
+```
+Window iter 15-17 (force-on, with CUDA graphs):
+  stream 4323: 337 kerns — fwd GEMMs + wgrad GEMMs + dgrad + ReLU + ...
+  stream 5311: 124 kerns — sparse_prep
+  stream 5317:  96 kerns — sparse_prep + memset
+  stream 5302:  33 kerns — RCCL + embedding
+  Active streams: 4 (UNCHANGED from baseline)
+```
+
+**Hypothesis**: HCTR uses `HCTR_USE_CUDA_GRAPH=1` which captures the bprop
+into a HIP graph. The graph capture appears to **flatten the multi-stream
+dispatch back onto a single stream** (the one the captured launch is replayed
+on). Cross-stream events recorded inside `bprop` get captured as graph edges
+but don't actually split the work onto distinct streams at replay time.
+
+This means **Item B alone cannot achieve stream split** — even with both
+`HCTR_INNERPRODUCT_ASYNC_WGRAD=1` AND `GPU_MAX_HW_QUEUES=16`, the trace
+shows identical 4-stream / 4-queue layout as baseline.
+
+**Impact on plan**:
+
+The Phase 14m prerequisite chain remains valid in principle, but the
+mechanism for splitting work across streams must be at a HIGHER level than
+per-bprop-call event sync. Options:
+
+1. **Disable HIP graph capture for the network bprop subgraph** — would
+   restore stream parallelism but lose the launch-overhead amortization
+   that graph capture provides (likely net negative at bs=1×).
+2. **Split network bprop across multiple Pipeline / GraphScheduleable
+   instances** with `set_stream("stream_X")` per layer. This is a
+   pipeline-level change in `model_pipeline.cpp` (~2 days work).
+3. **Use HIP graph stream-creation API** (`hipGraphAddMemsetNode` with
+   `dependencies`) to explicitly model concurrent streams within a single
+   graph. Untested on AMD ROCm; may not match NV's behavior.
+
+For now, **Item B reverted to env-gated default OFF** (no production impact).
+Code path remains for future use once mechanism #2 or #3 lands.
+
+#### Test results @ bs=1× (all measurements):
+
+| Config | Throughput | vs baseline |
+|---|---:|---:|
+| Baseline (Item B OFF) | **13.048 M sps** | — |
+| Item B ON (env=1) | 12.580 M sps | -3.6% |
+| Item B FORCE-ON (no env) | 12.580 M sps | -3.6% |
+| Item B + GPU_MAX_HW_QUEUES=16 | 12.5–12.7 M sps | -3% |
+| Item B + no CUDA graphs | 12.696 M sps | -2.7% |
+
+All converge to loss 0.2917 ✓.
+
+---
+
 ### Phase 14n — Item B (async wgrad) DONE + Item A1 (CK-Tile layout) progress (2026-05-13, late night)
 
 #### Item B: async wgrad in InnerProduct path — DONE (gated env)
