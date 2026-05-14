@@ -282,7 +282,33 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
-### Phase 14p — NV-port fidelity audit + ROCm 7.2 hipEventWaitExternal regression (2026-05-14)
+### Phase 14p.1 — CK-Tile fwd path RESTORED against new CShuffleEpilogueProblem API (2026-05-14)
+
+The Phase 14n.8 CK-Tile fused-fwd implementation broke when upstream CK-Tile
+(in `/opt/rocm/include/ck_tile`) added `MemoryOperation` as required template
+parameter #17 of `CShuffleEpilogueProblem` (between `isCTransposed` and the
+old `kNumWaveGroups`). Restored by passing `memory_operation_enum::set` —
+matches hipBLASLt's RELU_AUX_BIAS epilogue store semantics.
+
+Plain (no-bias) CK-Tile entry point left as `hipErrorInvalidValue` stub:
+upstream `GemmKernelMultiD` static_asserts `Ds tuple size > 0`, so an
+empty-Ds template instantiation no longer compiles. The plain path is
+unused on the bs=1×/bs=8× MLP fprop critical path (every layer has bias),
+so callers fall through to hipblasGemmEx — no behaviour change.
+
+Verified by re-running the exact Phase 14n.8 bs=8× config:
+
+| Config | Phase 14n.8 (working) | Phase 14p.1 (restored) | Delta |
+|---|---:|---:|---:|
+| bs=8×, FUSE_TOP_MLP=1 + CK-Tile | 17.721 M sps | **17.708 M sps** | -0.07 % (noise) |
+
+Loss converges identically (0.292 ± FP16 noise). CK-Tile fused-fwd path
+back online — required prerequisite for the Phase 14n.9 Item #1 (CK-Tile
+MLP backward) work.
+
+---
+
+### Phase 14p — NV-port fidelity audit + ROCm 7.2 hipEventWaitExternal regression (2026-05-14) — [`b72c612`](https://github.com/chriscai-amd/training_results_v5.1/commit/b72c612)
 
 User asked for explicit verification that the AMD port faithfully follows
 NVIDIA's original HugeCTR implementation, with focus on the multi-stream
