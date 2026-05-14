@@ -282,6 +282,39 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.6 — hipblasSetStream-per-call workaround attempt (2026-05-14)
+
+Tested whether explicitly calling `hipblasSetStream(wgrad_handle, wgrad_stream)`
+right before each `hipblasGemmEx` (in addition to the per-handle binding done
+once at `gpu_resource` init) would force HIP graph capture to track the stream
+switch.
+
+**Result**: NO change. wgrad GEMMs still land on stream 4323 (default).
+
+This **confirms the hipblas/HIP graph-capture stream pinning issue is deeper
+than per-call stream binding**. Possible deeper causes:
+1. hipblas internally re-binds to a captured-graph-context stream during
+   capture, ignoring user `hipblasSetStream`
+2. The CUPTI-style trace (rocprofv3) reports the WRONG stream after graph
+   capture/replay (could be the case — needs vendor follow-up)
+3. AMD ROCm graph capture has different semantics than CUDA for cublas/hipblas
+
+#### Realistic remaining path (deferred to dedicated session)
+
+| Item | Estimated effort | Confidence | Approach |
+|---|---|---|---|
+| **Item A1 numerical debug** | 0.5 day | HIGH | Compare CK-Tile call against POC v8 with byte-exact reproduction; likely a single bias-stride or layout config issue |
+| **Bypass hipblas entirely** with CK-Tile fused MLP (no hipblas) | 1-2 days | MEDIUM | Use CK-Tile-only path for fwd + bwd MLP, sidestep the hipblas stream pinning issue |
+| **Vendor escalation**: file ROCm/hipblas issue about stream pinning under graph capture | unknown | LOW | Report to AMD with reproducer; wait for ROCm 7.3+ |
+
+#### Production safety preserved
+
+- Baseline: 12.79 M sps, loss 0.2917 ✓
+- All experimental code gated behind explicit env vars (default OFF)
+- Source remains compilable, scaffolds in place for next focused effort
+
+---
+
 ### Phase 14n.5 — Item D split now CONVERGES + extended GraphScheduleable API (2026-05-14)
 
 **Major plumbing landed for cross-graph synchronization**, Item D pipeline split
