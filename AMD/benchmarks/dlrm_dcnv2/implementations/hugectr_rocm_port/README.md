@@ -282,6 +282,88 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.2 — Stream-parallelism deeper validation + Item A1/D path forward (2026-05-13, late)
+
+Two more tests further validated the bs=1× path forward.
+
+#### Test 1: trace WITHOUT CUDA graphs + force async wgrad
+
+Setting `HCTR_USE_CUDA_GRAPH=0 + HCTR_INNERPRODUCT_ASYNC_WGRAD=1` (no graph
+capture, async wgrad ON):
+
+```
+GPU 0 active streams (>=10 kerns): 9 (vs 4 with graphs)
+  Stream 4327: 1831 kerns  ← still main compute
+  Stream 38:   1459 kerns  ← copyBuffer
+  Stream 5315:  840 kerns  ← sparse_prep + memset
+  Stream 5321:  608 kerns  ← sparse_prep
+  Stream 40:    569 kerns  ← copyBuffer
+  Stream 4347:  320 kerns  ← NEW! has dgrad(160) + fwd(160)
+  Stream 5283:  240 kerns  ← NEW! has fwd(120) + ...
+  Stream 0:     257 kerns  ← null stream
+  Stream 5303:  240 kerns  ← embedding RCCL
+
+  Of MLP GEMMs:
+    fwd:    {'4347': 160, '5283': 120}    ← split across 2 streams ✓
+    dgrad:  {'4327': 440, '4347': 160}    ← split across 2 streams ✓
+    wgrad:  {'4327': 280}                 ← STILL on default stream ✗
+    rccl:   {'4327': 32, '5303': 40, '5321': 38}
+```
+
+**Findings**:
+1. **Without graph capture, MLP fwd + dgrad DO split across multiple streams** (9 active vs 4 with graphs).
+2. **wgrad still pinned to default stream even WITHOUT graph capture** — confirms `cublas_handle_wgrad_` stream binding has an issue under hipblas (likely a hipblas-internal stream override; the handle has stream 2 bound, but kernels go to default).
+3. **Perf without graphs: 27.46 ms/iter (2.0 M sps)** — 6× slower than with graphs. Graph launch latency amortization is critical at bs=1×.
+
+#### Test 2: explored multi-pipeline split for Item D
+
+Looked at `model_pipeline.cpp:282-284`:
+
+```cpp
+auto network_graph = std::make_shared<GraphScheduleable>(
+    network_init, bottom_network_fprop, top_network_fprop, init_wgrad, cal_loss,
+    top_network_bprop, bottom_network_bprop);
+```
+
+The ENTIRE network compute (fwd + bwd) is wrapped in ONE `GraphScheduleable`,
+so all kernels capture into one HIP graph and replay on one stream. To split:
+
+1. Decompose into `network_fprop_graph` + `network_bprop_graph` separate sub-graphs
+2. Each sub-graph captures its own HIP graph (sub-graphs are NOT flattened by parent)
+3. Assign bprop sub-graph to `computation_stream_2_` via `set_stream`
+4. Add proper event sync between fprop and bprop (and from bprop to exchange_wgrad)
+
+**Effort estimate revised**: 3-5 days (more than initial 2-day estimate; needs careful event sync to preserve correctness across CUDA graph subgraphs).
+
+#### Test 3: CK-Tile pipeline V2/V3/V4/V5/V6 audit
+
+Each later pipeline version has a different `operator()` signature (V2 takes
+4 args, V1 takes 6). Switching is NOT drop-in; each requires its own kernel
+wrapper. Estimated 0.5-1 day per pipeline to test row-major B support.
+
+#### Item A1 next step (refined): Weight pre-transpose
+
+Cleanest path that doesn't depend on CK-Tile pipeline plumbing:
+
+1. Allocate `kernel_T_` tensor in `FullyConnectedLayer<__half>` (size N×K col-major view, same elements transposed)
+2. Add a custom transpose kernel that runs at start of each iter (or after each opt step): `kernel_T[n, k] = kernel[k, n]`
+3. CK-Tile reads `kernel_T_` with `BLayout=ColumnMajor + stride_B=K` (the v6 POC config that gave 280 TFLOP/s)
+4. Cost: ~10us per transpose × 4 layers = 40 us/iter overhead vs ~1 ms/iter saved on GEMMs
+5. Effort: 1 day
+
+#### Honest path-forward sequencing
+
+| # | Item | Effort | Confidence | bs=1× delta |
+|---:|---|---|---|---:|
+| 1 | **Item A1 weight pre-transpose + CK-Tile engagement** (independent of all stream issues) | 1 day | HIGH (POC validated 280 TFLOP/s) | +5-10% |
+| 2 | Pipeline-level network_graph split (Item D, requires care) | 3-5 days | MEDIUM | +3-8% (stream parallelism finally exposed) |
+| 3 | wgrad stream pinning fix (debug why hipblas doesn't honor cublas_handle_wgrad_'s stream) | 1-2 days | LOW (deep hipblas issue) | enabler for #2 |
+| 4 | Combine 1+2+3 + enable existing GPU_MAX_HW_QUEUES=16 | 1 day | HIGH given prereqs | finalize at +10-15% |
+
+**Realistic combined target: +15-20% from 13.0 → 15.0+ M sps, putting us at PARITY or slightly AHEAD of NV B200 reference at bs=1×.**
+
+---
+
 ### Phase 14n.dbg — Item B routing verification + CUDA-graph stream-flatten finding (2026-05-13)
 
 **KEY NEGATIVE FINDING — saves time on similar future attempts.**
