@@ -210,7 +210,7 @@ b200/README §8.2b documents the same batch-size lever giving them
 
 ## 2.2 Selected sub-tables (key wins in detail)
 
-### Phase 6 — V5 2D-tile bgrad/bgrada kernels (+96 %, single biggest win)
+### Phase 6 — V5 2D-tile bgrad/bgrada kernels (+96 %, single biggest win) — [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a)
 
 `rocprof --stats` showed `reduce_sum_columns_kernel` (V1 BGRADA post-pass)
 was **49 %** of all GPU time on a single-GPU run (~289 ms / 590 ms). V1
@@ -236,7 +236,7 @@ the V5 kernels were in the binary but the routing code wasn't, so V5
 was never running. Verified post-fix by adding a one-shot
 `[HCTR-V5] ... path=V5` diag print on the first BGRADA call.
 
-### Phase 11 — `DEBUG_HIP_DYNAMIC_QUEUES=1` (+6-9 % across all batches)
+### Phase 11 — `DEBUG_HIP_DYNAMIC_QUEUES=1` (+6-9 % across all batches) — [`3860967`](https://github.com/chriscai-amd/training_results_v5.1/commit/3860967)
 
 After exhausting >120 env-knob configurations, found that AMD's HIP
 runtime debug knob enables on-demand HW-queue allocation instead of the
@@ -263,7 +263,7 @@ Per-stream effect at bs4x rocprofv3 trace (with vs without DYN_QUEUES):
 | 221,184 (4×) | 15.21 M sps | 16.15 M sps | +6.0 % |
 | 442,368 (8×) | 15.17 M sps | 16.42 M sps | +8.2 % |
 
-### Phase 12 — int4-vectorized `__half` elementwise kernels (+1.5 % at bs8x)
+### Phase 12 — int4-vectorized `__half` elementwise kernels (+1.5 % at bs8x) — [`d0f5c54`](https://github.com/chriscai-amd/training_results_v5.1/commit/d0f5c54)
 
 After capturing fresh rocprofv3 trace at the new bs8x peak, identified
 three `__half` element-wise kernels using sub-optimal HBM utilization
@@ -282,7 +282,7 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
-### Phase 14n.9 — bs=1× kernel-by-kernel diff vs B200 + actionable plan (2026-05-14)
+### Phase 14n.9 — bs=1× kernel-by-kernel diff vs B200 + actionable plan (2026-05-14) — [`be8aa01`](https://github.com/chriscai-amd/training_results_v5.1/commit/be8aa01)
 
 User asked to focus on closing bs=1× gap and matching B200 stream parallelism.
 Captured fresh AMD bs=1× trace post Phase 14n.8 + ran direct kernel-category
@@ -346,7 +346,7 @@ sync API is reusable for future structural fixes.
 
 ---
 
-### Phase 14n.8 — Item A1 FULLY WORKING: CK-Tile MLP integrated end-to-end, +19% at bs=8× (2026-05-14)
+### Phase 14n.8 — Item A1 FULLY WORKING: CK-Tile MLP integrated end-to-end, +19% at bs=8× (2026-05-14) — [`6977091`](https://github.com/chriscai-amd/training_results_v5.1/commit/6977091)
 
 **🎉 BREAKTHROUGH** — Item A1 (CK-Tile fused MLP) now **fully working with correct
 convergence** and showing **+19% throughput at bs=8×**.
@@ -430,7 +430,7 @@ suboptimal tile for small batch). Bs=1× gap closing needs different approach:
 
 ---
 
-### Phase 14n.7 — Item A1 ROOT CAUSE FOUND (bit-packed mask), helper kernel landed (2026-05-14)
+### Phase 14n.7 — Item A1 ROOT CAUSE FOUND (bit-packed mask), helper kernel landed (2026-05-14) — [`d5b7afc`](https://github.com/chriscai-amd/training_results_v5.1/commit/d5b7afc)
 
 **Major debugging breakthrough — found WHY CK-Tile loss diverges in HCTR.**
 
@@ -531,7 +531,7 @@ GraphScheduleable changes that conflicted).
 
 ---
 
-### Phase 14n.6 — hipblasSetStream-per-call workaround attempt (2026-05-14)
+### Phase 14n.6 — hipblasSetStream-per-call workaround attempt (2026-05-14) — [`4412e1d`](https://github.com/chriscai-amd/training_results_v5.1/commit/4412e1d)
 
 Tested whether explicitly calling `hipblasSetStream(wgrad_handle, wgrad_stream)`
 right before each `hipblasGemmEx` (in addition to the per-handle binding done
@@ -564,7 +564,7 @@ than per-call stream binding**. Possible deeper causes:
 
 ---
 
-### Phase 14n.5 — Item D split now CONVERGES + extended GraphScheduleable API (2026-05-14)
+### Phase 14n.5 — Item D split now CONVERGES + extended GraphScheduleable API (2026-05-14) — [`2d97743`](https://github.com/chriscai-amd/training_results_v5.1/commit/2d97743)
 
 **Major plumbing landed for cross-graph synchronization**, Item D pipeline split
 now converges correctly under graph capture.
@@ -637,7 +637,7 @@ or hipgraph fix at a lower level).
 
 ---
 
-### Phase 14n.4 — Item D pipeline split scaffold + GraphScheduleable stream-routing analysis (2026-05-14)
+### Phase 14n.4 — Item D pipeline split scaffold + GraphScheduleable stream-routing analysis (2026-05-14) — [`94ba448`](https://github.com/chriscai-amd/training_results_v5.1/commit/94ba448)
 
 #### Item D approach studied + scaffold landed (gated OFF)
 
@@ -706,7 +706,7 @@ in source for the future structural fix.
 
 ---
 
-### Phase 14n.3 — Item A1 weight pre-transpose: plumbing complete, convergence pending (2026-05-13, very late)
+### Phase 14n.3 — Item A1 weight pre-transpose: plumbing complete, convergence pending (2026-05-13, very late) — [`cde68cd`](https://github.com/chriscai-amd/training_results_v5.1/commit/cde68cd)
 
 **Major plumbing landed**, but CK-Tile output still numerically wrong.
 
@@ -781,7 +781,7 @@ When CK-Tile enabled: 4 layers × ~K×N halves of scratch ≈ 4-8 MB total per G
 
 ---
 
-### Phase 14n.2 — Stream-parallelism deeper validation + Item A1/D path forward (2026-05-13, late)
+### Phase 14n.2 — Stream-parallelism deeper validation + Item A1/D path forward (2026-05-13, late) — [`9d4df2f`](https://github.com/chriscai-amd/training_results_v5.1/commit/9d4df2f)
 
 Two more tests further validated the bs=1× path forward.
 
@@ -863,7 +863,7 @@ Cleanest path that doesn't depend on CK-Tile pipeline plumbing:
 
 ---
 
-### Phase 14n.dbg — Item B routing verification + CUDA-graph stream-flatten finding (2026-05-13)
+### Phase 14n.dbg — Item B routing verification + CUDA-graph stream-flatten finding (2026-05-13) — [`9d9f801`](https://github.com/chriscai-amd/training_results_v5.1/commit/9d9f801)
 
 **KEY NEGATIVE FINDING — saves time on similar future attempts.**
 
@@ -934,7 +934,7 @@ All converge to loss 0.2917 ✓.
 
 ---
 
-### Phase 14n — Item B (async wgrad) DONE + Item A1 (CK-Tile layout) progress (2026-05-13, late night)
+### Phase 14n — Item B (async wgrad) DONE + Item A1 (CK-Tile layout) progress (2026-05-13, late night) — [`56cee55`](https://github.com/chriscai-amd/training_results_v5.1/commit/56cee55)
 
 #### Item B: async wgrad in InnerProduct path — DONE (gated env)
 
@@ -1001,7 +1001,7 @@ will be tested once A1 lands.
 
 ---
 
-### Phase 14m — Stream-parallelism gap quantified + prerequisite chain validated (2026-05-13, late night)
+### Phase 14m — Stream-parallelism gap quantified + prerequisite chain validated (2026-05-13, late night) — [`ed3c7ae`](https://github.com/chriscai-amd/training_results_v5.1/commit/ed3c7ae)
 
 Validated the Phase 14l hypothesis ("items 1+2 are prerequisites for stream/queue parallelism")
 with three measurements:
@@ -1101,7 +1101,7 @@ AND stream rewiring) to even take effect.
 
 ---
 
-### Phase 14l — Side-by-side trace deep-dive vs B200 + refreshed bs=1× plan (2026-05-13, late night)
+### Phase 14l — Side-by-side trace deep-dive vs B200 + refreshed bs=1× plan (2026-05-13, late night) — [`440e9de`](https://github.com/chriscai-amd/training_results_v5.1/commit/440e9de)
 
 Used the new `rocprofv3_to_perfetto_annotated.py` converter (Phase 14k) on
 the apple-to-apple bs=1× capture, then diffed kernel-by-kernel and
@@ -1173,7 +1173,7 @@ all flat experiments (per Phase 14a/g/i sweeps).
 
 ---
 
-### Phase 14k — Apple-to-apple data + ROCm trace tooling (2026-05-13, late night)
+### Phase 14k — Apple-to-apple data + ROCm trace tooling (2026-05-13, late night) — [`e9f3e9e`](https://github.com/chriscai-amd/training_results_v5.1/commit/e9f3e9e)
 
 Two deliverables that close the "is this really apples-to-apples?" loop:
 
@@ -1259,7 +1259,7 @@ only, not SendRecv).
 
 ---
 
-### Phase 14j — Latest dual-batch perf measurement (2026-05-13, late night)
+### Phase 14j — Latest dual-batch perf measurement (2026-05-13, late night) — [`aecd2d8`](https://github.com/chriscai-amd/training_results_v5.1/commit/aecd2d8)
 
 Final clean perf measurement of current best HCTR build (with CK-Tile bridge
 compiled in but routing OFF by default), all 5-knob production config:
@@ -1285,7 +1285,7 @@ Key takeaways:
 
 ---
 
-### Phase 14i.5b — HCTR INTEGRATION RUNS END-TO-END (2026-05-13, late night)
+### Phase 14i.5b — HCTR INTEGRATION RUNS END-TO-END (2026-05-13, late night) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 **MAJOR PROGRESS**: separate-compilation bridge **WORKS**, CK-Tile kernel **engages
 on every iter**, HCTR baseline **preserved**.
@@ -1363,7 +1363,7 @@ bottleneck, not GEMM (Phase 14d trace analysis).
 
 ---
 
-### Phase 14i.5 — HCTR integration scaffold (2026-05-13, evening)
+### Phase 14i.5 — HCTR integration scaffold (2026-05-13, evening) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 Built the integration plumbing for routing HCTR's `MLPLayer::fprop` through
 the CK-Tile fused kernel when `HCTR_USE_CK_TILE_MLP=1`:
@@ -1452,7 +1452,7 @@ working bs=1× perf measurement:
 ✅ **HCTR build env extended** to support CK-Tile (cmake + extracted headers)
 ⏸️ **Remaining**: 1-day separate-compilation bridge + 1-day perf validation
 
-### Phase 14i.4 — CK-Tile backward GEMMs (2026-05-13)
+### Phase 14i.4 — CK-Tile backward GEMMs (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 Phase 4: validated CK-Tile works for **backward GEMMs** (dgrad + wgrad)
 on all major shapes. For an FC layer with weight W (K×N) and input I (M×K):
@@ -1487,7 +1487,7 @@ fallback).
 Source: `/home/chcai/cktile_mlp_v9.cpp`. Status: Phase 4 DONE (basic
 backward; wgrad tile-config tuning is a follow-up).
 
-### Phase 14i.3 — CK-Tile fused GEMM + bias + ReLU epilogue (2026-05-13)
+### Phase 14i.3 — CK-Tile fused GEMM + bias + ReLU epilogue (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After Phase 14i.2 unlocked multi-shape, attacked Phase 3 (epilogue
 fusion). Wrote a custom `AddRelu` `CDElementwise` functor that combines
@@ -1532,7 +1532,7 @@ unfused chain (`hipblasGemmEx` + `add_bias_per_row_v5_kernel` +
 
 Source: `/home/chcai/cktile_mlp_v8.cpp`. Status: Phase 3 DONE.
 
-### Phase 14i.2 — CK-Tile multi-shape parameterization (2026-05-13)
+### Phase 14i.2 — CK-Tile multi-shape parameterization (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 Phase 2 work: parameterized the CK-Tile GEMM template so we can sweep
 `M_Tile, N_Tile, K_Tile, M_Warp, N_Warp, K_Warp` per MLP shape and pick
@@ -1564,7 +1564,7 @@ correctness validation (Phase 6) before claiming end-to-end perf gain.
 
 Source: `/home/chcai/cktile_mlp_v7.cpp`. Status: Phase 2 DONE.
 
-### Phase 14i.1 — CK-Tile GEMM kernel BREAKTHROUGH (2026-05-13, evening)
+### Phase 14i.1 — CK-Tile GEMM kernel BREAKTHROUGH (2026-05-13, evening) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After Phase 14i identified the API mismatch between the example invokers
 and `/opt/rocm/include/ck_tile`, the user pointed out: **"did we build
@@ -1637,7 +1637,7 @@ Once bias+ReLU+dReLU is fused into a single epilogue:
 This is now the **HIGHEST-VIABLE next step** for closing the bs=1× gap
 (higher than RCCL rebuild paths which were tested negative).
 
-### Phase 14i — CK-Tile fused MLP POC attempt (2026-05-13)
+### Phase 14i — CK-Tile fused MLP POC attempt (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After Phase 14h's negative RCCL findings, attempted CK-Tile fused MLP
 prototype as the only remaining lever for the bs=1× MLP GEMM gap (23 %
@@ -1725,7 +1725,7 @@ POC source files preserved at:
 - `/home/chcai/cktile_minimal.cpp` (passing, just headers)
 - `/home/chcai/cktile_gemm_v4.cpp` (failing, 17-arg CShuffleEpilogue)
 
-### Phase 14h — RCCL custom rebuilds: MSCCLPP + 2.28.3 (2026-05-13)
+### Phase 14h — RCCL custom rebuilds: MSCCLPP + 2.28.3 (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After Phase 14g found CU-masking flat, we built TWO custom RCCL libraries
 on reserved nodes and tested both at bs=1× via `LD_LIBRARY_PATH` override:
@@ -1791,7 +1791,7 @@ The path to break through requires HARDWARE-LEVEL features:
 3. **CK-Tile fused MLP** — addresses GEMM gap (23 % of bs=1×) but not the
    dominant RCCL gap (22 %); 5-10 day effort, deferred to future session
 
-### Phase 14g — `hipExtStreamCreateWithCUMask` for RCCL streams (Technique A, 2026-05-13)
+### Phase 14g — `hipExtStreamCreateWithCUMask` for RCCL streams (Technique A, 2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After the trace breakdown showed RCCL kernels saturate all 304 CUs and
 block concurrent compute, we implemented **CU masking on RCCL streams**
@@ -1835,7 +1835,7 @@ SMs has nothing to do with kernel duration.
 with bandwidth-saturating-from-fewer-CUs (e.g., MSCCLPP-enabled) can
 re-test without code changes.
 
-### Phase 14f — Online RCCL knob audit + new RCCL knobs found (2026-05-13)
+### Phase 14f — Online RCCL knob audit + new RCCL knobs found (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After Phase 14e showed swapping API to `ncclAllToAll/v` is flat, we
 audited NEW RCCL knobs by reading the `librccl.so` binary symbols and
@@ -1919,7 +1919,7 @@ layer:
    AllReduce 170 → 340 GB/s on single OAM. Untested for our HCTR
    workload.
 
-### Phase 14e — `ncclAllToAll`/`ncclAllToAllv` API audit at bs1× (2026-05-13)
+### Phase 14e — `ncclAllToAll`/`ncclAllToAllv` API audit at bs1× (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After the bs1× knob saturation finding (§14c) showed the residual gap is
 exposed RCCL (0.94 ms/iter, 90 % of total RCCL), we audited whether
@@ -1956,7 +1956,7 @@ doesn't reduce chunk count.
 permanent finding in §4.A: this lever is not actionable from
 application code on AMD/RCCL 2.21.
 
-### Phase 14 — Batch-size-aware MLP fusion + bs1× knob saturation (2026-05-13)
+### Phase 14 — Batch-size-aware MLP fusion + bs1× knob saturation (2026-05-13) — [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)
 
 After Phase 13 the bs8× peak landed at 16.98 M sps and bs1× at
 12.92 M sps. NV's b200/README §8.2d showed their bs1× post-May-13
