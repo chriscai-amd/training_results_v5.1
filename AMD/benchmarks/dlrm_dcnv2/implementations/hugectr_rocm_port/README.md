@@ -307,25 +307,16 @@ work from re-testing.
 | `HCTR_FUSE_WB=True` (NV uses `False`) | HCTR `DenseLayerComputeConfig` | flat at bs1x; -0.3 % at bs4x |
 | Top-MLP fused (`HCTR_FUSE_TOP_MLP=1`) | NV uses fused MLP path | -6 % on AMD (loss correct but fused path's `hipblasGemmEx` chain is slower than InnerProduct's MFMA) |
 
-## Part 3 — Per-component analysis vs NV B200
+## Part 3 — Per-component analysis vs NV B200 (bs=1×)
 
-### 3.1 Iter-level metrics (bs4x, 2026-05-12)
+Trace-driven kernel-time decomposition at the **MLPerf-spec batch
+(bs=1×, 55 296)**. Earlier prior-peak (bs=4×) and current-peak (bs=8×)
+breakdowns have been removed for focus — they're trivially recoverable
+by re-running `scripts/analyze_per_component.py` against the
+`rocprof_bs4x_*/` and `rocprof_bs8x_phase13/` trace dirs that remain
+in-tree.
 
-Direct comparison via `rocprofv3 --hip-trace --kernel-trace` at the
-prior peak config (bs4x, 80 iters, agent 0; 55-iter steady window).
-Source: `scripts/analyze_per_component.py`.
-
-| Metric | AMD MI350X | NV B200 (b200/README §7.4a) | Notes |
-|---|---:|---:|---|
-| Per-iter wall (under profile overhead) | 4.61 ms | 4.08 ms | NV is +13 % faster |
-| GPU busy (any kernel, merged streams) | 3.18 ms (69 %) | 3.19 ms (78 %) | similar absolute |
-| Implied host gap | 1.43 ms (31 %) | 0.89 ms (22 %) | AMD has +0.54 ms host overhead |
-| RCCL on-GPU time | 1.58 ms (34 %) | 1.51 ms (37 %) | similar |
-| **RCCL exposed (compute idle)** at bs1x | **1.58 ms (100 % of RCCL!)** | **1.06 ms (70 %)** | AMD: 0 % hidden; NV: 30 % hidden via NVLS |
-| RCCL hidden in compute at bs8x (post-DYN_QUEUES) | **3.12 ms (80 % of RCCL!)** | n/a | DYN_QUEUES + larger batch made the AMD gap close |
-| `hipGraphLaunch` p50 | 5.97 ms | 0.53 ms (virtualized) / 0.01-0.03 ms (bare-metal) | AMD 11× slower than NV-virtualized, ~300× slower than NV bare-metal |
-
-### 3.2 Kernel-category breakdown @ MLPerf-spec batch (bs=1×, 55 296)
+### 3.1 Kernel-category breakdown @ MLPerf-spec batch (bs=1×, 55 296)
 
 This is the **direct apples-to-apples** comparison vs NV's b200/README
 §8.2d bs=1× decomposition (no extrapolation needed). Captured fresh
@@ -371,10 +362,12 @@ Top absolute kernel-time deltas (AMD minus NV, real-time estimates):
 (Iter-gap sum is +2.19 ms; categories overlap because of stream
 concurrency.)
 
-→ **At bs=1× the dominant gap is RCCL, not GEMMs** — the opposite
-of bs=8× where GEMMs dominate (see §3.3 below). This is exactly NV's
-own §8.2d signature: at small batch RCCL latency dominates total
-iter time; at large batch GPU compute amortizes.
+→ **At bs=1× the dominant gap is RCCL, not GEMMs** — the opposite of
+the bs=8× regime where GEMMs dominate (the unfused InnerProduct path
+at bs=8× fires ~70 kernels/iter — 5–6 per FC layer × 7 FC layers × 2
+fwd+bwd — vs NV's single fused `cutlass3x_sm100` per FC layer). This
+matches NV's own §8.2d signature: at small batch RCCL latency
+dominates total iter time; at large batch GPU compute amortizes.
 
 #### Two distinct RCCL gaps
 
@@ -391,29 +384,6 @@ embedding output at bs=1× = 6 912 batch × 26 tables × 128 ev_size
 × 2 B = 46 MB / 8 MB ≈ 6 chunks per logical SendRecv). The **5.3×
 per-call latency** is partly platform-fundamental (no
 xGMI multicast / NVLS equivalent on AMD).
-
-### 3.3 Kernel-category breakdown @ peak (bs=8×, 442 368)
-
-For completeness, the same analysis at our **peak throughput**
-config. Trace dir: `rocprof_bs8x_phase13/`. NV's bs=8× breakdown is
-not directly measured in b200/README §8.2d — extrapolated from §8.2d
-bs=1× assuming data-linear scaling for SendRecv / embedding / MLP /
-fused, constant for AllReduce.
-
-| Component | AMD bs=8× kernel-time | % of AMD | NV bs=8× (extrapolated) | % of NV | AMD/NV |
-|---|---:|---:|---:|---:|---:|
-| **MLP GEMMs** | **60.1 ms** | **51 %** | 2.40 ms | 18 % | **25×** |
-| Embedding ops | 24.7 ms | 21 % | 2.56 ms | 19 % | 9.7× |
-| Fused FMA / convert / concat | 17.7 ms | 15 % | 1.60 ms | 12 % | 11× |
-| RCCL | 11.9 ms | 10 % | 5.18 ms | 38 % | 2.3× |
-| Memcpy / fillBuffer | 1.2 ms | 1 % | 0 ms | 0 % | ∞ |
-| Other | 1.1 ms | 1 % | 2.24 ms | 17 % | 0.5× |
-| **Iter wall (real)** | **26.06 ms** | — | **13.50 ms** | — | **1.93×** |
-
-→ **At bs=8× the dominant gap is MLP GEMMs (49 % of total iter gap).**
-The unfused InnerProduct path fires ~70 kernels/iter (5–6 kernels
-per FC layer × 7 FC layers × 2 fwd+bwd) vs NV's single fused
-`cutlass3x_sm100` per FC layer.
 
 ## Linear fit of host overhead (`t_iter = c + α·batch`)
 
@@ -432,7 +402,7 @@ Implications for the remaining ~13–18 % gap:
 
 ## Part 4 — Open work
 
-Re-ranked **2026-05-13** based on the §3.2 / §3.3 trace-driven gap
+Re-ranked **2026-05-13** based on the §3.1 trace-driven gap
 analysis. **The dominant gap is batch-size-dependent**:
 
 - **At bs=1× (MLPerf-spec)**: RCCL is **72 %** of the iter-time gap
@@ -463,7 +433,7 @@ spec) then the bs=8× gap.
 
 | # | Item | Estimated win @ bs=8× | Effort | Notes |
 |---:|---|---:|---|---|
-| **4** | **CK-Tile fused MLP GEMM kernel** (GEMM + bias + ReLU + dReLU + bgrad epilogue, single MFMA kernel per FC layer) | **15–25 % at bs=8×** | 5–10 days (CK-Tile expertise) | **Highest-ROI lever per §3.3**: replaces the unfused `hipblasGemmEx` + V5-bgrad chain (5–6 kernels per FC layer × 7 layers × 2 directions = ~70 kernels/iter at bs=8× = 60 ms profile = ~20 ms real) with a single MFMA fused kernel matching NV's `cutlass3x_sm100` epilogue fusion. **Phase-5 attempt** (Tensile-fused via `hipblasGemmEx`) gave -6 % on AMD — the issue is the kernel chain, not the fusion concept. Use **Composable Kernel (CK) Tile API** (gfx950 supported). |
+| **4** | **CK-Tile fused MLP GEMM kernel** (GEMM + bias + ReLU + dReLU + bgrad epilogue, single MFMA kernel per FC layer) | **15–25 % at bs=8×** | 5–10 days (CK-Tile expertise) | **Highest-ROI lever for bs=8× (out-of-scope for the bs=1× focus this README is consolidated around)**: replaces the unfused `hipblasGemmEx` + V5-bgrad chain (5–6 kernels per FC layer × 7 layers × 2 directions = ~70 kernels/iter at bs=8× = 60 ms profile = ~20 ms real) with a single MFMA fused kernel matching NV's `cutlass3x_sm100` epilogue fusion. **Phase-5 attempt** (Tensile-fused via `hipblasGemmEx`) gave -6 % on AMD — the issue is the kernel chain, not the fusion concept. Use **Composable Kernel (CK) Tile API** (gfx950 supported). |
 | 5 | Direct `hipblasLtMatmul` API call (vs hipblasGemmEx wrapper) | 2–4 % @ bs=8× | medium (replace `cublas_gemm.cu` wrapper) | Bench shows 6/12 unique MLP shapes have 14–60 % heuristic-vs-best gap that `HIPBLASLT_TUNING_OVERRIDE_FILE` cannot apply because HCTR's `hipblasGemmEx` wrapper bypasses the override. Direct `hipblasLtMatmul` API call lets the offline tuning take effect. Smaller win than #4 because the gap is in *kernel selection*, not *kernel count*. |
 
 ### 4.C cross-batch levers
