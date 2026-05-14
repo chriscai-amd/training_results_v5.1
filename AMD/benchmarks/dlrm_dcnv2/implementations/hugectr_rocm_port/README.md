@@ -282,6 +282,79 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.5 — Item D split now CONVERGES + extended GraphScheduleable API (2026-05-14)
+
+**Major plumbing landed for cross-graph synchronization**, Item D pipeline split
+now converges correctly under graph capture.
+
+#### Extended `GraphScheduleable` with cross-graph events
+
+Added to `pipeline.hpp` and `pipeline.cpp`:
+
+```cpp
+class GraphScheduleable : public Scheduleable {
+  // NEW: cross-graph sync API
+  void wait_event(const std::vector<hipEvent_t>& events);  // wait BEFORE replay
+  hipEvent_t record_done();                                 // record AFTER replay
+  // ...
+};
+```
+
+The `run()` method now:
+1. Calls `hipStreamWaitEvent(stream, event)` for each external event BEFORE replay
+2. Records `completion_event_` AFTER `graph_.exec(stream)` so other Scheduleables can wait on it
+
+#### Item D split now WORKS without crash
+
+When `HCTR_SPLIT_NETWORK_GRAPH=1`:
+- `fprop_loss_graph` = (network_init, bottom_fprop, top_fprop, init_wgrad, cal_loss) on default stream
+- `network_bprop_graph` = (top_bprop, bottom_bprop) on `computation_stream_2_`
+- Cross-graph sync: `bprop_graph.wait_event(fprop_graph.record_done())`
+- Forward sync to allreduce: `network_exchange_wgrad.wait_event(bprop_graph.record_done())`
+
+**Test result**:
+```
+HCTR_SPLIT_NETWORK_GRAPH=1
+  Throughput: 12.872 M sps  (+0.6% vs baseline 12.79)
+  Loss:       0.2917 ✓ (converges correctly)
+```
+
+#### Trace analysis — but stream split STILL not visible at kernel level
+
+Even with split graphs successfully capturing on different streams, the
+rocprofv3 trace at iter 15-17 shows **same 4 active streams as baseline**:
+- stream 4328: ALL MLP work (fwd, dgrad, wgrad, bgrada, ReLU)
+- streams 5311, 5320, 5304: embedding + sparse_prep + RCCL
+
+The bprop graph runs on stream 2 at the **pipeline level**, but the actual
+`hipblasGemmEx` calls inside captured graph nodes still land on stream 4328
+in the hardware queue.
+
+**Same root cause as Item B (Phase 14n.dbg)**: hipblas stream pinning under
+graph capture appears to ignore the per-handle stream binding. The captured
+graph nodes always execute on the cublas_handle_'s ORIGINAL bound stream
+regardless of the capture stream.
+
+#### Where this leaves the bs=1× plan
+
+| Item | Status | Notes |
+|---|---|---|
+| Item B (async wgrad) | ✓ plumbing in, ✗ stream split not visible (Phase 14n.dbg) | hipblas/HIP graph capture pins to handle's stream |
+| Item D (pipeline split) | ✓ plumbing in, converges, ✗ stream split not visible | Same root cause as Item B |
+| Item A1 (CK-Tile pre-transpose) | ✓ plumbing in, ✗ numerical issue | Loss 0.594 vs 0.292; needs bias broadcast or stride debug |
+| GraphScheduleable cross-graph sync API | ✓ added (this Phase) | Reusable for future split work |
+
+The pipeline-level scaffold is now complete and ready for whichever
+mechanism actually moves work to different streams (likely needs hipblas
+or hipgraph fix at a lower level).
+
+#### Production safety
+
+- Baseline (default OFF): 12.791 M sps, loss 0.2917 ✓
+- All experimental paths gated behind explicit env vars
+
+---
+
 ### Phase 14n.4 — Item D pipeline split scaffold + GraphScheduleable stream-routing analysis (2026-05-14)
 
 #### Item D approach studied + scaffold landed (gated OFF)
