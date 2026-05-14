@@ -282,6 +282,92 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14k — Apple-to-apple data + ROCm trace tooling (2026-05-13, late night)
+
+Two deliverables that close the "is this really apples-to-apples?" loop:
+
+#### 1. Dataset bit-identical to NV submitters
+
+Extended the on-disk Criteo prefix at `/apps/chcai/criteo_data/mlperf/` to:
+
+| File | Bytes | Rows | Status vs NV/MLCommons R2 reference |
+|---|---:|---:|---|
+| `train_data.bin` | 401,999,999,440 | 440,789,473 | days 0..22 prefix (matches README §4.1 / NV submission setup) |
+| `val_data.bin`   |  81,293,234,928 |  89,137,319 | **MD5 = `c7ca591ad3fd2b09b75d99fa4fc210e2` — byte-perfect to NV reference + GigaComputing 5.1-0040 submission** |
+
+Apple-to-apple bs=1× perf with `docker --tmpfs /ramdata:size=512g` (matches NV's
+`--tmpfs /ramdata:size=250g` setup, just larger to fit our 483 GB total):
+
+```
+Steady-state throughput : 12.836 M samples/sec
+Per-iter time (steady)  : 4.31 ms/iter
+Final loss BCE          : 0.2917 ✓ (range 0.2990 → 0.2791)
+```
+
+Helper script: `/home/chcai/run_apple_to_apple.sh <jobid> [trace_steps]`.
+
+#### 2. ROCm trace → Perfetto JSON converter (PyTorch-profiler-style)
+
+ROCm equivalent of NV's `nsys_to_perfetto_annotated.py`. Reads `rocprofv3
+--kernel-trace --hip-trace --output-format csv` bundle and emits Chrome /
+Perfetto JSON with **all five** of NV's annotation features:
+
+| # | Feature | AMD source |
+|---|---|---|
+| 1 | DLRM-DCNv2 semantic role on every kernel (`[mlp_fwd]`, `[emb_a2a]`, `[allreduce]`, `[opt_emb]`, `[loss]`, `[interaction]`, `[sparse_prep]`, ...) | hand-written classifier in `classify()` mapping AMD kernel names (Tensile `Cijk_*`, `HugeCTR::*`, `embedding::*`, `__amd_rocclr_*`, `ncclDevKernel_*`, `rocprim::*`) to roles |
+| 2 | Per-kernel grid / workgroup / **VGPR / SGPR / LDS / scratch** in tooltip args | rocprofv3 kernel trace columns (`Workgroup_Size_X/Y/Z`, `Grid_Size_X/Y/Z`, `VGPR_Count`, `SGPR_Count`, `LDS_Block_Size`, `Scratch_Size`) |
+| 3 | Host-launch → device-kernel arrows | `Correlation_Id` shared between `_kernel_trace.csv` and `_hip_api_trace.csv`, emitted as Chrome flow events (`ph:"s"` on host TID lane → `ph:"f"` on GPU stream lane, `bp:"e"` to bind to enclosing slice) |
+| 4 | Heuristic fwd/bwd pair arrows within each iter | Loss kernel (HCTR `BinaryCrossEntropy_Kernel`) splits iter into fwd/bwd; LIFO-pair `mlp_fwd ↔ mlp_bwd_dgrad`, `mlp_fwd ↔ mlp_bwd_wgrad`, `interaction ↔ interaction`, `emb_fwd ↔ emb_scatter`, `rccl ↔ rccl` |
+| 5 | Iter boundary instant markers | `hipGraphLaunch` API events on the host TID that owns the GPU (one per iter per rank with CUDA graphs enabled — exactly 8 GPU × N iter graph-launches in our trace) |
+
+Files:
+- `scripts/rocprofv3_to_perfetto_annotated.py` — single-GPU converter (per-GPU JSON)
+- `scripts/rocprofv3_convert_all_gpus.sh` — wrapper to convert all 8 GPUs in one go
+
+Sample output for the 5-step apple-to-apple bs=1× capture (3 measured iters,
+GPU 0 of 8):
+
+```
+Loading a2a_bs55296_5step_kernel_trace.csv ...
+  total kernels on Agent 2: 6,917
+  RCCL kernels: 110
+  iter detection via hipGraphLaunch on TID 416: 20 iters
+  window: iter 15..17  T_START=...ns span=49.374ms (≈16.5 ms/iter under profile)
+  kernels in window: 592
+  category breakdown:
+    sparse_prep:138  mlp_bwd_dgrad:108  memset:69  mlp_fwd:51  hctr_other:45
+    mlp_bwd_wgrad:42  memcpy:46  fused_fma:18  rccl:15  emb_fwd:15
+    emb_reduce:12  interaction:12  opt_emb:9  emb_scatter:3  loss:3  ...
+  host->device launch arrows: 295
+  fwd/bwd flow pairs: 30
+Wrote perfetto_amd_bs1x_gpu0_iter15-17.json (1.23 MB)
+```
+
+The 8-GPU bundle (`a2a_bs55296_5step.gpu0..7.iter15-17.json`, ~10 MB total)
+loads cleanly in <https://ui.perfetto.dev>; click any kernel to see launch
+config, follow correlation arrow back to the originating `hipLaunchKernel` /
+`hipGraphLaunch` on the host row, or follow fwd/bwd arrows to the paired
+backward kernel.
+
+Per-component cross-check (apple-to-apple kernel-time breakdown, summed across
+20 iters × 8 GPUs from this trace):
+
+```
+RCCL/NCCL                : 8224 ms (89.4 %)   ← bs=1× bottleneck (matches Phase 14d)
+HCTR/embedding kernels   :  384 ms ( 4.2 %)
+GEMM (hipBLASLt Cijk_*)  :  340 ms ( 3.7 %)
+copy / fill              :  166 ms ( 1.8 %)
+other                    :   84 ms ( 0.9 %)
+```
+
+Re-confirms Phase 14d / 14f / 14g / 14h finding: at bs=1× the only
+meaningful lever is reducing RCCL exposed time. NV's 81 % hidden-RCCL via
+NVLS hardware all-to-all has no current AMD equivalent (MSCCLPP doesn't
+optimize SendRecv; CU masking is flat; 2.28.3 added WarpSpeed for AllReduce
+only, not SendRecv).
+
+---
+
 ### Phase 14j — Latest dual-batch perf measurement (2026-05-13, late night)
 
 Final clean perf measurement of current best HCTR build (with CK-Tile bridge
