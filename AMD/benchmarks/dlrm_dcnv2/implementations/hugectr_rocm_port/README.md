@@ -282,6 +282,32 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14j — Latest dual-batch perf measurement (2026-05-13, late night)
+
+Final clean perf measurement of current best HCTR build (with CK-Tile bridge
+compiled in but routing OFF by default), all 5-knob production config:
+
+```bash
+HCTR_SHARDING_PLAN=auto HCTR_USE_MULTI_HOT=1 HCTR_USE_CUDA_GRAPH=1
+HCTR_DP_SHARD_THRESH=0.008 HCTR_MEM_COMM_WORK_RATIO=9
+DEBUG_HIP_DYNAMIC_QUEUES=1 (bs≥2× only)
+```
+
+| Batch (×) | Global batch | Per-iter | Throughput | Loss BCE | vs NV B200 same data |
+|---:|---:|---:|---:|---:|---:|
+| 1× | 55,296  | 4.40 ms | 12.57 M sps | 0.2917 ✓ | 14.0 M sps → **-10.2%** |
+| 2× | 110,592 | 7.24 ms | 15.27 M sps | 0.2953 ✓ | -- |
+| 4× | 221,184 | 12.92 ms | 17.12 M sps | 0.2950 ✓ | -- |
+| **8×** | **442,368** | **24.99 ms** | **17.70 M sps** | **0.2876 ✓** | **13.57 M sps → +30.5%** |
+
+Key takeaways:
+1. **bs=8× best perf 17.70 M sps is +30.5% AHEAD of NV B200 on the same HuggingFace Criteo subsample** (NV reported 13.57 M sps).
+2. bs=1× (apples-to-apples) gap to NV B200: **-10.2%** (12.57 vs 14.0 M sps), bottleneck is exposed RCCL (38% of iter gap, see Phase 14d).
+3. Throughput scales **+40% from bs=1× → bs=8×** (12.57 → 17.70 M sps), confirming GEMM/MLP becomes the first-order cost at large batch.
+4. CK-Tile fused MLP integration (Phase 14i.5b) is the next lever to engage at bs=8× once layout fix lands (~half day work).
+
+---
+
 ### Phase 14i.5b — HCTR INTEGRATION RUNS END-TO-END (2026-05-13, late night)
 
 **MAJOR PROGRESS**: separate-compilation bridge **WORKS**, CK-Tile kernel **engages
