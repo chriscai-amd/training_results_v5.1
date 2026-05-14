@@ -71,7 +71,7 @@ plus the data-reader pointed at `/dev/shm/criteo/mlperf` if available.
 ## Part 1 — Enablement
 
 How NVIDIA HugeCTR was ported to ROCm 7.2 / `gfx950`. The initial port
-commit (`7882215`, 2026-05-09) added 1,661 files / ~478 K LOC — the full
+commit ([`7882215`](https://github.com/chriscai-amd/training_results_v5.1/commit/7882215), 2026-05-09) added 1,661 files / ~478 K LOC — the full
 upstream HugeCTR + GPU cache + vendored 3rd-party trees, post-`hipify-perl`,
 with the hand fixes below to make them build, link, and run correctly on
 AMD hardware. Sections are roughly the order you'd hit them porting from
@@ -127,16 +127,16 @@ scratch.
 
 | Issue | Fix | Commit |
 |---|---|---|
-| OpenMP `#pragma omp parallel` silently no-opped → AUC NCCL warmup deadlocked | `-fopenmp` for HIP/CXX in CMakeLists | `0a24ef2` |
-| MultiCross v2 **BGRADA FP16 overflow** at per-rank batch ≥ 2048 (FP16 column-sum could exceed 65,504 → inf → NaN via `ncclSum` → poisons Adagrad) | FP32 accumulation + `isfinite()` guard + ±FP16-max clamp + pre-divide by 256 (Adagrad scale-invariant) | `5439485` |
-| Wave-size mismatch in MultiCross bprop → row-cross-contamination at per-rank batch ≥ 2048 | `WARP_SIZE = 64` for AMD | `9d05c0f` |
-| MultiCross fprop **NaN poisoning** at per-rank batch ≥ 2048 (one inf/NaN element propagates through later GEMMs) | `clamp_fp16_kernel` post-pass after each cross layer's `fused_matrix_elementwise_dot_add`; later inlined into FMA store via `sanitize_half2_fp16` | `0a24ef2` then `93aad5c` |
-| `hipblasCreate` illegal during HIP graph capture | Per-device `hipblasHandle_t` cache pre-warmed via `std::call_once` in `CublasAlgo<T>::init_algorithm` | `eb4fa60` |
-| Synthetic Criteo IDs (0..65535) indexed OOB into real `TABLE_SIZE_ARRAY` (some entries 3, 36, 63) | Clamp `TABLE_SIZE_ARRAY[i] = max(real_size, 65536)` when `HCTR_USE_REAL_TABLE_SIZES=1` | `7882215` |
-| `Model.fit()` segfaulted on synthetic data — `DistributedSlotSparseEmbeddingHash` incompatible with `MultiHot AsyncDataReader` | Switch to modern `EmbeddingCollection` API; add `Reshape` between `EmbeddingCollection` output and `Concat` | `7882215` |
-| `ncclCommInitAll` failed on 8-GPU init — `shard_matrix` hardcoded for 1 GPU | Scale to `NGPU` in train.py's sharding generation | `7882215` |
-| Multi-GPU fused MLP collapsed to `log(2)·2` — BIAS post-pass guard was `(act == None) && bias != null`, dropping bias on every hidden ReLU layer | Drop `act == None` clause; BIAS post-pass fires whenever `bias != null && (saved_is_bias_epilogue || saved_is_relu_aux_epilogue)` | `0d9a35e` |
-| Excluded layers (`MultiHeadAttention`, `GRU`, etc.) still type-referenced | Throwing stubs in `excluded_layer_stubs.cpp` | `7882215` |
+| OpenMP `#pragma omp parallel` silently no-opped → AUC NCCL warmup deadlocked | `-fopenmp` for HIP/CXX in CMakeLists | [`0a24ef2`](https://github.com/chriscai-amd/training_results_v5.1/commit/0a24ef2) |
+| MultiCross v2 **BGRADA FP16 overflow** at per-rank batch ≥ 2048 (FP16 column-sum could exceed 65,504 → inf → NaN via `ncclSum` → poisons Adagrad) | FP32 accumulation + `isfinite()` guard + ±FP16-max clamp + pre-divide by 256 (Adagrad scale-invariant) | [`5439485`](https://github.com/chriscai-amd/training_results_v5.1/commit/5439485) |
+| Wave-size mismatch in MultiCross bprop → row-cross-contamination at per-rank batch ≥ 2048 | `WARP_SIZE = 64` for AMD | [`9d05c0f`](https://github.com/chriscai-amd/training_results_v5.1/commit/9d05c0f) |
+| MultiCross fprop **NaN poisoning** at per-rank batch ≥ 2048 (one inf/NaN element propagates through later GEMMs) | `clamp_fp16_kernel` post-pass after each cross layer's `fused_matrix_elementwise_dot_add`; later inlined into FMA store via `sanitize_half2_fp16` | [`0a24ef2`](https://github.com/chriscai-amd/training_results_v5.1/commit/0a24ef2) then [`93aad5c`](https://github.com/chriscai-amd/training_results_v5.1/commit/93aad5c) |
+| `hipblasCreate` illegal during HIP graph capture | Per-device `hipblasHandle_t` cache pre-warmed via `std::call_once` in `CublasAlgo<T>::init_algorithm` | [`eb4fa60`](https://github.com/chriscai-amd/training_results_v5.1/commit/eb4fa60) |
+| Synthetic Criteo IDs (0..65535) indexed OOB into real `TABLE_SIZE_ARRAY` (some entries 3, 36, 63) | Clamp `TABLE_SIZE_ARRAY[i] = max(real_size, 65536)` when `HCTR_USE_REAL_TABLE_SIZES=1` | [`7882215`](https://github.com/chriscai-amd/training_results_v5.1/commit/7882215) |
+| `Model.fit()` segfaulted on synthetic data — `DistributedSlotSparseEmbeddingHash` incompatible with `MultiHot AsyncDataReader` | Switch to modern `EmbeddingCollection` API; add `Reshape` between `EmbeddingCollection` output and `Concat` | [`7882215`](https://github.com/chriscai-amd/training_results_v5.1/commit/7882215) |
+| `ncclCommInitAll` failed on 8-GPU init — `shard_matrix` hardcoded for 1 GPU | Scale to `NGPU` in train.py's sharding generation | [`7882215`](https://github.com/chriscai-amd/training_results_v5.1/commit/7882215) |
+| Multi-GPU fused MLP collapsed to `log(2)·2` — BIAS post-pass guard was `(act == None) && bias != null`, dropping bias on every hidden ReLU layer | Drop `act == None` clause; BIAS post-pass fires whenever `bias != null && (saved_is_bias_epilogue || saved_is_relu_aux_epilogue)` | [`0d9a35e`](https://github.com/chriscai-amd/training_results_v5.1/commit/0d9a35e) |
+| Excluded layers (`MultiHeadAttention`, `GRU`, etc.) still type-referenced | Throwing stubs in `excluded_layer_stubs.cpp` | [`7882215`](https://github.com/chriscai-amd/training_results_v5.1/commit/7882215) |
 
 ## 1.5 FP16 numerical hardening (additions vs CUDA build, which is BF16)
 
@@ -171,22 +171,22 @@ report at the **peak batch 442,368 (8×)** instead.
 
 | Phase | Date | Optimization | Commits | Throughput before → after | Δ |
 |---:|---|---|---|---:|---:|
-| 1  | 2026-05-09 | Initial port — get build/link/run working | `7882215` | (didn't run) → first FP32 8-GPU run | n/a |
-| 2  | 2026-05-09 | Multi-GPU FP16 MultiCross stabilisation (3 numerical bugs) | `9d05c0f`, `5439485`, `0a24ef2` | NaN at iter ≤ 2 → **5.85** M sps | first convergence |
-| 3  | 2026-05-09 | HIP graph + intra/inter-iter overlap re-enabled (handle pre-warm `std::call_once`) | `eb4fa60` | 5.85 → **6.26** | **+7.0 %** |
-| 4  | 2026-05-10 | Multi-hot data path (912 B/row, 214 keys/row — apples-to-apples with NV submission) | `5e12007` | 6.26 → **5.73** | -8.5 % (5× more embedding work; intentional regression for apples-to-apples) |
-| 5  | 2026-05-10 | Fused MLP epilogue emulation (RELU_AUX / DRELU / DRELU_BGRAD via `hipblasGemmEx` fallback) | `2ee57e7`, `0d9a35e`, `61ce55b` | n/a (correctness only; fused path slower than InnerProduct on AMD) | (correctness) |
-| 6  | 2026-05-10 | **V5 2D-tile bgrad/bgrada kernels** replace V1 cooperative scan (49 % of single-GPU time → sub-1 %) | `56bc046`, `63a9c54`, `4fc896a` | 5.73 → **11.24** | **+96 %** ← single biggest win |
-| 7  | 2026-05-11 | FP16 NaN/inf clamp folded into `vector_fma{3,4}_align8` store path | `93aad5c` | 11.24 → **11.57** | +2.9 % @ bs1x; **+15 %** @ sweet-spot batch |
-| 8  | 2026-05-11 | Re-enable intra/inter-iteration overlap (earlier scripts had set both to 0) | `68e560e` | 11.57 → **12.55** | **+8.5 %** |
-| 9  | 2026-05-11 | V5-style `add_bias_per_row_v5_kernel` (BLOCK_M=64 × N_TILE=128, coalesced, shared-mem broadcast) | `3b984e4` | 12.55 → **12.72** | +1.4 % @ bs1x; +2.6 % @ sweet-spot |
-| 10 | 2026-05-11 | V5 BGRADA scratch zeroing folded into finalize kernel (3 hipMemsetAsync/iter eliminated) | `b898899` | 12.72 → **12.74** | +0.2 % (within noise) |
-|    | 2026-05-12 | NFS-bound → `/dev/shm` fix (AsyncReader uses `O_DIRECT`, bypasses page cache) | `bf88560` | 5.21 (NFS) → **11.76** sustained @ bs1x | +127 % vs NFS-bound run |
-|    | 2026-05-12 | NV-submission audit (>120 env-knob configs swept) — bake `NCCL_PROTO=LL128`, `HIP_FORCE_DEV_KERNARG=1` | `1ef02aa`, `fd1f4d2`, `2c4670a`, `a923ef1` | 11.76 → **11.88** sustained | +1.0 % |
-| 11 | 2026-05-12 | **`DEBUG_HIP_DYNAMIC_QUEUES=1`** (on-demand HW queue allocation; the 4-stream pipeline now overlaps properly) | `3860967` | 11.88 → **12.92** @ bs1x; 15.17 → **16.42** @ bs8x peak | **+8.9 % @ bs1x; +8.2 % @ bs8x** |
+| 1  | 2026-05-09 | Initial port — get build/link/run working | [`7882215`](https://github.com/chriscai-amd/training_results_v5.1/commit/7882215) | (didn't run) → first FP32 8-GPU run | n/a |
+| 2  | 2026-05-09 | Multi-GPU FP16 MultiCross stabilisation (3 numerical bugs) | [`9d05c0f`](https://github.com/chriscai-amd/training_results_v5.1/commit/9d05c0f), [`5439485`](https://github.com/chriscai-amd/training_results_v5.1/commit/5439485), [`0a24ef2`](https://github.com/chriscai-amd/training_results_v5.1/commit/0a24ef2) | NaN at iter ≤ 2 → **5.85** M sps | first convergence |
+| 3  | 2026-05-09 | HIP graph + intra/inter-iter overlap re-enabled (handle pre-warm `std::call_once`) | [`eb4fa60`](https://github.com/chriscai-amd/training_results_v5.1/commit/eb4fa60) | 5.85 → **6.26** | **+7.0 %** |
+| 4  | 2026-05-10 | Multi-hot data path (912 B/row, 214 keys/row — apples-to-apples with NV submission) | [`5e12007`](https://github.com/chriscai-amd/training_results_v5.1/commit/5e12007) | 6.26 → **5.73** | -8.5 % (5× more embedding work; intentional regression for apples-to-apples) |
+| 5  | 2026-05-10 | Fused MLP epilogue emulation (RELU_AUX / DRELU / DRELU_BGRAD via `hipblasGemmEx` fallback) | [`2ee57e7`](https://github.com/chriscai-amd/training_results_v5.1/commit/2ee57e7), [`0d9a35e`](https://github.com/chriscai-amd/training_results_v5.1/commit/0d9a35e), [`61ce55b`](https://github.com/chriscai-amd/training_results_v5.1/commit/61ce55b) | n/a (correctness only; fused path slower than InnerProduct on AMD) | (correctness) |
+| 6  | 2026-05-10 | **V5 2D-tile bgrad/bgrada kernels** replace V1 cooperative scan (49 % of single-GPU time → sub-1 %) | [`56bc046`](https://github.com/chriscai-amd/training_results_v5.1/commit/56bc046), [`63a9c54`](https://github.com/chriscai-amd/training_results_v5.1/commit/63a9c54), [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a) | 5.73 → **11.24** | **+96 %** ← single biggest win |
+| 7  | 2026-05-11 | FP16 NaN/inf clamp folded into `vector_fma{3,4}_align8` store path | [`93aad5c`](https://github.com/chriscai-amd/training_results_v5.1/commit/93aad5c) | 11.24 → **11.57** | +2.9 % @ bs1x; **+15 %** @ sweet-spot batch |
+| 8  | 2026-05-11 | Re-enable intra/inter-iteration overlap (earlier scripts had set both to 0) | [`68e560e`](https://github.com/chriscai-amd/training_results_v5.1/commit/68e560e) | 11.57 → **12.55** | **+8.5 %** |
+| 9  | 2026-05-11 | V5-style `add_bias_per_row_v5_kernel` (BLOCK_M=64 × N_TILE=128, coalesced, shared-mem broadcast) | [`3b984e4`](https://github.com/chriscai-amd/training_results_v5.1/commit/3b984e4) | 12.55 → **12.72** | +1.4 % @ bs1x; +2.6 % @ sweet-spot |
+| 10 | 2026-05-11 | V5 BGRADA scratch zeroing folded into finalize kernel (3 hipMemsetAsync/iter eliminated) | [`b898899`](https://github.com/chriscai-amd/training_results_v5.1/commit/b898899) | 12.72 → **12.74** | +0.2 % (within noise) |
+|    | 2026-05-12 | NFS-bound → `/dev/shm` fix (AsyncReader uses `O_DIRECT`, bypasses page cache) | [`bf88560`](https://github.com/chriscai-amd/training_results_v5.1/commit/bf88560) | 5.21 (NFS) → **11.76** sustained @ bs1x | +127 % vs NFS-bound run |
+|    | 2026-05-12 | NV-submission audit (>120 env-knob configs swept) — bake `NCCL_PROTO=LL128`, `HIP_FORCE_DEV_KERNARG=1` | [`1ef02aa`](https://github.com/chriscai-amd/training_results_v5.1/commit/1ef02aa), [`fd1f4d2`](https://github.com/chriscai-amd/training_results_v5.1/commit/fd1f4d2), [`2c4670a`](https://github.com/chriscai-amd/training_results_v5.1/commit/2c4670a), [`a923ef1`](https://github.com/chriscai-amd/training_results_v5.1/commit/a923ef1) | 11.76 → **11.88** sustained | +1.0 % |
+| 11 | 2026-05-12 | **`DEBUG_HIP_DYNAMIC_QUEUES=1`** (on-demand HW queue allocation; the 4-stream pipeline now overlaps properly) | [`3860967`](https://github.com/chriscai-amd/training_results_v5.1/commit/3860967) | 11.88 → **12.92** @ bs1x; 15.17 → **16.42** @ bs8x peak | **+8.9 % @ bs1x; +8.2 % @ bs8x** |
 |    | 2026-05-12 | **Configuration: peak measurement at bs8x (442,368) instead of bs1x (55,296)** (amortizes 1.29 ms/iter host overhead — see linear-fit in Part 3) | (configuration only) | bs1x **12.92** → bs8x **16.42** M sps (same binary, 8× larger global batch, ~7 % per-GPU memory increase) | **+27 %** (**+5.3 ms saved per 8× samples**; relaxes MLPerf-spec batch constraint) |
-| 12 | 2026-05-12 | int4-vectorized `__half` elementwise: `concat_fwd/bwd_kernel_vec8` + `binaryOp_kernel_vec8_half` (used by MultiCross matrix_add) | `4fb17c3`, `e3e64a2` | 16.42 → **16.67** @ bs8x | **+1.5 %** at peak |
-| 13 | 2026-05-13 | **`HCTR_DROP_TABLE_SIZE_CLAMP=1` on real-data path** — removes stale `max(real_size, 65536)` clamp that broke `auto`-planner's DP-replication of the 13 small embedding tables (≤ 7,424 elems). Reduces embedding all-to-all volume by ~80 %. (NV's May-13 hot-fix per b200/README §7.5.) | `tbd` | bs8x 16.67 → **16.98**; bs2x 15.04 → **15.31** | **+2.0 % @ bs8x; +1.8 % @ bs2x; flat @ bs1x** (RCCL is CU-bound on AMD, not volume-bound) |
+| 12 | 2026-05-12 | int4-vectorized `__half` elementwise: `concat_fwd/bwd_kernel_vec8` + `binaryOp_kernel_vec8_half` (used by MultiCross matrix_add) | [`4fb17c3`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fb17c3), [`e3e64a2`](https://github.com/chriscai-amd/training_results_v5.1/commit/e3e64a2) | 16.42 → **16.67** @ bs8x | **+1.5 %** at peak |
+| 13 | 2026-05-13 | **`HCTR_DROP_TABLE_SIZE_CLAMP=1` on real-data path** — removes stale `max(real_size, 65536)` clamp that broke `auto`-planner's DP-replication of the 13 small embedding tables (≤ 7,424 elems). Reduces embedding all-to-all volume by ~80 %. (NV's May-13 hot-fix per b200/README §7.5.) | [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6) | bs8x 16.67 → **16.98**; bs2x 15.04 → **15.31** | **+2.0 % @ bs8x; +1.8 % @ bs2x; flat @ bs1x** (RCCL is CU-bound on AMD, not volume-bound) |
 | 14a | 2026-05-13 | **`NCCL_BUFFSIZE=8 MiB → 32 MiB`** — at bs1x embedding output is 46 MB ≫ 8 MB so RCCL splits each logical SendRecv into ~6 chunks; bumping the buffer to 32 MB merges most chunks → fewer per-call inter-launch gaps | baked in `run_b200_match.sh` | bs1x 12.90 → **13.07**; bs8x 16.98 → 16.99 (flat) | **+1.3 % @ bs1x; flat @ bs8x** (RCCL only 10 % of bs8x kernel-time, dominant at bs1x) |
 | 14b | 2026-05-13 | **`HCTR_FUSE_TOP_MLP=1` (re-enabled at bs ≥ 4×)** — Phase-5's negative measurement (-6 % at all batches) was a measurement artifact: with `NCCL_BUFFSIZE=8 MiB` the fused top-MLP path's larger NCCL chunks couldn't pipeline. With `BUFFSIZE=32 MiB` + bs ≥ 4× the fused-MLP epilogue chain (1 GEMM + 1 epilogue kernel per FC layer instead of 5–6 unfused) finally amortizes. | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 16.99 → **17.86**; bs4x 16.50 → **17.49**; bs2x 15.31 → 14.59 (regress); bs1x 13.07 → 12.46 (regress) | **+5.2 % @ bs8x; +6.0 % @ bs4x; ‑4.7 % @ bs2x; ‑4.6 % @ bs1x** — auto-disabled below bs4× |
 | 14c | 2026-05-13 | **`HCTR_FUSE_WB=True` (at bs ≥ 8×)** — fold weight-bias post-pass into the fused MLP. Stacks on top of 14b. At bs ≤ 4× this is flat or slightly negative (kernel overhead dominates the bias-fuse savings). | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 17.86 → **17.93**; bs4x 17.49 → 17.14 (regress) | **+0.4 % @ bs8x; ‑2.0 % @ bs4x** — auto-disabled below bs8× |
@@ -228,7 +228,7 @@ MultiCross).
 | Configuration | Throughput | Δ |
 |---|---:|---:|
 | pre-V5 (legacy `reduce_sum_columns`) | 5.73 M sps | baseline |
-| V5 in source but stale build (commit `4fc896a`) | 5.73 M sps | (V5 not actually engaged) |
+| V5 in source but stale build (commit [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a)) | 5.73 M sps | (V5 not actually engaged) |
 | **V5 actually engaged** (clean rebuild) | **11.24 M sps** | **+96 %** |
 
 Side-finding: the build I'd been benchmarking against had been stale —
