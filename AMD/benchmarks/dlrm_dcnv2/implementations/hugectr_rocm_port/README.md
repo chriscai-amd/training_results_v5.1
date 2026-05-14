@@ -282,6 +282,75 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n.4 — Item D pipeline split scaffold + GraphScheduleable stream-routing analysis (2026-05-14)
+
+#### Item D approach studied + scaffold landed (gated OFF)
+
+Reviewed `pipeline.cpp::GraphScheduleable::run()` (lines 104-129):
+
+```cpp
+auto first_node = std::dynamic_pointer_cast<StreamContextScheduleable>(scheduleable_list_[0]);
+auto [current_stream_name, priority] = first_node->get_stream_name(gpu);
+hipStream_t stream = gpu->get_stream(current_stream_name, priority);
+// ...
+graph_.capture(do_it, stream);   // CAPTURE on chosen stream
+graph_.exec(stream);             // REPLAY on chosen stream
+```
+
+**Finding**: `GraphScheduleable` runs on the stream of its FIRST sub-Scheduleable. So
+to put a sub-graph on `computation_stream_2_`, just call `set_stream("computation_stream_2_")`
+on its first item.
+
+#### Scaffold implemented in `model_pipeline.cpp`
+
+Behind `HCTR_SPLIT_NETWORK_GRAPH=1` (currently gated OFF):
+
+```cpp
+if (split_network_env) {
+  auto fprop_loss_graph = std::make_shared<GraphScheduleable>(
+      network_init, bottom_network_fprop, top_network_fprop, init_wgrad, cal_loss);
+  top_network_bprop->set_stream("computation_stream_2_");
+  network_bprop_graph = std::make_shared<GraphScheduleable>(
+      top_network_bprop, bottom_network_bprop);
+  network_graph = fprop_loss_graph;  // use fprop+loss as "network_graph" slot
+}
+// Pipeline scheduleable_list pushes back fprop+loss graph, then bprop graph as separate entries
+```
+
+#### Initial test result (env-on): convergence FAILED
+
+```
+HCTR_SPLIT_NETWORK_GRAPH=1
+  Throughput: crashed during training
+  Loss:       cannot converge (RuntimeError)
+```
+
+**Root cause**: cal_loss writes `grad_top` on default stream (in fprop_loss_graph),
+but bprop graph captures on stream 2 with NO `hipStreamWaitEvent` for the loss
+completion event. During replay, bprop reads stale/zero grad_top before fprop's
+loss kernel completes, causing divergence.
+
+#### Fix needed (~2 days more work)
+
+To make split work, need:
+1. `GraphScheduleable` exposes `record_done()` + `wait_event()` (currently
+   only `StreamContextScheduleable` has these — line 39 of pipeline.hpp)
+2. Wrap the cross-graph sync at HIP level: `hipEventRecord` after fprop graph
+   replay on default stream + `hipStreamWaitEvent` before bprop graph replay
+   on stream 2
+3. Mirror sync on the way back: bprop → exchange_wgrad on default stream
+
+Until that lands, `HCTR_SPLIT_NETWORK_GRAPH` defaults to OFF. Scaffold left
+in source for the future structural fix.
+
+#### Production impact
+
+- Baseline (default OFF): **12.791 M sps, loss 0.2917 ✓** (preserved)
+- Scaffold compiles + builds clean
+- All experimental paths gated behind explicit env vars
+
+---
+
 ### Phase 14n.3 — Item A1 weight pre-transpose: plumbing complete, convergence pending (2026-05-13, very late)
 
 **Major plumbing landed**, but CK-Tile output still numerically wrong.
