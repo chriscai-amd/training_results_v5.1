@@ -282,6 +282,78 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14l — Side-by-side trace deep-dive vs B200 + refreshed bs=1× plan (2026-05-13, late night)
+
+Used the new `rocprofv3_to_perfetto_annotated.py` converter (Phase 14k) on
+the apple-to-apple bs=1× capture, then diffed kernel-by-kernel and
+stream-by-stream against NV's published example trace
+(`/home/chcai/traces/HCTR/perfetto_bs1x_gpu0_iter1000-1002.v2.json`).
+
+#### 1. Quantitative diff (bs=1×, GPU 0, 3 steady iters)
+
+| Metric | NV B200 | AMD MI350X | Gap |
+|---|---:|---:|---:|
+| Wall time / iter | **2.45 ms** | **4.31 ms** (unprofiled) | +76% slower |
+| Kernels / iter | 127 | **198** | +56% more kernels |
+| Active GPU streams | **10** | **4** (= 4 HW queues) | 2.5× less concurrency |
+| Critical-stream kernels / iter | 45 (stream 250) | **112** (stream 4323) | 2.5× more on critical path |
+| `mlp_bwd_dgrad` / iter | 5 (CUTLASS3 fused dgrad+bgradA+drelu+wgrad) | **36** (unfused: bgrada_v5 + bgrad_finalize + 18 distinct hipBLASLt tile configs) | **7.2× more** |
+| `mlp_fwd` / iter | 25 (bias_relu fused) | 17 GEMMs + **14 standalone half4_relu_kernel** = 31 total | +24% more |
+| `memset` / iter | 0 | **23 × `__amd_rocclr_fillBufferAligned`** (89 µs) | AMD-only waste |
+| RCCL kernels / iter | 6 (4 emb_a2a SendRecv + 2 allreduce) | 5 (all `ncclDevKernel_Generic_1`, indistinguishable) | similar count |
+| RCCL avg per-call duration | ~80 µs | **~800 µs** | **10× slower per call** |
+| Total RCCL time / iter | ~470 µs | **~2750 µs** | 5.8× more |
+
+#### 2. Four root causes of the 1.76× wall-time gap
+
+| # | Root cause | Estimated share of gap | Fix path |
+|---:|---|---:|---|
+| 1 | Exposed RCCL (NVLS hardware multicast on NV vs CU-saturating ncclDevKernel on AMD) | 38–55% | MSCCL++ xGMI custom AllToAll; or wait for AMD hardware NVLS-equivalent |
+| 2 | Unfused MLP backward (NV CUTLASS3 1-kernel-per-layer vs AMD 9-kernel chain × 4 layers) | 25–30% | **CK-Tile fused MLP (Phase 14i.5b — already integrated, blocked on weight-layout fix, ~half day)** |
+| 3 | Only 4 HW queues used vs NV's 10 streams (NEW finding) | 15–20% (after #2 lands) | App-level: split network fwd/bwd across multiple streams; HW: `GPU_MAX_HW_QUEUES=16` (verified 4→8 queues but flat alone — needs #2 first to expose more parallel streams) |
+| 4 | Standalone ReLU + scratch memsets (AMD-only) | 5–10% | hipBLASLt's `RELU_AUX_BIAS` epilogue (already coded for MLPLayer; need to extend to InnerProduct path) + buffer-pool the scratch zeroing |
+
+#### 3. Item #1 (HW queue bump) — TESTED 2026-05-13, requires #2 first
+
+```
+GPU_MAX_HW_QUEUES=16  → unique HW queues 4 → 8 (verified in trace)
+                      → throughput 12.956 → 12.956 M sps (FLAT)
+```
+
+Why flat: HCTR creates 4–7 logical streams; even with 16 queues available,
+the **critical-path stream `4323` still carries 337 kernels** (75% of total
+GPU work) because the network forward/backward all funnel through the
+"default" compute stream. More queues don't help when one stream is
+saturated.
+
+**Conclusion**: Item #1 (HW queues) and Item #3 (stream-affinity tuning) are
+**no-ops alone**. They become useful AFTER Item #2 (CK-Tile fused MLP) cuts
+the critical-stream kernel count by 84/iter, which then exposes parallelism
+the queues can absorb.
+
+#### 4. Refreshed bs=1× plan (sequenced, with hard prerequisites)
+
+| Order | Item | Effort | bs=1× gain | Prerequisite |
+|---:|---|---|---:|---|
+| 1 | **CK-Tile fused MLP — close layout bug** (Phase 5b followup) | ~half day | **+5–10%** (cuts 84 of 198 kerns/iter from critical stream) | none |
+| 2 | **Fuse standalone ReLU into MLP fwd via `RELU_AUX_BIAS`** for InnerProduct path (currently only MLPLayer uses it) | 1 day | **+3–5%** (eliminates 14 ReLU kernels/iter from critical stream) | none |
+| 3 | **Re-test `GPU_MAX_HW_QUEUES=16` after items 1+2** | 1 hr | **+5–15%** if HCTR's now-shorter critical stream lets `dp`/`mp`/`computation_stream_2` run in parallel | items 1+2 |
+| 4 | **`hipExtStreamCreateWithCUMask` for RCCL streams (re-test)** — Phase 14g attempt was flat because RCCL was on the same stream as MLP backward | 3 days | +2–5% | items 1+2 (so MLP backward isn't on RCCL stream anymore) |
+| 5 | **MSCCL++ xGMI custom AllToAll** (replaces ncclSendRecv = 86% of exposed RCCL) | 5–10 days | +5–15% | none |
+| 6 | **Wgrad scratch memset consolidation** | 2 days | +1–2% | none |
+| 7 | Wait for ROCm 7.3+ WarpSpeed for AllReduce | 0 days | +1–2% | container update |
+
+**Cumulative midpoint estimate, items 1–6**: **+35%** at bs=1×. Closes the
+gap from -8.3% (12.836 vs 14.0 M sps NV) to **+25% AHEAD** of NV B200 on the
+same data — matching what we already achieve at bs=8×.
+
+**Critical insight**: items 1+2 are NOT the biggest individual gains, but
+they are **PREREQUISITES for items 3+4 to even work**. Without cutting the
+critical-stream kernel count first, more queues / RCCL CU-masking / etc are
+all flat experiments (per Phase 14a/g/i sweeps).
+
+---
+
 ### Phase 14k — Apple-to-apple data + ROCm trace tooling (2026-05-13, late night)
 
 Two deliverables that close the "is this really apples-to-apples?" loop:
