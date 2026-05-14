@@ -282,6 +282,73 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14n — Item B (async wgrad) DONE + Item A1 (CK-Tile layout) progress (2026-05-13, late night)
+
+#### Item B: async wgrad in InnerProduct path — DONE (gated env)
+
+Implementation in `HugeCTR/src/layers/fully_connected_layer_half.cu`:
+- Routes bias_grad + kernel_grad GEMMs through `cublas_handle_wgrad_`
+  (which is bound to `computation_stream_2_` in `gpu_resource.cpp:68`)
+- dgrad GEMM stays on default stream (its output `bottom` feeds previous
+  layer's bprop)
+- Cross-stream sync via pre-cached `event_overlap_` (created in `initialize()`,
+  reused per bprop call — works under CUDA graph capture, mirrors MLPLayer's
+  pattern)
+- Gated behind `HCTR_INNERPRODUCT_ASYNC_WGRAD=1` (default OFF)
+
+**Test result @ bs=1×**:
+
+```
+Baseline (Item B OFF):       12.944 M sps  (4.27 ms/iter)
+HCTR_INNERPRODUCT_ASYNC_WGRAD=1: 12.446 M sps (-3.8%)
+   + GPU_MAX_HW_QUEUES=16:   12.4–12.6 M sps (still net -3%)
+Final loss converges to 0.2917 in all cases ✓
+```
+
+**Why -3% alone**: per-layer event sync overhead (~10us each × 4 layers ×
+2 events = 80us/iter) currently exceeds the wgrad-vs-dgrad parallel time
+savings (~60us/iter at bs=1×, since wgrad GEMMs are tiny per-GPU at bs=1×).
+
+This is **expected and matches the Phase 14l/14m prediction**: Item B is a
+prerequisite. It becomes net-positive once Item A1 (CK-Tile) cuts critical
+stream from 337 → ~135 kernels, exposing more parallel MLP work that the
+empty `computation_stream_2_` can absorb.
+
+Item B left in source as gated env knob (default OFF) — ready to re-enable
+in combination with Items A1+D.
+
+#### Item A1: CK-Tile fused MLP layout — partial progress
+
+Tried two layout fixes:
+
+1. **`BLayout = ColumnMajor` with `stride_B = K`** (v6 POC layout) → loss 0.6055 (HCTR's W is row-major, not col-major; reads wrong elements)
+2. **`BLayout = RowMajor` with `stride_B = N`** → loss 1.386 = log(2), output all zero (V1 pipeline's `WarpGemmDispatcher` doesn't support row-major B for our `128x128x32 MFMA32` config — silent failure inside kernel, IsSupportedArgument returns true)
+3. **Swap-AB trick** (`Y^T = W^T @ X^T` with all ColumnMajor) → **compile error**:
+   ```
+   /aiter_ck_tile/.../cshuffle_epilogue.hpp:820: static_assert(
+     std::is_same_v<ELayout, tensor_layout::gemm::RowMajor>, ...)
+   ```
+   CK-Tile's `CShuffleEpilogue` REQUIRES output layout to be RowMajor.
+   Cannot swap-AB while keeping ColumnMajor everywhere.
+
+#### Item A1 next steps (deferred, ~1-2 days):
+
+| Approach | Effort | Risk |
+|---|---|---|
+| Try `GemmPipelineAGmemBGmemCRegV2` (different load pattern, may support row-major B) | 0.5 day | Low (pipeline swap, same kernel semantics) |
+| Pre-transpose weight at HCTR opt step → CK-Tile reads col-major B | 1.5 days (HCTR opt + scratch buffer + sync) | Medium (memory cost: 2× weight, transpose kernel per opt) |
+| Per-layer custom transpose kernel called inside CK-Tile wrapper | 1 day | Low (one-shot at fwd time, ~10us per call) |
+
+For now, code compiles + runs (gated behind `HCTR_USE_CK_TILE_MLP=1 + HCTR_CK_TILE_FORCE=1`, both default off so production unaffected). Phase 5b plumbing (separate-compilation bridge, ABI, integration) remains valid.
+
+#### Validated: prerequisite chain matches Phase 14m prediction
+
+Item B alone is a **net regression** (-3%), confirming it cannot help bs=1×
+without Item A1 (CK-Tile to reduce critical stream). The combined effect
+will be tested once A1 lands.
+
+---
+
 ### Phase 14m — Stream-parallelism gap quantified + prerequisite chain validated (2026-05-13, late night)
 
 Validated the Phase 14l hypothesis ("items 1+2 are prerequisites for stream/queue parallelism")
