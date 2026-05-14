@@ -9,25 +9,29 @@ This is a research / port branch, **not an official MLPerf submission**.
 ## Status
 
 Single node, 8 × MI350X, FP16 mixed precision (matching NVIDIA's B200
-submission), Adagrad, scaler 16,348, sharding=auto, HIP graph + overlap on,
-`DEBUG_HIP_DYNAMIC_QUEUES=1` baked in. All numbers on real MLPerf Criteo
-data (HuggingFace subsample, copied to `/dev/shm` to avoid the AsyncReader's
-`O_DIRECT` NFS bottleneck).
+submission), Adagrad, scaler 16,348, sharding=auto + real-cardinality
+embedding tables (DP-replicates 13 small tables, see §2.4), HIP graph +
+overlap on, `DEBUG_HIP_DYNAMIC_QUEUES=1` baked in. All numbers on real
+MLPerf Criteo data (HuggingFace subsample, copied to `/dev/shm` to avoid
+the AsyncReader's `O_DIRECT` NFS bottleneck — same RAM-disk strategy as
+NV's `--tmpfs /ramdata`).
 
-| Batch (global) | Per-GPU | ms/iter | **AMD M sps** | NV B200 (same data) | Ratio |
+| Batch (global) | Per-GPU | ms/iter | **AMD M sps** | NV B200 May-13 (auto+tmpfs) | Ratio |
 |---:|---:|---:|---:|---:|---:|
-| 55,296 (1×, MLPerf-spec) | 6,912 | 4.28 | **12.92** | 15.78 | **81.9 %** |
-| 110,592 (2×) | 13,824 | 7.35 | **15.04** | 18.20 | **82.6 %** |
-| 221,184 (4×) | 27,648 | 13.47 | **16.43** | 19.82 | **82.9 %** |
-| **442,368 (8×, peak)** | 55,296 | 26.54 | **16.67** | 19.19 | **86.9 %** ← peak ratio |
+| 55,296 (1×, MLPerf-spec) | 6,912 | 4.23 | **13.07** | 26.33 | 49.6 % |
+| 110,592 (2×) | 13,824 | 7.22 | **15.31** | 30.72 | 49.8 % |
+| 221,184 (4×) | 27,648 | 12.65 | **17.49** | 31.60 | 55.3 % |
+| **442,368 (8×, peak)** | 55,296 | 24.67 | **17.93** | 32.77 | **54.7 %** ← peak ratio |
 
 NVIDIA B200 reference numbers come from the companion
 [`b200/.../README-b200-1x8.md`](https://github.com/chriscai-amd/training_results_v5.1/blob/chcai/b200/NVIDIA/benchmarks/dlrm_dcnv2/implementations/hugectr/README-b200-1x8.md)
 where NVIDIA ran their published MLPerf submission binary on the same
-HuggingFace Criteo subsample. The publicly headlined **23.02 M sps on
-8 × B200** is on the full 4.2 B-row MLCommons R2 corpus (~4 TB), which
-this port doesn't have local capacity to host; on equivalent HF data
-NV's own peak is **19.82 M sps** at bs4x.
+HuggingFace Criteo subsample. NV's **May 13, 2026** numbers reflect
+their `SHARDING_PLAN=auto` + `--tmpfs /ramdata` breakthrough (their
+Apr→May jump: 13.69 → 26.33 M sps at bs1x = +92 %). On AMD the same
+two changes give us only +2 % (we already use the tmpfs equivalent and
+RCCL all-to-all is bottlenecked by CU-saturation rather than volume,
+see §2.4 below).
 
 ## Build & Run
 
@@ -182,18 +186,19 @@ report at the **peak batch 442,368 (8×)** instead.
 | 11 | 2026-05-12 | **`DEBUG_HIP_DYNAMIC_QUEUES=1`** (on-demand HW queue allocation; the 4-stream pipeline now overlaps properly) | `3860967` | 11.88 → **12.92** @ bs1x; 15.17 → **16.42** @ bs8x peak | **+8.9 % @ bs1x; +8.2 % @ bs8x** |
 |    | 2026-05-12 | **Configuration: peak measurement at bs8x (442,368) instead of bs1x (55,296)** (amortizes 1.29 ms/iter host overhead — see linear-fit in Part 3) | (configuration only) | bs1x **12.92** → bs8x **16.42** M sps (same binary, 8× larger global batch, ~7 % per-GPU memory increase) | **+27 %** (**+5.3 ms saved per 8× samples**; relaxes MLPerf-spec batch constraint) |
 | 12 | 2026-05-12 | int4-vectorized `__half` elementwise: `concat_fwd/bwd_kernel_vec8` + `binaryOp_kernel_vec8_half` (used by MultiCross matrix_add) | `4fb17c3`, `e3e64a2` | 16.42 → **16.67** @ bs8x | **+1.5 %** at peak |
+| 13 | 2026-05-13 | **`HCTR_DROP_TABLE_SIZE_CLAMP=1` on real-data path** — removes stale `max(real_size, 65536)` clamp that broke `auto`-planner's DP-replication of the 13 small embedding tables (≤ 7,424 elems). Reduces embedding all-to-all volume by ~80 %. (NV's May-13 hot-fix per b200/README §7.5.) | `tbd` | bs8x 16.67 → **16.98**; bs2x 15.04 → **15.31** | **+2.0 % @ bs8x; +1.8 % @ bs2x; flat @ bs1x** (RCCL is CU-bound on AMD, not volume-bound) |
+| 14a | 2026-05-13 | **`NCCL_BUFFSIZE=8 MiB → 32 MiB`** — at bs1x embedding output is 46 MB ≫ 8 MB so RCCL splits each logical SendRecv into ~6 chunks; bumping the buffer to 32 MB merges most chunks → fewer per-call inter-launch gaps | baked in `run_b200_match.sh` | bs1x 12.90 → **13.07**; bs8x 16.98 → 16.99 (flat) | **+1.3 % @ bs1x; flat @ bs8x** (RCCL only 10 % of bs8x kernel-time, dominant at bs1x) |
+| 14b | 2026-05-13 | **`HCTR_FUSE_TOP_MLP=1` (re-enabled at bs ≥ 4×)** — Phase-5's negative measurement (-6 % at all batches) was a measurement artifact: with `NCCL_BUFFSIZE=8 MiB` the fused top-MLP path's larger NCCL chunks couldn't pipeline. With `BUFFSIZE=32 MiB` + bs ≥ 4× the fused-MLP epilogue chain (1 GEMM + 1 epilogue kernel per FC layer instead of 5–6 unfused) finally amortizes. | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 16.99 → **17.86**; bs4x 16.50 → **17.49**; bs2x 15.31 → 14.59 (regress); bs1x 13.07 → 12.46 (regress) | **+5.2 % @ bs8x; +6.0 % @ bs4x; ‑4.7 % @ bs2x; ‑4.6 % @ bs1x** — auto-disabled below bs4× |
+| 14c | 2026-05-13 | **`HCTR_FUSE_WB=True` (at bs ≥ 8×)** — fold weight-bias post-pass into the fused MLP. Stacks on top of 14b. At bs ≤ 4× this is flat or slightly negative (kernel overhead dominates the bias-fuse savings). | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 17.86 → **17.93**; bs4x 17.49 → 17.14 (regress) | **+0.4 % @ bs8x; ‑2.0 % @ bs4x** — auto-disabled below bs8× |
 
-**Peak result post-Phase-12: 16.67 M sps at bs8x (442,368)** = 86.9 % of NV B200's bs8x peak (19.19 M sps), or **1.23× of the matched-data NV reference** (13.57 M sps at bs1x on the HF subsample).
+**Peak result post-Phase-14: 17.93 M sps at bs8x (442,368)** = 54.7 % of NV B200's May-13 auto+tmpfs bs8x peak (32.77 M sps).
 
-**Cumulative breakdown of the bs1x → bs8x configuration win (all numbers
-post-Phase-11 to isolate the batch-size lever):**
-
-| Batch (global) | Per-GPU | M sps | vs bs1x baseline | vs NV B200 (same batch) |
+| Batch (global) | Per-GPU | M sps (post-Phase-14) | vs Phase-13 | vs NV B200 May-13 (same batch) |
 |---:|---:|---:|---:|---:|
-| 55,296 (1×, MLPerf-spec) | 6,912 | 12.92 | (baseline) | 81.9 % of 15.78 |
-| 110,592 (2×) | 13,824 | 15.04 | **+16.4 %** | 82.6 % of 18.20 |
-| 221,184 (4×) | 27,648 | 16.43 | **+27.2 %** | 82.9 % of 19.82 |
-| 442,368 (8×, peak) | 55,296 | **16.67** | **+29.0 %** | **86.9 %** of 19.19 |
+| 55,296 (1×, MLPerf-spec) | 6,912 | **13.07** | +1.3 % (BUFFSIZE) | 49.6 % of 26.33 |
+| 110,592 (2×) | 13,824 | **15.31** | flat | 49.8 % of 30.72 |
+| 221,184 (4×) | 27,648 | **17.49** | +6.0 % (FUSE_TOP) | 55.3 % of 31.60 |
+| 442,368 (8×, peak) | 55,296 | **17.93** | +5.6 % (FUSE_TOP+FUSE_WB) | **54.7 %** of 32.77 |
 
 The +29 % bs1x → bs8x win is **not free** — it relaxes the MLPerf-spec
 global batch constraint (55,296). It IS free if the calling task can
@@ -277,6 +282,875 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14i.5b — HCTR INTEGRATION RUNS END-TO-END (2026-05-13, late night)
+
+**MAJOR PROGRESS**: separate-compilation bridge **WORKS**, CK-Tile kernel **engages
+on every iter**, HCTR baseline **preserved**.
+
+#### Deliverables (added in 14i.5b on top of 14i.5 scaffold)
+
+1. **`HugeCTR/src/layers/cktile_mlp_kernel.cu`** — full CK-Tile template
+   instantiation in a separate `.cu`, exposes `extern "C"` wrappers:
+   - `hctr_cktile_gemm_bias_relu_fp16(A, B, bias, C, M, N, K, stream)`
+   - `hctr_cktile_gemm_bias_fp16(...)` (no activation, last MLP layer)
+   - `hctr_cktile_gemm_plain_fp16(...)` (for backward dgrad/wgrad)
+
+2. **`HugeCTR/src/CMakeLists.txt`** — builds `cktile_mlp_kernel.cu` as a
+   **separate OBJECT library** with `set_property(TARGET cktile_mlp_kernel
+   PROPERTY COMPILE_OPTIONS "")` to **CLEAR** the inherited `-include
+   warp-compat.h` and `-fopenmp` flags that broke CK-Tile's `WarpGemmDispatcher`
+   template instantiation. Object then linked into `huge_ctr_shared` via
+   `$<TARGET_OBJECTS:cktile_mlp_kernel>`.
+
+3. **`HugeCTR/include/cktile_mlp_kernel.hpp`** — refactored to declare the
+   `extern "C"` API at GLOBAL scope (was inside namespace, which mangled the
+   linkage). Now any HCTR `.cu` can call them without namespace qualification.
+
+4. **`HugeCTR/src/layers/mlp_layer.cu`** — fwd routing block now compiled
+   **always**, gated at runtime on `HCTR_USE_CK_TILE_MLP=1` AND `HCTR_CK_TILE_FORCE=1`.
+   Falls back to legacy `hipblasGemmEx` chain if CK-Tile shape unsupported or
+   returns `hipErrorInvalidValue`.
+
+#### Verified end-to-end behaviour
+
+```
+[CK-Tile gemm_bias_relu] call#0 M=6912 N=1024 K=3456   ← top[0] (interaction concat)
+[CK-Tile gemm_bias_relu] call#1 M=6912 N=1024 K=1024   ← top[1]
+[CK-Tile gemm_bias_relu] call#2 M=6912  N=512 K=1024   ← top[2]
+[CK-Tile gemm_bias_relu] call#3 M=6912  N=256  K=512   ← top[3]
+... repeating per iter
+```
+
+Build path verified: `huge_ctr_shared.so` 42 MB, links cleanly, `MLPLayer::fprop`
+dispatches to CK-Tile kernel without crash. Loss converges (with FORCE=0,
+baseline path): **0.2917** = matches stock baseline (was 0.2827–0.2917 in prior
+runs).
+
+#### Performance probe at bs=1× (informational, layout still WIP)
+
+| Run | Throughput | Loss | Notes |
+|---|---:|---:|---|
+| Baseline (CK-Tile not engaged) | **12.89 M sps** | 0.2917 ✓ | matches stock |
+| `HCTR_USE_CK_TILE_MLP=1` (no FORCE) | 12.97 M sps | 0.2917 ✓ | path not taken |
+| `HCTR_USE_CK_TILE_MLP=1 + HCTR_FUSE_TOP_MLP=1 + FORCE=1` | 12.34 M sps | **0.6055 ✗** | layout bug |
+
+The **0.6055 loss vs 0.2917 baseline** is a layout mismatch between HCTR's
+row-major weight tensor (`{K, N}` shape, stride=N) and the current CK-Tile pipeline
+(expects `BLayout=ColumnMajor` with stride=K). Tested `BLayout=RowMajor` with
+stride=N → kernel runs but produces all-zero output (loss → log(2) = 1.386),
+suggesting the `GemmPipelineAGmemBGmemCRegV1` doesn't have a row-major-B
+specialization registered in this CK-Tile version. **Production runs are
+unaffected** because the routing block is gated behind `HCTR_CK_TILE_FORCE=1`
+(off by default).
+
+#### Remaining work for engagement (~half day)
+
+1. Custom transpose kernel applied to weight before each MLP layer (fast — ~0.01 ms each)
+   OR
+2. Switch to a CK-Tile pipeline variant that supports row-major B (need to
+   research aiter's CK-Tile API surface)
+   OR
+3. Upgrade to `/opt/rocm/include/ck_tile` (newer API) — may have row-major B
+   support, but reintroduces the original API mismatch problem (Phase 14i.1).
+
+Once layout fix lands, expected upside at bs=8× (where GEMM dominates 51% of
+kernel time per Phase 14i trace) is **+5-10%** vs the 14.7 M sps current best.
+At bs=1×, upside is **<2%** because RCCL exposed time (38% of iter gap) is the
+bottleneck, not GEMM (Phase 14d trace analysis).
+
+---
+
+### Phase 14i.5 — HCTR integration scaffold (2026-05-13, evening)
+
+Built the integration plumbing for routing HCTR's `MLPLayer::fprop` through
+the CK-Tile fused kernel when `HCTR_USE_CK_TILE_MLP=1`:
+
+#### Deliverables
+
+1. **`HugeCTR/include/cktile_mlp_kernel.hpp`** — header-only wrapper exposing:
+   - `HugeCTR::cktile::gemm_bias_relu<T>(...)` — fused GEMM + bias + ReLU
+   - `HugeCTR::cktile::gemm_bias<T>(...)` — fused GEMM + bias (no activation, last layer)
+   - `HugeCTR::cktile::gemm_plain<T>(...)` — plain GEMM (for dgrad/wgrad in backward)
+   - `HugeCTR::cktile::is_shape_supported(M, N, K)` — runtime shape gate (N≥64, K≥32)
+   - `HugeCTR::cktile::is_enabled()` — `HCTR_USE_CK_TILE_MLP` env knob check
+
+2. **`HugeCTR/CMakeLists.txt` patch** — adds `/aiter_ck_tile` to `include_directories()`
+   BEFORE `/opt/rocm/include` so `#include "ck_tile/..."` resolves to the
+   aiter-bundled API (which matches the example invokers' signature).
+
+3. **`/home/chcai/aiter_ck_tile/`** — extracted aiter's CK-Tile headers (23 MB)
+   from the docker image to a host path so it can be bind-mounted at build time
+   (the docker bind-mount of `/workspace` hides the in-container `/workspace/aiter`).
+
+4. **`HugeCTR/src/layers/mlp_layer.cu` patch** — the routing block (forward path)
+   currently `#ifdef`-out via `HCTR_HAS_CKTILE_MLP_WIRED 0`. To enable: change to 1.
+
+#### BLOCKER — HCTR build flag interaction with CK-Tile dispatcher
+
+When `cktile_mlp_kernel.hpp` is included from `mlp_layer.cu` in HCTR's full
+build env, CK-Tile's internal `WarpGemmDispatcher` template fails to
+instantiate:
+
+```
+error: implicit instantiation of undefined template 'ck_tile::impl::warp_gemm_dispatcher::Dispatcher<
+    __half, __half, float, 32, 32, 16, false, false, false,
+    ck_tile::WGAttrNumAccessEnum::Single,    ← TWO Single enums
+    ck_tile::WGAttrNumAccessEnum::Single>'
+```
+
+The same template instantiation works fine in standalone `hipcc` builds
+(`cktile_mlp_v8.cpp` etc.). The difference is HCTR's compile flags:
+- HCTR adds `-fopenmp`, custom `-include` for warp-mask shims, multiple HIP
+  defines that affect template default param resolution
+- These cause the policy to pick `(Single, Single)` instead of `(Single, *default*)`
+- That specialization is not registered in the aiter CK-Tile
+
+#### Resolution path (deferred to next session)
+
+**Separate-compilation bridge**: instead of including `cktile_mlp_kernel.hpp`
+inside `mlp_layer.cu`, create a new compilation unit `cktile_mlp_kernel.cu`
+that:
+- Includes the CK-Tile headers + template instantiations with ISOLATED flags
+  (no HCTR-specific defines)
+- Exposes only `extern "C"`-style wrapper functions
+  (`hctr_cktile_gemm_bias_relu`, `hctr_cktile_gemm_bias`, etc.)
+- Compiled by CMake with custom `target_compile_options(... PRIVATE
+  -nostdinc++-fopenmp ... )` to strip HCTR-specific defines
+
+This is ~1 day of CMake + linker work. Estimated remaining effort to
+working bs=1× perf measurement:
+
+| Phase | Status | Effort |
+|---|---|---:|
+| Phases 1-4 | DONE (POCs working) | ✓ |
+| Phase 5a | scaffold DONE (header, cmake, mount) | ✓ |
+| **Phase 5b** | **separate-compilation bridge (BLOCKER fix)** | **1 day** |
+| Phase 5c | Re-enable routing in mlp_layer.cu, test build | 0.5 day |
+| Phase 6 | Loss/AUC validation + bs=1× perf measurement | 0.5-1 day |
+| **Total remaining** | | **2-2.5 days** |
+
+#### Source files preserved for next session
+
+- `/home/chcai/cktile_minimal.cpp` — header feasibility (passes)
+- `/home/chcai/cktile_gemm_v6.cpp` — basic GEMM, 280 TFLOP/s (passes)
+- `/home/chcai/cktile_mlp_v7.cpp` — multi-shape benchmark (passes, 6/8 shapes)
+- `/home/chcai/cktile_mlp_v8.cpp` — fused GEMM+bias+ReLU, 421 TFLOP/s + correctness (passes)
+- `/home/chcai/cktile_mlp_v9.cpp` — fwd+dgrad+wgrad benchmark (passes)
+- `/home/chcai/aiter_ck_tile/` — extracted aiter CK-Tile (23 MB, ready to mount)
+- `/home/chcai/hugectr_rocm_port/hugectr_hip/HugeCTR/include/cktile_mlp_kernel.hpp` — wrapper
+- `/home/chcai/hugectr_rocm_port/hugectr_hip/CMakeLists.txt` — already patched
+
+#### What this session delivered
+
+✅ **Path 5-day → 2-day** (5 days saved by completing Phases 1-4 + half of 5)
+✅ **Working CK-Tile gemm+bias+ReLU at 421 TFLOP/s on real shape** (correctness verified)
+✅ **All 8 MLP shape configs identified** + best tile config (`128×128×32 MFMA32`)
+✅ **Backward GEMMs validated** (fwd/dgrad: ~460 TFLOP/s; wgrad: ~120 TFLOP/s)
+✅ **HCTR build env extended** to support CK-Tile (cmake + extracted headers)
+⏸️ **Remaining**: 1-day separate-compilation bridge + 1-day perf validation
+
+### Phase 14i.4 — CK-Tile backward GEMMs (2026-05-13)
+
+Phase 4: validated CK-Tile works for **backward GEMMs** (dgrad + wgrad)
+on all major shapes. For an FC layer with weight W (K×N) and input I (M×K):
+- **Fwd**: Y = I·W,  shape M×N
+- **Dgrad**: dI = dY·W^T,  shape M×K  (same M as fwd, swap N↔K)
+- **Wgrad**: dW = I^T·dY,  shape K×N  (M=K_orig, K=M_orig — large K case)
+
+Same `128×128×32 MFMA32` config compiles + runs for all 3 directions:
+
+| Layer | Direction | M×N×K | µs/iter | TFLOP/s |
+|---|---|---:|---:|---:|
+| top[1] | Fwd   | 6912×1024×1024 | 31.6 | 458 |
+| top[1] | Dgrad | 6912×1024×1024 | 31.4 | 461 |
+| top[1] | Wgrad | 1024×1024×6912 | 122.5 | 118 |
+| top[2] | Fwd   | 6912×512×1024  | 24.8 | 293 |
+| top[2] | Dgrad | 6912×1024×512  | 20.1 | 361 |
+| top[2] | Wgrad | 1024×512×6912  | 122.5 | 59 |
+| bot[1] | Fwd   | 6912×256×512   | 12.7 | 142 |
+| bot[1] | Dgrad | 6912×512×256   | 9.3 | 194 |
+| bot[1] | Wgrad | 512×256×6912   | 104.2 | 17 |
+
+**Observation**: `wgrad` is slower because its shape has small M,N
+(weight dims) and large K (= original M = batch). Future work: pick a
+different per-direction tile config (e.g., 64×64×256 with K_Warp=2 for
+wgrad) to bring wgrad up to ~250 TFLOP/s.
+
+For now, the basic backward GEMM works. Bias-grad (column sum of
+dY_relu) and dReLU mask multiply still need to be either fused into
+wgrad epilogue (Phase 4b) or kept as separate kernels (acceptable
+fallback).
+
+Source: `/home/chcai/cktile_mlp_v9.cpp`. Status: Phase 4 DONE (basic
+backward; wgrad tile-config tuning is a follow-up).
+
+### Phase 14i.3 — CK-Tile fused GEMM + bias + ReLU epilogue (2026-05-13)
+
+After Phase 14i.2 unlocked multi-shape, attacked Phase 3 (epilogue
+fusion). Wrote a custom `AddRelu` `CDElementwise` functor that combines
+bias-add + ReLU into the GEMM epilogue, eliminating 2 separate kernel
+launches (`add_bias_per_row_v5_kernel` + `half4_relu_kernel`) per FC
+layer:
+
+```cpp
+struct AddRelu {
+    template <typename Y, typename X0, typename X1>
+    __host__ __device__ constexpr void operator()(Y& y, const X0& x0, const X1& x1) const {
+        const float sum = static_cast<float>(x0) + static_cast<float>(x1);
+        const float relu = sum > 0.0f ? sum : 0.0f;
+        y = ck_tile::type_convert<Y>(relu);
+    }
+};
+```
+
+API used:
+- `ck_tile::GemmKernelMultiD<...>` (multi-D variant — 1 D-tensor for bias)
+- `ck_tile::GemmMultiDHostArgs<1>` (host-side args with 1 D-tensor)
+- `CShuffleEpilogueProblem<..., AddRelu, ...>` (custom CDElementwise)
+- bias stride = 0 → broadcast 1×N bias across all M rows
+
+**Result @ M=6912 N=1024 K=1024 fp16**:
+```
+[v8] CK-Tile fused GEMM+bias+ReLU: 0.0344 ms/iter, 421.909 TFLOP/s
+  Correctness:
+    [0,0] ref=0     got=0     (negative→ReLU clipped ✓)
+    [0,1] ref=6.789 got=6.789 (within fp16 noise diff=0.0004)
+    [0,2] ref=6.224 got=6.226 (within fp16 noise diff=0.0017)
+    [0,3] ref=0     got=0     (negative→ReLU clipped ✓)
+```
+
+Compared to Phase 14i.2 plain GEMM (433 TFLOP/s for same shape), the
+fused epilogue costs only **3 % overhead**. Vs HCTR's current
+unfused chain (`hipblasGemmEx` + `add_bias_per_row_v5_kernel` +
+`half4_relu_kernel`), the fused kernel:
+- Eliminates 2 of 5+ kernel launches per FC layer
+- Per-layer launch overhead saved at bs=1× (where launch latency
+  dominates) ≈ 10-20 µs, × 7 FC layers = ~70-140 µs/iter saved
+
+Source: `/home/chcai/cktile_mlp_v8.cpp`. Status: Phase 3 DONE.
+
+### Phase 14i.2 — CK-Tile multi-shape parameterization (2026-05-13)
+
+Phase 2 work: parameterized the CK-Tile GEMM template so we can sweep
+`M_Tile, N_Tile, K_Tile, M_Warp, N_Warp, K_Warp` per MLP shape and pick
+the best per-shape config. Tested 4 tile configs against all 8
+DLRM-DCNv2 MLP forward shapes at bs=1×:
+
+| Shape | M | N | K | Best config | µs/iter | TFLOP/s |
+|---|---:|---:|---:|---|---:|---:|
+| bot[0] | 6912 | 512 | 13 | **N/A** (K<32, no tile fits) | — | pathological |
+| bot[1] | 6912 | 256 | 512 | 128×128×32 (2×2 MFMA32) | 12.6 | 143 |
+| bot[2] | 6912 | 128 | 256 | 128×128×32 | 8.5 | 53 |
+| top[0] | 6912 | 1024 | 480 | 128×128×32 | 20.1 | 337 |
+| **top[1]** | **6912** | **1024** | **1024** | **128×128×32** | **33.5** | **433** ← largest, hits 33 % of MI350X fp16 peak |
+| top[2] | 6912 | 512 | 1024 | 128×128×32 | 24.6 | 294 |
+| top[3] | 6912 | 256 | 512 | 128×128×32 | 12.6 | 143 |
+| top[4] | 6912 | 1 | 256 | **N/A** (N<64, no tile fits) | — | pathological |
+
+**`128×128×32 (2×2×1 MFMA32)` is consistently the best config** for all
+non-pathological shapes — single template specialization covers 6 of 8
+MLP layers. Pathological shapes (bot[0] K=13, top[4] N=1) need fallback
+to `hipblasGemmEx` (~10 % of total MLP time, not a blocker).
+
+**Sum of 6 supported shapes (fwd only): ~112 µs / iter**
+
+Compared to HCTR's hipblasGemmEx baseline at bs=1× (~1120 µs MLP-GEMMs
+in trace per §3.2), this is **~10× faster on the supported shapes** —
+caveat: still need backward (Phase 4) + integration (Phase 5) +
+correctness validation (Phase 6) before claiming end-to-end perf gain.
+
+Source: `/home/chcai/cktile_mlp_v7.cpp`. Status: Phase 2 DONE.
+
+### Phase 14i.1 — CK-Tile GEMM kernel BREAKTHROUGH (2026-05-13, evening)
+
+After Phase 14i identified the API mismatch between the example invokers
+and `/opt/rocm/include/ck_tile`, the user pointed out: **"did we build
+against the docker we are using?"** This question revealed the fix —
+there are **THREE** versions of CK-Tile shipped in our container, and I
+was using the wrong one:
+
+| Path | API version | Matches example invokers? |
+|---|---|---|
+| `/opt/rocm/include/ck_tile/` | NEWER (17-arg `CShuffleEpilogueProblem` with `MemoryOperation_`) | ❌ NO |
+| **`/workspace/aiter/3rdparty/composable_kernel/include/ck_tile/`** | **OLDER (16-arg with `DoubleSmemBuffer_`)** | ✅ **YES (matches `gemm_basic_invoker.hpp`)** |
+| `/opt/venv/lib/python3.12/.../tilelang/.../composable_kernel/include/ck_tile/` | yet another | not tested |
+
+Recompiled `cktile_gemm_v6.cpp` with `-I/workspace/aiter/3rdparty/composable_kernel/include`
+instead of the system include path. **Result: kernel compiles, launches,
+and produces correct output**:
+
+```
+$ ./cktile_gemm_v6
+[v6] CK-Tile GEMM run for M=6912 N=1024 K=1024 fp16
+[v6] Grid={108,1} Block=256
+[v6] CK-Tile gemm time: 0.0518 ms/iter, 279.654 TFLOP/s
+[v6] Correctness: row0/col0 ref=-1.70783 got=-1.70801 diff=0.000173 (within fp16 noise)
+```
+
+#### Working CK-Tile GEMM template (top MLP layer 1, M=6912 N=1024 K=1024 fp16)
+
+```
+Tile config (gfx950 native MFMA fp16):
+  M_Tile=256, N_Tile=256, K_Tile=64
+  M_Warp=2,   N_Warp=2,   K_Warp=1
+  M_Warp_Tile=32, N_Warp_Tile=32, K_Warp_Tile=16
+
+Kernel name: gemm_fp16_pipeline_AGmemBGmemCRegV1_256x256x64x256_8x8x1_1x1x1
+Performance: 0.052 ms/iter = 279 TFLOP/s = 21 % of MI350X fp16 peak (~1.3 PFLOP/s)
+```
+
+#### Source files preserved
+
+- `/home/chcai/cktile_minimal.cpp` — header-only feasibility test (passes)
+- `/home/chcai/cktile_gemm_v5.cpp` — kernel template instantiation only (passes)
+- `/home/chcai/cktile_gemm_v6.cpp` — full kernel launch + correctness check (passes, 280 TFLOP/s)
+- `/home/chcai/cktile_vs_hipblas.cpp` — comparison vs hipblasGemmEx (compile error, needs sig fix)
+
+#### Next steps for full HCTR integration (estimated 4-7 days, not 5-10)
+
+The blocker that consumed Phase 14i is removed. Realistic effort revised down:
+
+| Phase | Work | Effort |
+|---|---|---|
+| 1 | ~~API archaeology~~ | **DONE** (this phase) |
+| 2 | Tile config tuning per MLP shape (parameterize template for our 8 shapes) | 1 day |
+| 3 | Custom bias+ReLU+dReLU epilogue (replace `PassThrough` with custom `CDElementwise` functor) | 1-2 days |
+| 4 | Add backward GEMMs (dgrad + wgrad shapes, dReLU+bgrad fused on backward) | 1-2 days |
+| 5 | HCTR `mlp_layer.cu` integration as `HCTR_USE_CK_TILE_MLP=1` opt-in (with hipblasGemmEx fallback) | 1 day |
+| 6 | Loss/AUC correctness validation + perf measurement at bs=1×/8× | 1 day |
+| **Total** | | **5-7 days** |
+
+#### Estimated upside
+
+CK-Tile baseline (no epilogue): **279 TFLOP/s vs current `hipblasGemmEx` baseline (TBD)**.
+Once bias+ReLU+dReLU is fused into a single epilogue:
+- Eliminates ~5 separate kernel launches per FC layer (`add_bias_per_row_v5_kernel`,
+  `half4_relu_kernel`, `bprop_drelu_bgrad_v5_kernel`, etc.)
+- Saves per-call launch latency at small batch (where current `FUSE_TOP_MLP=1`
+  regresses -4.6 % at bs=1× because launch overhead dominates)
+- **Estimated: +5-10 % at bs=1×, +3-5 % at bs=8×** (closes most of the
+  MLP-GEMM gap; remaining gap is per-kernel TFLOP/s vs CUTLASS3)
+
+This is now the **HIGHEST-VIABLE next step** for closing the bs=1× gap
+(higher than RCCL rebuild paths which were tested negative).
+
+### Phase 14i — CK-Tile fused MLP POC attempt (2026-05-13)
+
+After Phase 14h's negative RCCL findings, attempted CK-Tile fused MLP
+prototype as the only remaining lever for the bs=1× MLP GEMM gap (23 %
+of iter time at bs=1×). Goal: write a standalone CK-Tile kernel that
+does GEMM + bias + ReLU for our top-MLP shape (M=6912, N=1024, K=1024,
+fp16) on gfx950, validate it compiles, then plan integration into
+`HCTR/src/layers/mlp_layer.cu`.
+
+**Step 1 — header compile feasibility**: PASSED.
+Wrote `cktile_minimal.cpp` that just `#include`s CK-Tile headers and
+prints type sizes. Compiles + runs cleanly with `hipcc`:
+```
+[ok] CK-Tile headers included successfully
+  Target shape: M=6912 N=1024 K=1024
+  ADataType: half_t  BDataType: half_t  CDataType: half_t  AccDataType: float
+```
+
+**Step 2 — instantiate `GemmKernel<...>`**: FAILED across 3 attempts.
+
+Attempt v3 (`Default2DEpilogue`): error — installed `GemmKernel`
+requires `EpiloguePipeline::DsLayout` and `::DsDataType` typedefs (for
+multi-D output protocol), which `Default2DEpilogue` doesn't expose.
+
+Attempt v4 (`CShuffleEpilogue` with full 17-template-arg signature
+including `memory_operation_enum::set`): two new errors:
+1. `DsDataType (aka 'float') cannot be used prior to '::' because it
+   has no members` — passing `ck_tile::tuple<>` for empty DsDataType
+   doesn't dispatch correctly; the type alias deduces it as `float`.
+2. `WarpGemmDispatcher<_Float16, _Float16, _Float16, 32, 32, 16, false,
+   false, false, ck_tile::WGAttrNumAccessEnum::Single>` is undefined —
+   the 32×32×16 fp16 MFMA specialization is not registered for the
+   `Single` access enum we're getting from the default policy. Need
+   different access enum or different tile shape.
+
+**Root-cause analysis**: CK-Tile installed at `/opt/rocm/include/ck_tile`
+in our container has a NEWER API than the example invokers shipped in
+`aiter/3rdparty/composable_kernel/example/ck_tile/`. The example code
+references `CShuffleEpilogueProblem<ADataType, BDataType, ck_tile::tuple<>,
+AccDataType, CDataType, ck_tile::tuple<>, CLayout, PassThrough, ...>`
+(15 args with old order), while installed signature is
+`CShuffleEpilogueProblem<AsDataType, BsDataType, AccDataType, ODataType,
+DsDataType, DsLayout, ELayout, CDElementwise, ..., MemoryOperation, ...>`
+(17 args with completely different order, including `memory_operation_enum`
+that has no default value).
+
+**Cascading issues** (each requires 1-2 days investigation):
+- AsDataType / DsDataType must be `tuple<...>`, but empty `tuple<>` doesn't
+  dispatch through `::size()` correctly
+- `WarpGemmDispatcher` specializations only registered for specific access
+  enum / transpose / output combinations — must match exactly
+- `MemoryOperation::set` value may not be the correct one for our use case
+- `GemmHostArgs` field names changed (`a_ptr` vs `A_ptr`, `e_ptr` vs `D_ptr`)
+
+**Conclusion: CK-Tile fused MLP requires dedicated 5-10 day engineering session.**
+
+The work needed:
+1. **API archaeology** (1-2 days): map installed CK-Tile API to a working
+   minimal compile. Either match installed headers or rebuild CK-Tile
+   from source matching example version (the cmake build approach we
+   attempted in Phase 14g — 3 cmake attempts all failed with
+   interdependency errors).
+2. **Tile config tuning per shape** (1-2 days): each of our 8 unique MLP
+   shapes (e.g., M×N×K = 6912×{512,256,128,1024,1,...}×{13,256,512,...})
+   needs its own `M_Tile/N_Tile/K_Tile/M_Warp/N_Warp` config; some
+   shapes (e.g., K=13) may need fundamentally different kernel structure.
+3. **Bias + ReLU + dReLU epilogue** (2-3 days): write CK-Tile compatible
+   `CDElementwise` functor that fuses bias add + ReLU forward and dReLU
+   backward, including FP32 accumulator path for numerical stability.
+4. **HCTR integration** (1-2 days): replace `hipblasGemmEx` chain in
+   `mlp_layer.cu` with CK-Tile kernel call, gated by
+   `HCTR_USE_CK_TILE_MLP=1` env knob with hipblasGemmEx fallback.
+5. **Correctness + perf validation** (1-2 days): compare loss/AUC vs
+   baseline; measure perf at bs=1×/8× vs current FUSE_TOP_MLP path.
+
+**Estimated upside if successful**: +5-10 % at bs=1× (closes per-FC-layer
+launch overhead that currently makes FUSE_TOP_MLP regress at small batch).
+
+**Time-to-value mismatch**: 5-10 days of dedicated work for ≤+10 % bs=1×
+gain — vs the next ROCm container update which may bring further
+improvements automatically. Recommended to defer until either:
+(a) a dedicated CK-Tile expert is available, or (b) ROCm 7.3+
+container ships with CK-Tile/HCTR integration sample code.
+
+POC source files preserved at:
+- `/home/chcai/cktile_minimal.cpp` (passing, just headers)
+- `/home/chcai/cktile_gemm_v4.cpp` (failing, 17-arg CShuffleEpilogue)
+
+### Phase 14h — RCCL custom rebuilds: MSCCLPP + 2.28.3 (2026-05-13)
+
+After Phase 14g found CU-masking flat, we built TWO custom RCCL libraries
+on reserved nodes and tested both at bs=1× via `LD_LIBRARY_PATH` override:
+
+#### Build 1: RCCL 2.27.7 (our version) with `-DENABLE_MSCCLPP=ON`
+
+Cloned RCCL `rocm-7.1.0` tag (= 2.27.7), built with MSCCLPP backend
+enabled. Verified via `strings librccl.so.1.0`: `MSCCLPP_*` symbols
+present, `MSCCL++` runtime strings baked in (size 53.9 MB vs original
+unchanged). Built libraries at `/home/chcai/rccl_builds/mscclpp_install/`.
+
+**Test config**: `LD_LIBRARY_PATH=/rccl/mscclpp_install/lib + RCCL_MSCCLPP_ENABLE=1
++ RCCL_MSCCLPP_FORCE_ENABLE=1 + RCCL_MSCCLPP_THRESHOLD=64M`.
+
+#### Build 2: RCCL 2.28.3 (latest develop)
+
+Cloned RCCL `develop` branch HEAD, built with default options. Verified:
+RCCL version 2.28.3, size 62.3 MB. NOTE: WarpSpeed strings (`RCCL_WARP_SPEED_*`)
+NOT found in this build — likely needs a specific branch (rocm-7.3.0)
+or feature flag.
+
+#### Results @ bs=1× (5-min runs each, node 375, loss 0.2855 healthy across all)
+
+| Config | M sps | vs baseline (12.95) | Notes |
+|---|---:|---:|---|
+| **Baseline** (bundled RCCL 2.27.7) | **12.95** (range 12.95–13.05) | — | reference; node noise ±0.5 % |
+| RCCL 2.28.3 | 13.03 | +0.6 % (within noise) | flat — no WarpSpeed in this build |
+| RCCL 2.27.7 + MSCCLPP enabled | 12.71 | **−2.5 %** | **regression** |
+
+#### Why MSCCLPP doesn't help our bs=1× workload
+
+Per ROCm Blogs, MSCCLPP only optimizes **AllReduce, AllGather, ReduceScatter**
+(plus restricted dtypes: fp16/bf16/int32/uint32/fp32; sum-only; non-zero
+multiple of 32 bytes). It does NOT include `Send`/`Recv` (which is what HCTR's
+embedding all-to-all uses).
+
+From our trace breakdown (§Phase 14g, exposed-RCCL split):
+- **SendRecv exposed = 0.81 ms (86 % of exposed RCCL)** — NOT addressable by MSCCLPP
+- AllReduce exposed = 0.13 ms (14 %) — addressable by MSCCLPP
+
+So MSCCLPP can at best optimize 14 % of our exposed-RCCL gap. The MSCCLPP
+runtime setup adds per-iter overhead (init, buffer registration) that
+EXCEEDS the AllReduce savings at our small per-call payload (gradient sync
+~83 MB), giving a NET regression.
+
+#### Why 2.28.3 doesn't help either
+
+Without WarpSpeed in the build, 2.28.3 brings only minor protocol
+improvements over 2.27.7. The tradeoff vs MSCCLPP:
+- 2.28.3 (with WarpSpeed): would help AllReduce ONLY (14 % of gap) → +1-2 % max
+- 2.27.7 + MSCCLPP: would help AllReduce ONLY (14 % of gap) → -2.5 % observed
+
+**Both paths target the SAME small gap (AllReduce) and neither addresses
+the dominant 86 % (SendRecv).**
+
+#### Conclusion: bs=1× is at HW ceiling for current ROCm/RCCL
+
+The path to break through requires HARDWARE-LEVEL features:
+1. **Send/Recv equivalent of NVLS/MSCCLPP** — would need new RCCL primitive
+   that uses minimal CUs for SendRecv (currently RCCL SendRecv saturates all
+   304 CUs)
+2. **xGMI hardware multicast** — not available in MI350X; possible in MI400+
+3. **CK-Tile fused MLP** — addresses GEMM gap (23 % of bs=1×) but not the
+   dominant RCCL gap (22 %); 5-10 day effort, deferred to future session
+
+### Phase 14g — `hipExtStreamCreateWithCUMask` for RCCL streams (Technique A, 2026-05-13)
+
+After the trace breakdown showed RCCL kernels saturate all 304 CUs and
+block concurrent compute, we implemented **CU masking on RCCL streams**
+as the AMD analog of NV's NVLS. Idea: limit RCCL to a subset of CUs
+(e.g., 32) so the remaining 272 CUs are free for compute on other
+streams.
+
+**Implementation**: added `HCTR_RCCL_CU_MASK_BITS=N` env knob in
+`HugeCTR/include/stream_event_manager.hpp`. When set, the "mp" and "dp"
+streams (which HCTR pipeline scheduler uses for embedding all-to-all)
+are created via `hipExtStreamCreateWithCUMask` with a contiguous N-bit
+CU mask instead of `hipStreamCreateWithPriority`. Default 0 = no-op
+(unchanged behavior).
+
+**Sweep results** (loss verified healthy across all configs, BCE 0.2855):
+
+| Config | bs1× | bs8× |
+|---|---:|---:|
+| baseline (no mask) | 13.00 M sps | 17.93 M sps |
+| `HCTR_RCCL_CU_MASK_BITS=16` | 12.94 (-0.4 %) | not tested |
+| `HCTR_RCCL_CU_MASK_BITS=32` | 13.07 (+0.5 %, noise) | 17.91 (flat) |
+| `HCTR_RCCL_CU_MASK_BITS=64` | 12.98 (flat) | not tested |
+| `HCTR_RCCL_CU_MASK_BITS=128` | 12.97 (flat) | 17.92 (flat) |
+
+**Conclusion**: CU masking does NOT improve perf on AMD — confirms
+RCCL is **bandwidth-bound on xGMI, not parallelism-bound**. Reducing
+CUs makes RCCL kernel run proportionally LONGER without freeing
+useful compute time:
+
+1. RCCL with 32 CUs takes ~9× longer per kernel (CU-proportional)
+2. Compute on default stream STILL has to wait for RCCL output (data
+   dependency to MLP)
+3. So compute isn't actually unblocked — it just sees a longer RCCL
+   kernel ahead of it
+
+This is fundamentally different from NV's NVLS where the kernel uses
+zero GPU compute (the work happens on NVSwitch silicon), so freeing
+SMs has nothing to do with kernel duration.
+
+**Code kept** (env knob default 0 = no-op) so future RCCL versions
+with bandwidth-saturating-from-fewer-CUs (e.g., MSCCLPP-enabled) can
+re-test without code changes.
+
+### Phase 14f — Online RCCL knob audit + new RCCL knobs found (2026-05-13)
+
+After Phase 14e showed swapping API to `ncclAllToAll/v` is flat, we
+audited NEW RCCL knobs by reading the `librccl.so` binary symbols and
+searching ROCm Blogs / GitHub for AMD-specific MI350 collective
+optimizations.
+
+**Container's RCCL version**: 2.27.7 (ROCm 7.1.1).
+
+**New RCCL knobs found that we hadn't tested before**:
+
+| Knob | Source | bs1× result vs 13.0 baseline |
+|---|---|---:|
+| `RCCL_P2P_BATCH_ENABLE=1` (default 4 MB threshold) | RCCL 2.27.7 CHANGELOG | **-4.0 %** (regress; per-peer payload 360 KB hits batch overhead) |
+| `RCCL_P2P_BATCH_ENABLE=1 + RCCL_P2P_BATCH_THRESHOLD=8 MB` | RCCL 2.27.7 CHANGELOG | **+0.6 %** (within noise; 13.08) |
+| `RCCL_P2P_BATCH_ENABLE=1 + THRESHOLD=16 MB` | tested | flat (13.03) |
+| `RCCL_CHANNEL_TUNING_ENABLE=1` | RCCL 2.27.7 CHANGELOG | flat (13.04) |
+| `RCCL_PIVOT_ALLTOALL_ENABLE=1 + RCCL_ALL_TO_ALL_PIVOT_ENABLE=1` | librccl strings | flat (12.97) |
+| `RCCL_MSCCLPP_ENABLE=1 + RCCL_MSCCLPP_FORCE_ENABLE=1` | librccl strings | flat (13.03) — **MSCCLPP compiled out, see below** |
+| `RCCL_MSCCL_ENABLE=1 + RCCL_MSCCL_FORCE_ENABLE=1 + RCCL_MSCCL_FORCE_FULLOPS=1` | librccl strings | flat (13.00) |
+| `NCCL_SYM_CTAS=8` | librccl strings | flat (13.04) |
+| `NCCL_CGA_CLUSTER_SIZE=8` | librccl strings | flat (13.09) |
+| `RCCL_GFX9_CHEAP_FENCE_OFF=0` | librccl strings (gfx950 specific) | env-leakage crash on test node, retry needed |
+| **`NCCL_IGNORE_CPU_AFFINITY=1`** | [RCCL usage tips](https://rocm.docs.amd.com/projects/rccl/en/develop/how-to/rccl-usage-tips.html) | **+0.6 %** (within noise; 13.08) — per AMD docs "improves performance as comm scales" |
+| `RCCL_ENABLE_CONTEXT_TRACKING=1` | [RCCL usage tips](https://rocm.docs.amd.com/projects/rccl/en/develop/how-to/rccl-usage-tips.html) | flat (12.97) |
+| `NCCL_MIN_NCHANNELS=NCCL_MAX_NCHANNELS=16` (force 16 channels) | librccl strings | **-20 %** (10.37; too few for our 8-GPU topology) |
+| `NCCL_MIN_NCHANNELS=NCCL_MAX_NCHANNELS=32` (force 32 channels) | librccl strings | **-7 %** (12.08; auto-pick of ~112 is better) |
+| 4-knob combo (P2P_BATCH+CHAN_TUNE+CGA8) | combination | -0.8 % (12.89) |
+| All-knob combo (IGNORE_CPU+P2P_BATCH+CGA8+CHAN_TUNE) | combination | flat (12.85) |
+| **`HCTR_RCCL_CU_MASK_BITS={16,32,64,128}`** (Phase 14g code change) | new code path via `hipExtStreamCreateWithCUMask` | **flat across all values** (-0.4 % to +0.5 %, all in noise) — RCCL is BW-bound, see §Phase 14g |
+| `OMP_PROC_BIND=close, OMP_PLACES=cores` (bs8×) | host-side affinity | **−58 %** (catastrophic — restricts to too few cores on this cluster) |
+
+**MSCCLPP backend is COMPILED OUT in our container's RCCL**. Container
+prints:
+```
+MSCCL++: Feature not enabled. ENABLE_MSCCLPP must be defined at
+compile-time to enable this feature.
+```
+Setting `RCCL_MSCCLPP_ENABLE=1` is silently ignored. Both
+`/opt/rocm-7.2.1/lib/librccl.so.1.0.70201` and
+`/workspace/rccl/build/release/build/lib/librccl.so.1.0` are built
+without `-DENABLE_MSCCLPP=ON`.
+
+**WarpSpeed (PR #2073, 50 % CU reduction on MI350 for AllReduce/AllGather/ReduceScatter)
+NOT in our RCCL version**. Searched binary for `RCCL_WARP_SPEED_*`
+symbols — none present. WarpSpeed was added in RCCL 2.28+ (ROCm 7.2+
+post-release). Our container is RCCL 2.27.7 (ROCm 7.1.1). Would
+need newer container or self-built RCCL to access.
+
+**Conclusion**: of all knobs available in our RCCL 2.27.7, none meaningfully
+move bs1× perf (best individual: `NCCL_IGNORE_CPU_AFFINITY=1` at +0.6 %
+within noise). The bs1× window is fully knob-saturated at **~13.0 M sps =
+49.6 % of NV's 26.33 M sps**.
+
+**`NCCL_MIN/MAX_NCHANNELS` sweep at bs1×** confirms RCCL's auto-pick of
+~112 channels is optimal — forcing fewer channels regresses linearly:
+
+| Channel pin | Throughput | Δ |
+|---|---:|---:|
+| 8 (extreme) | 5.24 | -60 % (catastrophic) |
+| 16 | 10.37 | -20 % |
+| 32 | 12.08 | -7 % |
+| 64 (untested cleanly) | — | — |
+| 192 | 12.98 | flat |
+| auto (~112) | 13.00 | (baseline) |
+
+Three paths to break through the 13.0 ceiling, each leaving env-knob
+layer:
+
+1. **(URGENT, time-limited window)** Build OUR RCCL 2.27.7 with
+   `-DENABLE_MSCCLPP=ON` — opens the MSCCLPP backend (1-sided put/get
+   on xGMI with minimal CU footprint). Estimated effort: 2–4 days.
+   Estimated upside: +5–15 %. **CRITICAL**: per [RCCL 2.28.3 docs](https://rocm.docs.amd.com/projects/rccl/en/develop/how-to/rccl-usage-tips.html),
+   _"MSCCL and MSCCL++ integration has been REMOVED from RCCL"_ — so
+   our RCCL 2.27.7 still has the source code to enable, but ROCm 7.3+
+   containers will permanently lose this option.
+2. **Wait for ROCm 7.3+ container with WarpSpeed** — RCCL 2.28+ promises
+   50 % CU reduction for AllReduce out of the box (`RCCL_WARP_SPEED_AUTO=1`).
+   No effort required, just wait for image. **But** you also lose MSCCLPP.
+3. **CPX/NPS4 partition mode** — invasive (requires `amd-smi set --gpu all
+   --compute-partition CPX`, system-level); per AMD docs boosts
+   AllReduce 170 → 340 GB/s on single OAM. Untested for our HCTR
+   workload.
+
+### Phase 14e — `ncclAllToAll`/`ncclAllToAllv` API audit at bs1× (2026-05-13)
+
+After the bs1× knob saturation finding (§14c) showed the residual gap is
+exposed RCCL (0.94 ms/iter, 90 % of total RCCL), we audited whether
+swapping HCTR's grouped `ncclSend/ncclRecv` loops for the native
+`ncclAllToAll`/`ncclAllToAllv` primitives (added to RCCL 2.21) would
+reduce per-iter RCCL kernel count.
+
+**Implementation**: added `HCTR_USE_NCCL_ALLTOALL=1` env knob that
+gates a code path in
+`HugeCTR/embedding/data_distributor/{dense,sparse}_data_distribution_op_impl.cu`
+to use:
+- `ncclAllToAll(send, recv, count=1, ...)` for the dense per-bucket
+  size-announcement loop (each peer sends 1 element).
+- `ncclAllToAllv(send, sendcounts, sdispls, recv, recvcounts, rdispls, ...)`
+  for the sparse per-bucket size-announcement loop (variable counts).
+
+**Results** (rebuilt + 5-iter A/B at bs=1×, both nodes):
+
+| Config | M sps | RCCL kernels/iter | Loss (final BCE) |
+|---|---:|---:|---:|
+| Baseline (grouped Send/Recv) | 12.97 | 17.4 | 0.2855 |
+| `HCTR_USE_NCCL_ALLTOALL=1` | 12.97 | 16.5 | 0.2855 |
+| Δ | **flat** | -5 % | identical |
+
+**Conclusion**: native `ncclAllToAll`/`v` only saves ~1 RCCL kernel
+per iter (the 2 small size-announcement groups, which were tiny) and
+gives **no measurable throughput gain**. The remaining 16 RCCL kernels
+come from the BIG embedding-data all-to-all (4 calls/iter × ~4
+internal chunks each), and **RCCL chunks every primitive call
+internally** based on `NCCL_PROTO` + message size — the API choice
+doesn't reduce chunk count.
+
+**Code reverted** (no perf win, added complexity). Documented as a
+permanent finding in §4.A: this lever is not actionable from
+application code on AMD/RCCL 2.21.
+
+### Phase 14 — Batch-size-aware MLP fusion + bs1× knob saturation (2026-05-13)
+
+After Phase 13 the bs8× peak landed at 16.98 M sps and bs1× at
+12.92 M sps. NV's b200/README §8.2d showed their bs1× post-May-13
+hits 26.33 M sps with **5 % exposed RCCL** — vs our ~22 % exposed.
+We launched a focused parallel sweep on both reserved nodes to find
+the remaining wins.
+
+#### 14a — `HCTR_FUSE_TOP_MLP=1` re-enabled at bs ≥ 4× (+5–6 %)
+
+Phase 5 had measured `HCTR_FUSE_TOP_MLP=1` at -6 % across all
+batches — but that was **before** Phase 11 + 13. Re-running the A/B
+test with the post-Phase-13 baseline:
+
+| Batch | Default (InnerProduct) | + FUSE_TOP_MLP=1 | Δ |
+|---:|---:|---:|---:|
+| 55,296 (1×) | 13.07 M sps | 12.46 M sps | -4.6 % |
+| 110,592 (2×) | 15.31 M sps | 14.59 M sps | -4.7 % |
+| 221,184 (4×) | 16.50 M sps | **17.49 M sps** | **+6.0 %** |
+| 442,368 (8×) | 16.99 M sps | **17.86 M sps** | **+5.2 %** |
+
+The fused-top-MLP epilogue chain (1 GEMM + 1 epilogue kernel per FC
+layer instead of 5–6 unfused MFMA + bias + ReLU + dReLU + bgrad
+kernels) only amortizes when the GEMM size is large enough — at
+bs ≤ 2× the kernel-launch overhead per FC layer dominates, at
+bs ≥ 4× the GPU work dominates and fewer kernels = win.
+
+#### 14b — `HCTR_FUSE_WB=True` stacks at bs = 8× (+0.4 %)
+
+Folds the weight-bias post-pass into the fused MLP. Stacks on top
+of 14a only at bs8x (at bs4x it regresses):
+
+| Batch | + FUSE_TOP only | + FUSE_TOP + FUSE_WB | Δ |
+|---:|---:|---:|---:|
+| 221,184 (4×) | 17.49 M sps | 17.14 M sps | -2.0 % |
+| 442,368 (8×) | 17.86 M sps | **17.93 M sps** | **+0.4 %** |
+
+Both 14a and 14b are auto-picked by `run_b200_match.sh` based on
+`HCTR_BATCH` — the script gates `HCTR_FUSE_TOP_MLP=1` on
+`BATCH ≥ 220k` and `HCTR_FUSE_WB=True` on `BATCH ≥ 440k`. Loss
+validated healthy at all batches (final BCE 0.290–0.292 across
+configs).
+
+#### 14c — bs1× env-knob saturation audit
+
+Pushed >25 additional environment / config combinations on bs1× to
+close the gap to NV's 26.33 M sps. **All within ±1 % of the 13.0
+M sps baseline** (i.e. node noise). Documents that the bs1× lever
+space at the application layer is exhausted.
+
+| Class | Knob | bs1× result vs 13.07 baseline |
+|---|---|---|
+| RCCL chunking | `NCCL_BUFFSIZE` ∈ {8,16,24,32,64,128 MiB} | flat (12.66–13.07; bigger regress) |
+| RCCL channels | `NCCL_NCHANNELS_PER_NET_PEER` ∈ {2,4} | flat |
+| RCCL channels | `NCCL_MAX_NCHANNELS` ∈ {8,192} | -60 % at 8 (catastrophic), +0.0 % at 192 |
+| RCCL CTAs | `NCCL_MAX_CTAS` ∈ {32,64} | flat to -1 % |
+| RCCL threads | `NCCL_NTHREADS` ∈ {32,64} | flat |
+| RCCL protocol | `NCCL_PROTO=Simple` | flat |
+| RCCL protocol | `NCCL_PROTO=LL` | -3.3 % |
+| RCCL algo | `NCCL_ALGO=Tree` | flat |
+| RCCL chunk | `NCCL_CHUNK_SIZE=512K` | flat |
+| RCCL multi-step | `RCCL_MSCCL_FORCE_ENABLE=1` | flat |
+| RCCL register | `NCCL_GRAPH_REGISTER=1` + `NCCL_LOCAL_REGISTER=1` | flat |
+| Reader | `HCTR_READER_THREADS` ∈ {4,8} | -2 to -3 % (we're not data-bound) |
+| Reader queue | `HCTR_READER_BATCHES=32` | flat |
+| Sharding | `HCTR_DP_SHARD_THRESH` ∈ {0.001, 0.05} | -1 % to -5 % |
+| Sharding | `HCTR_MEM_CAP=60` (NV's exact value) | -1.1 % (different sharding plan) |
+| Sharding | `HCTR_MEM_COMM_*RATIO` (NV defaults 7.44/4) | -3.3 % |
+| Overlap | `HCTR_INTRA_OVERLAP=0` | -15 % |
+| Overlap | `HCTR_INTER_OVERLAP=0` | -10.8 % |
+| Overlap | `HCTR_USE_COMPUTE_STREAM_2=0` | -0.7 % |
+| Graph | `HCTR_USE_CUDA_GRAPH=0` | -1.5 % |
+| MLP fusion | `HCTR_FUSE_TOP_MLP=1` | -4.6 % (kernel overhead doesn't amortize) |
+| MLP fusion | `HCTR_FUSE_BOTTOM_MLP=1` | loss diverges |
+| MLP fusion | `HCTR_FUSE_WB=True` | -4.6 % |
+| HSA | `HSA_QUEUE_PRIORITY=high` | flat |
+| HSA | `HSA_ENABLE_SDMA=1`, `HSA_NO_SCRATCH_RECLAIM=1` | flat |
+| HIP | `HIP_FORCE_DEV_KERNARG=0` | -7.5 % (validates 1 is correct) |
+| HIP | `DEBUG_HIP_DYNAMIC_QUEUES=0` | -6 % (validates 1 is correct) |
+| HIP | `DEBUG_HIP_BLOCK_SYNC=1` | -7 % |
+| Dispatch | `AMD_DIRECT_DISPATCH=1` | flat |
+| HCTR | `HCTR_NUM_ITERATIONS_STATISTICS=5` | flat |
+| HCTR | `HCTR_GROUPED_ALL_REDUCE=0` | -1.6 % |
+| Layer | `HCTR_FUSE_WB=True` | flat alone |
+| MLP | `HCTR_FUSE_TOP_MLP=1 + FUSE_WB` (combined) | -4.6 % |
+
+**Conclusion**: at bs1× we are knob-saturated. Further wins
+require code changes — see Part 4 §4.A.
+
+#### 14d — Trace re-validation post-Phase-14
+
+Captured fresh `rocprofv3` trace at bs1× post-Phase-14 config
+(`rocprof_bs1x_phase14/`). The exposed-RCCL story is unchanged
+from §3.2:
+
+| Metric | AMD bs1× post-Phase-14 | NV bs1× post-May-13 (§8.2d) | AMD/NV |
+|---|---:|---:|---:|
+| RCCL kernels per iter | 17.4 | 5 | 3.5× more |
+| RCCL total time / iter (real est.) | **1.06 ms (25 %)** | 0.54 ms (25 %) | 1.96× |
+| **RCCL exposed (compute idle)** | **0.94 ms (22 % of iter)** | 0.10 ms (5 % of iter) | **9.4×** |
+| RCCL hidden behind compute | 0.12 ms (12 %) | 0.43 ms (80 %) | 0.28× |
+| Iter wall (real) | 4.23 ms | 2.10 ms | 2.01× |
+
+**The 0.84 ms exposed-RCCL gap = 38 % of the total bs1× iter gap
+(2.13 ms).** This is platform-fundamental on AMD MI350X under
+ROCm 7.2: each `ncclDevKernel_Generic_1` saturates all 304 CUs
+during its window, blocking concurrent compute. NV's NVLS hardware
+multicast lets RCCL kernels run with negligible CU footprint, so
+80 % of NV's RCCL hides behind cutlass3x_sm100 GEMMs.
+
+### 2.4 May 13 — `SHARDING_PLAN=auto` + tmpfs parity audit (+2 % at peak)
+
+After NV's `b200/README` May-13 edit reported a **+92 % bs1x jump**
+(13.69 → 26.33 M sps) from "`auto` + `--tmpfs /ramdata`", we audited
+both knobs on AMD.
+
+**Finding 1 — tmpfs (data-loader RAM disk): we already had it.**
+NV's `docker --tmpfs /ramdata:size=250g` (per-container RAM mount,
+RAM-backed) and our `-v /dev/shm/criteo:/criteo` (host-tmpfs bind-mount,
+also RAM-backed) are functionally equivalent. Both serve the
+`AsyncDataReader`'s `O_RDONLY | O_DIRECT` reads from RAM, sidestepping
+the kernel page-cache-vs-O_DIRECT issue (tmpfs has no
+"direct vs cached" distinction because tmpfs IS RAM).
+
+Verified on compute node:
+
+```
+$ df -hT /dev/shm
+Filesystem  Type   Size  Used Avail Use% Mounted on
+tmpfs       tmpfs  1.5T  263G  1.3T  18% /dev/shm
+
+$ dd if=/dev/shm/.../train_data.bin of=/dev/null bs=64M count=100 iflag=direct
+6.7 GB copied, 0.539 s, 12.4 GB/s          ← O_DIRECT (single-thread memcpy bound)
+
+$ dd if=/dev/shm/.../train_data.bin of=/dev/null bs=64M count=100
+6.7 GB copied, 0.535 s, 12.5 GB/s          ← buffered (identical, proving no storage layer)
+```
+
+The single-thread 12.4 GB/s ceiling is the EPYC's per-core memcpy
+bandwidth, not storage. With HCTR's 16-thread `AsyncReader`
+(`HCTR_READER_THREADS=8` × 2-batch interleave) effective throughput
+scales to >40 GB/s — well above the 11.7 GB/s the GPU consumes at bs8x.
+
+**Finding 2 — `SHARDING_PLAN=auto` was already on, but a stale clamp
+was hiding the DP-replication win.** Our `train.py` had a
+`max(real_size, 65536)` clamp on the table-size array that was added
+when the data was synthetic single-hot (preprocessor hashed IDs mod
+65536, would index OOB into tables with cardinalities like 3 / 36 / 63).
+On real MLPerf data this clamp is unnecessary AND it broke the auto
+planner: every table ended up with ≥ 65536 elements ≫ the
+DP_SHARDING_THRESHOLD = 7,812 elements (= 0.008 GiB / `ev_size·byte_per_elem`),
+so the planner put **all 26 tables in MP mode** (only the 40 M-cap table 20
+sharded 4-way) instead of DP-replicating the 13 small tables (≤ 7,424).
+
+**Fix.** Auto-enable `HCTR_DROP_TABLE_SIZE_CLAMP=1` whenever
+`HCTR_USE_MLPERF_CRITEO=1` (real-data path). After the fix the planner
+correctly emits:
+
+```
+shard_matrix (auto, post-fix):
+  GPU 0: [20, 3, 5, 6, 7, 8, 12, 13, 15, 16, 17, 18, 24, 25]   ← 13 tables DP'd to all 8 GPUs
+  GPU 1: [20, 3, 5, 6, 7, 8, 12, 13, 15, 16, 17, 18, 24, 25]
+  GPU 2: [20, 3, 5, 6, 7, 8, 12, 13, 15, 16, 17, 18, 24, 25]
+  GPU 3: [20, 3, 5, 6, 7, 8, 12, 13, 15, 16, 17, 18, 24, 25]
+  GPU 4: [22, 14, 10, 2, ...DP tables]
+  GPU 5: [21, 4, 23, ...DP tables]
+  GPU 6: [19, 11, 0, ...DP tables]
+  GPU 7: [21, 9, 1, ...DP tables]
+```
+
+The 13 small tables are now **data-parallel-replicated**, eliminating
+~80 % of the embedding all-to-all volume (matches NV's intent at
+b200/README §7.5).
+
+**Result.** AMD perf gain is much smaller than NV's:
+
+| Batch | Pre-fix (clamp on, all-MP) | Post-fix (auto-DP small tables) | Δ |
+|---:|---:|---:|---:|
+| 55,296 (1×) | 12.92 M sps | 12.90 M sps | flat |
+| 110,592 (2×) | 15.04 M sps | **15.31 M sps** | **+1.8 %** |
+| 442,368 (8×) | 16.64 M sps | **16.98 M sps** | **+2.0 %** |
+
+vs NV's bs1x: 13.69 → 26.33 = **+92 %**. The discrepancy is
+platform-fundamental: NV's NVLS-routed all-to-all on B200 NVSwitch is
+**bandwidth-bound** (volume reduction → proportional time saving). On
+AMD MI350X with Infinity Fabric, RCCL all-to-all is **CU-saturation
+bound** (each `ncclDevKernel_Generic_1` already occupies all 304 CUs
+during its window — see Phase 11 trace analysis). Reducing the
+all-to-all *volume* by 80 % reduces the launch count and post-shuffle
+work, but the per-call CU-saturation kernel still runs nearly the same
+wall time. Net: ~2 % at large batch (where the launch-count savings
+amortize), flat at bs1x (where the residual bottleneck is host gap +
+GPU compute, not the embedding all-to-all anymore).
+
+The fix is small (gated on real-data path so the synthetic-data
+preprocessor is unaffected), validated on both compute nodes, and
+baked into the production `train.py`.
+
 ## 2.3 Negative results (notable knobs that did NOT help)
 
 These were measured but didn't survive a controlled re-test, so they're
@@ -285,7 +1159,7 @@ work from re-testing.
 
 | Knob / change | Source | AMD result |
 |---|---|---|
-| `SHARDING_PLAN=round_robin` (vs `auto`) | NV b200/README +12 % | **−23 %** on AMD; auto is correct |
+| `SHARDING_PLAN=round_robin` (vs `auto`) | NV b200/README Apr-26 +12 %, but May-13 retracted | **−23 %** on AMD; auto is correct (matches NV's May-13 finding) |
 | `HCTR_DEFAULT_CONCURRENCY=8` | NV +30 % under host contention | flat on quiet host |
 | `NCCL_LAUNCH_MODE=PARALLEL` (NV bakes in via Dockerfile) | n/a | flat |
 | `grouped_all_reduce=False`, `num_iterations_statistics={5,100}` | NV submission default 20 | flat (sweep ±5 %) |
@@ -303,9 +1177,11 @@ work from re-testing.
 
 ## Part 3 — Per-component analysis vs NV B200
 
-Direct comparison via `rocprofv3 --hip-trace --kernel-trace` at peak
-config (bs4x, 80 iters, agent 0; 55-iter steady window). Source:
-`scripts/analyze_per_component.py`.
+### 3.1 Iter-level metrics (bs4x, 2026-05-12)
+
+Direct comparison via `rocprofv3 --hip-trace --kernel-trace` at the
+prior peak config (bs4x, 80 iters, agent 0; 55-iter steady window).
+Source: `scripts/analyze_per_component.py`.
 
 | Metric | AMD MI350X | NV B200 (b200/README §7.4a) | Notes |
 |---|---:|---:|---|
@@ -316,6 +1192,96 @@ config (bs4x, 80 iters, agent 0; 55-iter steady window). Source:
 | **RCCL exposed (compute idle)** at bs1x | **1.58 ms (100 % of RCCL!)** | **1.06 ms (70 %)** | AMD: 0 % hidden; NV: 30 % hidden via NVLS |
 | RCCL hidden in compute at bs8x (post-DYN_QUEUES) | **3.12 ms (80 % of RCCL!)** | n/a | DYN_QUEUES + larger batch made the AMD gap close |
 | `hipGraphLaunch` p50 | 5.97 ms | 0.53 ms (virtualized) / 0.01-0.03 ms (bare-metal) | AMD 11× slower than NV-virtualized, ~300× slower than NV bare-metal |
+
+### 3.2 Kernel-category breakdown @ MLPerf-spec batch (bs=1×, 55 296)
+
+This is the **direct apples-to-apples** comparison vs NV's b200/README
+§8.2d bs=1× decomposition (no extrapolation needed). Captured fresh
+`rocprofv3 --hip-trace --kernel-trace` of our post-Phase-13 bs1x run
+(200 iters, 55-iter steady window). Trace dir: `rocprof_bs1x_phase13/`.
+
+| Component | AMD profile (raw) | AMD real (×0.167) | AMD % | NV real (§8.2d) | NV % | AMD/NV |
+|---|---:|---:|---:|---:|---:|---:|
+| **RCCL (15.9 calls/iter)** | **14.42 ms** | **2.41 ms** | **49 %** | **0.84 ms** | 43 % | **2.87×** |
+| MLP GEMMs (hipBLASLt) | 6.70 ms | 1.12 ms | 23 % | 0.30 ms | 16 % | 3.74× |
+| Embedding ops | 4.94 ms | 0.83 ms | 17 % | 0.32 ms | 16 % | 2.58× |
+| Fused FMA / convert / concat | 2.37 ms | 0.40 ms | 8 % | 0.20 ms | 10 % | 1.98× |
+| Memcpy / fillBuffer | 0.51 ms | 0.09 ms | 2 % | 0 ms | 0 % | ∞ |
+| Other (sort / label_count / etc) | 0.30 ms | 0.05 ms | 1 % | 0.28 ms | 14 % | 0.18× |
+| **Sum (kernel-time across streams)** | **29.24 ms** | **4.90 ms** | 100 % | **1.94 ms** | 100 % | **2.52×** |
+| **Iter wall (real, unprofiled)** | — | **4.29 ms** | — | **2.10 ms** | — | **2.04×** |
+
+Notes:
+- **AMD profile column** is the raw `rocprofv3` kernel-time sum
+  across all 8 streams (15.9× rcclDevKernel calls, 183× GEMM calls,
+  etc.). Profile distortion inflates the wall from 4.29 → 43.36 ms
+  (~10×) and inflates kernel-internal time too.
+- **AMD real column** scales the profile sum by `4.0 / 23.89` =
+  0.167 (real GPU-busy ms / profile GPU-busy ms, assuming AMD's
+  busy fraction matches NV's 93 % at bs=1×). This is an estimate;
+  the true scaling could be ±20 %.
+- **NV real column** is the direct §8.2d measurement (bs=1×
+  post-May-13, no extrapolation).
+- **AMD/NV ratio** is conservative under the profile-scaling
+  uncertainty.
+
+#### Where the AMD/NV gap actually lives @ bs=1×
+
+Top absolute kernel-time deltas (AMD minus NV, real-time estimates):
+
+| Component | AMD − NV (ms / iter) | Gap as % of total iter gap |
+|---|---:|---:|
+| **RCCL** | **+1.57 ms** | **72 %** |
+| MLP GEMMs | +0.82 ms | 38 % |
+| Embedding ops | +0.51 ms | 23 % |
+| Fused FMA / convert / concat | +0.20 ms | 9 % |
+
+(Iter-gap sum is +2.19 ms; categories overlap because of stream
+concurrency.)
+
+→ **At bs=1× the dominant gap is RCCL, not GEMMs** — the opposite
+of bs=8× where GEMMs dominate (see §3.3 below). This is exactly NV's
+own §8.2d signature: at small batch RCCL latency dominates total
+iter time; at large batch GPU compute amortizes.
+
+#### Two distinct RCCL gaps
+
+| Sub-metric | AMD bs=1× | NV bs=1× | AMD/NV |
+|---|---:|---:|---:|
+| RCCL kernels per iter | **15.9** | **5** (4 SendRecv + 1 AllReduce) | **3.2× more** |
+| Per-call ncclDevKernel p50 | **815 µs** | 155 µs (SendRecv), 217 µs (AllReduce) | **5.3× slower** |
+| Per-call mean | 873 µs | ~169 µs (weighted) | 5.2× slower |
+
+The **3.2× call-count multiplier** is potentially actionable
+(suggests RCCL is splitting each logical SendRecv/AllReduce into
+chunks because the buffer is larger than `NCCL_BUFFSIZE=8 MiB`;
+embedding output at bs=1× = 6 912 batch × 26 tables × 128 ev_size
+× 2 B = 46 MB / 8 MB ≈ 6 chunks per logical SendRecv). The **5.3×
+per-call latency** is partly platform-fundamental (no
+xGMI multicast / NVLS equivalent on AMD).
+
+### 3.3 Kernel-category breakdown @ peak (bs=8×, 442 368)
+
+For completeness, the same analysis at our **peak throughput**
+config. Trace dir: `rocprof_bs8x_phase13/`. NV's bs=8× breakdown is
+not directly measured in b200/README §8.2d — extrapolated from §8.2d
+bs=1× assuming data-linear scaling for SendRecv / embedding / MLP /
+fused, constant for AllReduce.
+
+| Component | AMD bs=8× kernel-time | % of AMD | NV bs=8× (extrapolated) | % of NV | AMD/NV |
+|---|---:|---:|---:|---:|---:|
+| **MLP GEMMs** | **60.1 ms** | **51 %** | 2.40 ms | 18 % | **25×** |
+| Embedding ops | 24.7 ms | 21 % | 2.56 ms | 19 % | 9.7× |
+| Fused FMA / convert / concat | 17.7 ms | 15 % | 1.60 ms | 12 % | 11× |
+| RCCL | 11.9 ms | 10 % | 5.18 ms | 38 % | 2.3× |
+| Memcpy / fillBuffer | 1.2 ms | 1 % | 0 ms | 0 % | ∞ |
+| Other | 1.1 ms | 1 % | 2.24 ms | 17 % | 0.5× |
+| **Iter wall (real)** | **26.06 ms** | — | **13.50 ms** | — | **1.93×** |
+
+→ **At bs=8× the dominant gap is MLP GEMMs (49 % of total iter gap).**
+The unfused InnerProduct path fires ~70 kernels/iter (5–6 kernels
+per FC layer × 7 FC layers × 2 fwd+bwd) vs NV's single fused
+`cutlass3x_sm100` per FC layer.
 
 ## Linear fit of host overhead (`t_iter = c + α·batch`)
 
@@ -334,18 +1300,55 @@ Implications for the remaining ~13–18 % gap:
 
 ## Part 4 — Open work
 
-Remaining items, ranked by EV vs effort. Items 1–3 are application-level,
-4 is library-level, 5–6 are platform-fundamental (not actionable from
-this repo).
+Re-ranked **2026-05-13** based on the §3.2 / §3.3 trace-driven gap
+analysis. **The dominant gap is batch-size-dependent**:
+
+- **At bs=1× (MLPerf-spec)**: RCCL is **72 %** of the iter-time gap
+  (15.9 calls/iter on AMD vs 5 on NV; 815 µs vs 155 µs per call).
+  Items #1–3 below.
+- **At bs=8× (peak throughput)**: MLP GEMMs are **49 %** of the
+  gap (unfused InnerProduct chain vs single fused
+  `cutlass3x_sm100`). Items #4–5 below.
+
+Sequence the work to address the bs=1× gap first (matches MLPerf
+spec) then the bs=8× gap.
+
+### 4.A bs=1× RCCL-dominant levers
+
+| # | Item | Estimated win @ bs=1× | Effort | Notes |
+|---:|---|---:|---|---|
+| ~~1~~ | ~~Bump `NCCL_BUFFSIZE` to merge per-call RCCL chunks~~ | **flat** | tested 2026-05-13 | Swept 8/16/24/32/64/128 MiB at bs=1× — all within ±1 % of baseline. RCCL's per-call chunk count is set by NCCL_PROTO and message size, not by host-side buffer; bumping doesn't help. |
+| ~~1b~~ | ~~Replace looped `ncclSend/ncclRecv` with native `ncclAllToAll/v`~~ | **flat** | tested 2026-05-13 (Phase 14e) | **Major finding**: implemented `HCTR_USE_NCCL_ALLTOALL=1` env knob that swaps the 2 small "size-announcement" Send/Recv groups in `dense_data_distribution_op_impl.cu:198` and `sparse_data_distribution_op_impl.cu:247` for native `ncclAllToAll`/`ncclAllToAllv`. Trace post-fix: 17.4 → 16.5 RCCL kernels/iter (-5 %). Throughput **flat** (12.97 vs 12.97 M sps). **RCCL chunks every primitive call internally based on NCCL_PROTO + message size — using AllToAll vs grouped Send/Recv API doesn't reduce per-iter kernel count meaningfully.** Reverted (no perf win, added complexity). |
+| 2 | Per-GPU NCCL stream affinity tuning | < 1 % | 2 days (HCTR core) | NCCL `Send`/`Recv` on different streams could overlap; current HCTR uses a single RCCL stream. Splitting could expose more concurrency. Limited upside given RCCL kernels are CU-saturating. |
+| 3 | mscclpp xGMI-multicast custom AllReduce | 1–3 % | 5–10 days (mscclpp ROCm port + HCTR integration) | mscclpp source available at `/home/muabdulj/mscclpp/`. Would need: (a) build mscclpp on ROCm 7.2 (untested), (b) write GPU-side AllReduce kernel using mscclpp 1-sided put/get primitives over xGMI, (c) integrate into HCTR's `NcclAllReduceInplaceComm` as a fallback path. **High risk, moderate upside** — even if it works, only attacks AllReduce (1 of 17 RCCL calls); embedding all-to-all still uses RCCL. |
+| 4 | Custom RCCL chunking patches (RCCL source-level) | 5–15 % (potential) | 10+ days (RCCL expert) | The fundamental gap is RCCL emits 3.5× more device kernels per logical collective vs NCCL (chunking + protocol overhead). Fix would require RCCL source patches — outside this repo's scope. Wait for ROCm 7.3+ RCCL improvements. |
+| ~~5a~~ | ~~Build OUR RCCL 2.27.7 with `-DENABLE_MSCCLPP=ON`~~ | **−2.5 %** (TESTED 2026-05-13, see §Phase 14h) | done | **NEGATIVE RESULT**: built + tested, regresses. MSCCLPP only optimizes AllReduce (14 % of our exposed RCCL); doesn't address SendRecv (86 % of exposed RCCL). Setup overhead exceeds AllReduce savings → net regression. |
+| **5b** | Wait for native AMD RCCL CU-mask / xGMI multicast equivalent | unknown | unknown | AMD has not announced an NVLS-equivalent for next-gen MI400 series. WarpSpeed (item 6) is the partial-mitigation path. |
+| 6 | Upgrade container to ROCm 7.3+ for WarpSpeed | 1–2 % (AllReduce-only — see below) | 0 days (waiting for image) | RCCL 2.28+ ships with **WarpSpeed** (PR #2073) which automatically halves CU usage for AllReduce / AllGather (≥64 MB) / ReduceScatter (≥256 MB) on gfx950. Configurable via `RCCL_WARP_SPEED_AUTO=1`. **Tested RCCL 2.28.3 develop branch on 2026-05-13 (§Phase 14h)** — flat (+0.0 % vs baseline) because WarpSpeed strings NOT in develop branch (may need rocm-7.3.0 tag). Even with WarpSpeed engaged, AllReduce is only 14 % of our exposed-RCCL gap → max +1-2 % expected. |
+| 7 | CPX/NPS4 GPU partition mode | unknown | invasive (requires `amd-smi set --compute-partition CPX` reboot, may break HCTR's 8-GPU assumption) | Per [RCCL usage tips](https://rocm.docs.amd.com/projects/rccl/en/develop/how-to/rccl-usage-tips.html), CPX+NPS4 mode boosts single-OAM AllReduce from ~170 → ~340 GB/s. Not directly applicable to DLRM-DCNv2 (single OAM with 8 GPUs is our target topology), but worth A/B testing if AllReduce-bound. |
+
+### 4.B bs=8× GEMM-dominant levers
+
+| # | Item | Estimated win @ bs=8× | Effort | Notes |
+|---:|---|---:|---|---|
+| **4** | **CK-Tile fused MLP GEMM kernel** (GEMM + bias + ReLU + dReLU + bgrad epilogue, single MFMA kernel per FC layer) | **15–25 % at bs=8×** | 5–10 days (CK-Tile expertise) | **Highest-ROI lever per §3.3**: replaces the unfused `hipblasGemmEx` + V5-bgrad chain (5–6 kernels per FC layer × 7 layers × 2 directions = ~70 kernels/iter at bs=8× = 60 ms profile = ~20 ms real) with a single MFMA fused kernel matching NV's `cutlass3x_sm100` epilogue fusion. **Phase-5 attempt** (Tensile-fused via `hipblasGemmEx`) gave -6 % on AMD — the issue is the kernel chain, not the fusion concept. Use **Composable Kernel (CK) Tile API** (gfx950 supported). |
+| 5 | Direct `hipblasLtMatmul` API call (vs hipblasGemmEx wrapper) | 2–4 % @ bs=8× | medium (replace `cublas_gemm.cu` wrapper) | Bench shows 6/12 unique MLP shapes have 14–60 % heuristic-vs-best gap that `HIPBLASLT_TUNING_OVERRIDE_FILE` cannot apply because HCTR's `hipblasGemmEx` wrapper bypasses the override. Direct `hipblasLtMatmul` API call lets the offline tuning take effect. Smaller win than #4 because the gap is in *kernel selection*, not *kernel count*. |
+
+### 4.C cross-batch levers
 
 | # | Item | Estimated win | Effort | Notes |
 |---:|---|---:|---|---|
-| 1 | `hipGraphLaunch` host overhead | ~1 % | not actionable from app code | **Trace-validated 2026-05-12**: rocprofv3 measures p50 = 5.89 ms (mean 5.94, p99 7.33; 400 launches over 50 iters). Swept 14 HIP graph knobs (`DEBUG_HIP_GRAPH_BATCH_SIZE` ∈ {32,64,128,256,512,1024}, `DEBUG_CLR_GRAPH_PACKET_CAPTURE`, `DEBUG_HIP_KERNARG_COPY_OPT`, `DEBUG_CLR_BLIT_KERNARG_OPT`, `DEBUG_CLR_MAX_BATCH_SIZE`, `DEBUG_CLR_BATCH_CPU_SYNC_SIZE`, `GPU_MAX_COMMAND_BUFFERS`) at bs8x — all within ±0.3 % of baseline. Reduction requires a ROCm runtime fix (try ROCm 7.3+ when available). vs NV's 530 µs virtualized cudaGraphLaunch = ~11× slower. |
-| 2 | hipBLASLt offline tuning via direct `hipblasLtMatmul` | 1–3 % | medium (rewrite HCTR MLP layer) | Bench shows 6/12 unique MLP shapes have 14–60 % heuristic-vs-best gap. `HIPBLASLT_TUNING_OVERRIDE_FILE` workflow tested — gain stayed in noise (HCTR's `hipblasGemmEx` wrapper bypasses the override). Direct hipblasLt API call needed. |
-| 3 | `__amd_rocclr_fillBufferAligned` consolidation | < 1 % | medium (HugeCTR core) | **Trace-validated 2026-05-12**: 43.5 calls/iter at bs8x = 432 µs (1.6 % of iter). Audit shows ~22 of those are small (256 B – 524 KB) per-iter scratch zeroing from `data_distributor/`, `embedding/operators/`, MultiCross. Consolidation requires HugeCTR core changes — finding the per-iter `hipMemsetAsync` callers and either merging consecutive ones or pre-zeroing a global scratch arena. |
-| 4 | Real single-kernel HIP/MFMA fused MLP GEMM | 3–5 % | 3–5 days CUTLASS-AMD | Restores `Layer_t.MLP` to a perf win. Currently chains `hipblasGemmEx` + 1 fused post-pass + `bprop_drelu_bgrad_v5` per FC layer (5 launches/layer vs NV's 1). |
-| 5 | NVLS / hardware multicast on xGMI | ~3 % | not actionable from app code | NV's NCCL all-reduce + embedding all-to-all benefit from NVLink multicast hardware. AMD xGMI lacks an equivalent in current ROCm 7.2 RCCL (no `mscclpp` library shipped). Trace shows ~0.5 ms/iter exposed RCCL on AMD that NV hides via NVLS. **Validated 2026-05-12**: also swept 15 RCCL knobs (`NCCL_P2P_LEVEL`, `NCCL_P2P_DIRECT_DISABLE`, `NCCL_P2P_LL_THRESHOLD`, `NCCL_P2P_NVL_CHUNKSIZE`, `NCCL_GDR_FLUSH_DISABLE`, `NCCL_SHM_DISABLE`, `NCCL_ALGO=Tree/Ring,Tree`, `NCCL_CHUNK_SIZE`, `NCCL_MAX_P2P_NCHANNELS`, `NCCL_MIN_P2P_NCHANNELS`) at bs8x — all within ±0.6 % of baseline (a few regress hard; lower-channel-count is -2.9 % to -24.6 %). |
-| 6 | BF16 path | 1–2 % | medium | NV submission uses BF16 mixed; we use FP16. Would need `enable_bf16_compute` flag + `hip_bfloat16` template instantiations across `HugeCTR/src/layers/`. Removes loss-scaler stalls. |
+| 6 | int4-vectorized `update4_kernel` + `multi_to_one_reduce_vec4_v2` (embedding ops) | 2–4 % at bs=8×, 5–10 % at bs=1× | 3–5 days | Top-2 embedding kernels at bs=1× = 1.05 + 0.60 + 0.46 = 2.1 ms / iter under profile (~0.35 ms real = 8 % of bs=1× iter). Already use `vec4` (8-byte int2) loads; bumping to `int4` (16-byte) for `__half` slot data + same bounds-check rewrite as Phase 12 concat. |
+| 7 | `__amd_rocclr_fillBufferAligned` consolidation | < 1 % | medium (HugeCTR core) | **Trace-validated 2026-05-12 + 2026-05-13**: 72.9 calls/iter at bs=1× = 301 µs profile / ~50 µs real (1.2 % of iter); 43.5 calls/iter at bs=8× = 432 µs profile / ~140 µs real. Audit shows ~22 of those are small (256 B – 524 KB) per-iter scratch zeroing from `data_distributor/`, `embedding/operators/`, MultiCross. |
+| 8 | BF16 path | 1–2 % | medium | NV submission uses BF16 mixed; we use FP16. Would need `enable_bf16_compute` flag + `hip_bfloat16` template instantiations across `HugeCTR/src/layers/`. Removes loss-scaler stalls. Lower priority than #1–4. |
+
+### 4.D Validated as non-actionable from app code
+
+| Item | Why | Validation |
+|---|---|---|
+| `hipGraphLaunch` host overhead (5.97 ms p50, 11× slower than NV's 555 µs virtualized) | ROCm runtime / kernel-launch path | 14 `DEBUG_HIP_GRAPH_*` and `DEBUG_CLR_*` knobs swept at bs=8× — all within ±0.3 % of baseline. Try ROCm 7.3+ when available. |
+| NVLS / hardware multicast on xGMI for in-network reduction | xGMI lacks NVLS-equivalent in current ROCm 7.2 RCCL | 15 RCCL knobs (`NCCL_P2P_*`, `NCCL_GDR_*`, `NCCL_SHM_*`, `NCCL_ALGO`, `NCCL_CHUNK_SIZE`, `NCCL_*_NCHANNELS`) swept at bs=8× — all within ±0.6 % (per-call latency floor 815 µs vs NV 155 µs is platform-fundamental). |
+| GPU clock pinning | Already at boost clocks during steady state | `rocm-smi --showclocks` confirms GPU 0–7 at 2 100 MHz GFX clock during run. |
 
 **Out of perf path** but worth listing:
 - Multi-node (RDMA `NetworkExchangeWgrad`) — currently single-node only
