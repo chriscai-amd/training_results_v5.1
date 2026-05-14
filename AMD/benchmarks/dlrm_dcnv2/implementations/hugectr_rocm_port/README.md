@@ -316,7 +316,24 @@ by re-running `scripts/analyze_per_component.py` against the
 `rocprof_bs4x_*/` and `rocprof_bs8x_phase13/` trace dirs that remain
 in-tree.
 
-### 3.1 Kernel-category breakdown @ MLPerf-spec batch (bs=1×, 55 296)
+### 3.1 Latest status — bs=1× throughput gap vs NV B200
+
+Steady-state samples/s @ MLPerf-spec global batch 55 296 (bs=1×, real
+MLPerf Criteo on `/dev/shm`, 8 × MI350X / 8 × B200, FP16 mixed).
+
+| Platform | M samples/s @ bs=1× | ms/iter | Ratio (AMD ÷ NV) | Gap to NV |
+|---|---:|---:|---:|---:|
+| AMD MI350X (this port, post-Phase-14p, 2026-05-14) | **13.07** | 4.23 | **0.496×** | **−50.4 %** |
+| NV B200 (companion `b200/README-b200-1x8.md` May-13 auto+tmpfs) | **26.33** | 2.10 | 1.000× | — |
+
+**AMD reaches 49.6 % of NV B200 throughput at bs=1×** — i.e. NV is
+**2.01× faster**, leaving an **absolute +2.13 ms/iter** gap to close.
+Per the §3.2 trace decomposition below, **72 %** of that 2.13 ms gap
+is RCCL latency (5.3× per-call slowdown × 3.2× more calls), making
+RCCL-side improvements the highest-leverage open work for bs=1×
+(see Part 4 §4.1 for the prioritized plan).
+
+### 3.2 Kernel-category breakdown @ MLPerf-spec batch (bs=1×, 55 296)
 
 This is the **direct apples-to-apples** comparison vs NV's b200/README
 §8.2d bs=1× decomposition (no extrapolation needed). Captured fresh
@@ -406,8 +423,8 @@ Implications for the remaining ~13–18 % gap:
 
 | Rank | Item | Est. bs=1× win | Effort | Notes |
 |---:|---|---:|---|---|
-| 1 | **Custom RCCL chunking patches (RCCL source-level)** | **5–15 %** | 10+ days, RCCL expert | Fundamental gap per §3.1: RCCL emits **3.2 × more device kernels** per logical collective vs NCCL (chunking + protocol overhead — 15.9 vs 5 calls/iter at bs=1×). RCCL chunks every primitive call internally based on `NCCL_PROTO` + message size; host-side `NCCL_BUFFSIZE` / native `ncclAllToAll` API swaps were both flat (see §4.2). Real fix is RCCL source patches — outside this repo's scope. |
-| 2 | **int4-vectorized embedding ops** (`update4_kernel` + `multi_to_one_reduce_vec4_v2`) | **5–10 %** | 3–5 days | Top embedding kernels consume ~2.1 ms/iter profile (~0.35 ms real = 8 % of bs=1× iter, per §3.1 trace). Already use `vec4` (8-byte int2) loads; bump to `int4` (16-byte) for `__half` slot data — same bounds-check rewrite pattern as Phase 12 concat (which landed +1.5 % at bs=8× via the same lever). Self-contained inside `embedding_storage/ragged_static_embedding.cu`. |
+| 1 | **Custom RCCL chunking patches (RCCL source-level)** | **5–15 %** | 10+ days, RCCL expert | Fundamental gap per §3.2: RCCL emits **3.2 × more device kernels** per logical collective vs NCCL (chunking + protocol overhead — 15.9 vs 5 calls/iter at bs=1×). RCCL chunks every primitive call internally based on `NCCL_PROTO` + message size; host-side `NCCL_BUFFSIZE` / native `ncclAllToAll` API swaps were both flat (see §4.2). Real fix is RCCL source patches — outside this repo's scope. |
+| 2 | **int4-vectorized embedding ops** (`update4_kernel` + `multi_to_one_reduce_vec4_v2`) | **5–10 %** | 3–5 days | Top embedding kernels consume ~2.1 ms/iter profile (~0.35 ms real = 8 % of bs=1× iter, per §3.2 trace). Already use `vec4` (8-byte int2) loads; bump to `int4` (16-byte) for `__half` slot data — same bounds-check rewrite pattern as Phase 12 concat (which landed +1.5 % at bs=8× via the same lever). Self-contained inside `embedding_storage/ragged_static_embedding.cu`. |
 | 3 | **mscclpp xGMI-multicast custom AllReduce** | 1–3 % | 5–10 days | mscclpp source available at `/home/muabdulj/mscclpp/`. Need: (a) build mscclpp on ROCm 7.2 (untested), (b) write GPU-side AllReduce using mscclpp 1-sided put/get over xGMI, (c) integrate into HCTR's `NcclAllReduceInplaceComm` as a fallback path. **Only attacks AllReduce (1 of 17 RCCL calls)**; embedding all-to-all still uses RCCL → bounded upside. |
 | 4 | **ROCm 7.3+ container upgrade for WarpSpeed** (`RCCL_WARP_SPEED_AUTO=1`) | 1–2 % | 0 days dev (waiting on image) | RCCL 2.28+ ships **WarpSpeed** (PR #2073) which halves CU usage for AllReduce / AllGather / ReduceScatter on gfx950. Tested RCCL 2.28.3 develop branch on 2026-05-13 (commit [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)) — flat: WarpSpeed strings not in develop branch (needs rocm-7.3.0 tag). AllReduce is only 14 % of exposed-RCCL → max +1-2 % even when engaged. Free win when image ships. |
 | 5 | **BF16 mixed precision path** | 1–2 % | medium | NV submission uses BF16 mixed; we use FP16. Need `enable_bf16_compute` flag + `hip_bfloat16` template instantiations across `HugeCTR/src/layers/`. Eliminates loss-scaler stalls. |
@@ -427,7 +444,7 @@ Sequence: items 1+2 in parallel (different code areas, additive gain). Item 4 la
 | **RCCL emits 3.2 × more device kernels per logical collective than NCCL** | Bumped `NCCL_BUFFSIZE` 8 / 16 / 24 / 32 / 64 / 128 MiB; replaced looped `ncclSend` / `ncclRecv` with native `ncclAllToAll` / `ncclAllToAllv` API (Phase 14e, `HCTR_USE_NCCL_ALLTOALL=1`) | All flat at bs=1×. Trace: 17.4 → 16.5 RCCL kernels/iter (-5 %). Reverted as no-perf-win, added complexity. **RCCL chunks every primitive call internally based on `NCCL_PROTO` + message size** — host-side levers don't change kernel count | RCCL upstream (item #1 in §4.1 = real fix) |
 | **CK-Tile MLP backward dgrad as bs=1× win** | Implemented end-to-end CK-Tile dgrad path (Phase 14p.2): new `hctr_cktile_gemm_dgrad_fp16` entry point, zero-bias-buffer workaround for upstream `Ds tuple > 0` static_assert, init API called pre-graph-capture, mlp_layer.cu integration with hipblas fallback. Bit-exact validated against CPU reference + hipBLAS | bs=1× **+0.3 % (noise)**; bs=8× **−24.9 % regression** (CK-Tile fixed 128×128×32 tile is wrong shape vs hipBLASLt's per-shape picks at large M). Code kept gated default-OFF as scaffold | Would need CK-Tile multi-tile dispatch OR fused bwd megakernel (dgrad + wgrad + bgrad + dRELU in one MFMA kernel) — multi-week effort |
 | **MSCCLPP custom AllReduce (HCTR-internal)** | Built RCCL 2.27.7 with `-DENABLE_MSCCLPP=ON` (Phase 14h, commit [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)) | **−2.5 % regression**. MSCCLPP only optimizes AllReduce (14 % of exposed RCCL); setup overhead exceeds savings | (use mainline RCCL; revisit if RCCL exposes mscclpp-on-demand path) |
-| **Per-shape hipBLASLt offline tuning at bs=1×** | `HIPBLASLT_TUNING_OVERRIDE_FILE` deployed | HCTR's `hipblasGemmEx` wrapper bypasses the override path → tunings never apply. Would need direct `hipblasLtMatmul` refactor | 3–5 day refactor, but per §3.1 the bs=1× MLP-GEMM gap is only +0.82 ms (38 % of iter gap) — bounded upside; deferred |
+| **Per-shape hipBLASLt offline tuning at bs=1×** | `HIPBLASLT_TUNING_OVERRIDE_FILE` deployed | HCTR's `hipblasGemmEx` wrapper bypasses the override path → tunings never apply. Would need direct `hipblasLtMatmul` refactor | 3–5 day refactor, but per §3.2 the bs=1× MLP-GEMM gap is only +0.82 ms (38 % of iter gap) — bounded upside; deferred |
 | **GPU clock pinning / boost** | `rocm-smi --showclocks` audit during steady state | Already at 2 100 MHz GFX boost during run — no headroom | (n/a) |
 
 ## Vendored upstream content
