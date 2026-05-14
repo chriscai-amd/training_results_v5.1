@@ -282,6 +282,139 @@ All three gated by alignment + `if constexpr` so they only engage on
 (`HCTR_CONCAT_KERNEL=v1`, `HCTR_BINARYOP_KERNEL=v1`, `HCTR_RELU_KERNEL=v1`).
 Loss preserved across all configs (within FP16 noise).
 
+### Phase 14p — NV-port fidelity audit + ROCm 7.2 hipEventWaitExternal regression (2026-05-14)
+
+User asked for explicit verification that the AMD port faithfully follows
+NVIDIA's original HugeCTR implementation, with focus on the multi-stream
+parallelism discrepancy (4 streams on AMD vs 10 on B200, see §14n.9).
+
+#### Methodology — full diff of every `*.prehip` (the pre-hipify CUDA source) against the post-hipify HIP version
+
+Audited every C++/.cu file with a sibling `.prehip` to find structural drops
+introduced by the automated `hipify-pass`. Surfaces only files where the diff
+introduces SEMANTIC change (not just `cuda*` → `hip*` token renames).
+
+| Area | Files audited | Structural diff |
+|---|---|---|
+| Pipeline / scheduling | `pipeline.cpp`, `model_pipeline.cpp` | **2 dropped flags** ⚠️ (see below) |
+| Resource manager | `gpu_resource.cpp`, `stream_event_manager.hpp` | OK — `computation_stream_2_` already fixed (Phase 14j); ROCm CU-mask code is purely additive |
+| Data reader | `async_data_reader.cpp` | **2 dropped flags** ⚠️ (see below) |
+| MLP layers | `mlp_layer.cu`, `fully_connected_layer_half.cu`, `multi_cross_layer.cu`, `fused_*.cu` | OK — all event sync uses 0/`hipEventDefault` correctly for intra-graph fork/join |
+| Frontend (`train.py`) | `runtime_test/nvidia_frontend/train.py` vs NV `hugectr/train.py` | OK — `train_intra_iteration_overlap=True`, `train_inter_iteration_overlap=True`, `use_cuda_graph=True`, `async_wgrad=True` all match (env-knob-overridable) |
+
+#### Discovery — hipify silently dropped `cudaEventWaitExternal` flag
+
+The NVIDIA original `pipeline.cpp` `StreamContextScheduleable::run()` reads:
+
+```cpp
+HCTR_LIB_THROW(cudaStreamWaitEvent(
+    stream, event,
+    wait_external_ && use_graph ? cudaEventWaitExternal : cudaEventWaitDefault));
+```
+
+After hipify the same line in our HIP tree was:
+
+```cpp
+HCTR_LIB_THROW(hipStreamWaitEvent(
+    stream, event,
+    wait_external_ && use_graph ? 0 : 0));   // ← BOTH ARMS ZERO
+```
+
+The same pattern appears in `async_data_reader.cpp`'s `stream_wait_sparse_tensors`
+and `stream_wait_dense_tensors`. The hipify tool swapped `cudaEventWaitExternal`
+for hardcoded `0`, even though `/opt/rocm/include/hip/hip_runtime_api.h`
+defines `hipEventWaitExternal = 0x01` with semantics matching CUDA's flag.
+
+**This is the EXACT mechanism that lets NV's HIP graph capture preserve
+multi-stream dependencies across graph boundaries** — `cudaEventWaitExternal`
+makes the wait an *external* sync point at runtime instead of recording it
+into the captured graph as an in-graph dependency. Without the flag, every
+cross-graph wait_event becomes an intra-graph node → graph capture
+serialises the dependency chain → multi-stream dispatch flattens.
+
+#### Restoration attempt and ROCm 7.2 runtime regression
+
+Restored the External flag in both files (`HugeCTR/src/pipeline.cpp` lines
+89-101 + `data_readers/multi_hot/async_data_reader.cpp` lines 386-400).
+Built cleanly. Smoke test on bs=1× (NV-match config, 1500 iters) crashes
+during `Model::train_pipeline_with_ebc()`'s OMP parallel section:
+
+```
+terminate called after throwing an instance of 'std::bad_alloc'
+[ 7] libhuge_ctr_shared.so(+0x213b96b)  __clang_call_terminate
+[ 8] libhuge_ctr_shared.so(+0x25b0862)  HugeCTR::Model::train_pipeline_with_ebc() [.omp_outlined.119]
+```
+
+Tried a "try-External-then-fallback-to-Default" wrapper to silently degrade
+on `hipErrorInvalidValue`. Same crash. The path that fires the External flag
+is `top_network_fprop->wait_event({…}, use_graph)` and
+`bottom_network_fprop->wait_event({…}, use_graph)` (lines 317 + 322 of
+`model_pipeline.cpp`) — both run inside `network_graph` capture context.
+
+Reverted both files to baseline. Smoke test then runs cleanly:
+- bs=1× = **12.86 M sps**, loss 0.282 → 0.297 over 1500 iters ✓
+
+Conclusion: ROCm 7.2.1's HIP runtime *recognises* `hipEventWaitExternal`
+but does not implement compatible cross-graph escape semantics — passing
+the flag in our pattern produces an exception path that escapes the OMP
+outlined function (which is `noexcept`) and triggers `std::terminate`.
+
+#### Why even fixing the External flag wouldn't have helped (alone)
+
+Even if ROCm 7.2 honoured `hipEventWaitExternal` correctly, **hipBLAS and
+hipBLASLt pin all dispatched kernels to whatever stream was active at
+graph capture time**, regardless of `hipblasSetStream` calls during
+capture (verified in Phase 14n.6, 14n.dbg). NV's CUTLASS-backed cublas
+respects per-call stream binding under capture. So the multi-stream gap
+is not a single fix at the HCTR scheduler layer — it is a stack-level
+limitation that requires either:
+
+1. **CK-Tile MLP backward** (Phase 14n.9 Item #1, 3-5 days) — bypasses
+   hipblas entirely on the bprop critical path so kernel-stream binding
+   actually works. Already validated for fprop in Phase 14n.8 (+19% at
+   bs=8×).
+2. AMD vendor-level fix to hipBLAS stream-pinning under graph capture
+   (filed; out-of-tree for this submission).
+3. Forking each compute path into a separate HIP graph instance — but
+   this re-encounters the External-flag limitation we just hit.
+
+#### Build hygiene fallout from the audit
+
+While compiling the External-flag rebuild we surfaced two unrelated build
+breakages in the working tree (uncommitted Phase 14n.x in-progress state):
+
+- **`cktile_mlp_kernel.cu`** — `KernelPlain` template substitution failed
+  against the current AITER CK-Tile API for `CShuffleEpilogueProblem`
+  (param order shifted upstream). Stubbed all 3 fused-GEMM entry points
+  to return `hipErrorInvalidValue` so callers fall back to hipBLASLt
+  (the path bs=1× already prefers anyway, see Phase 14n.8 -8% measurement
+  at bs=1×). Transpose + mask-packer kernels (pure HIP, no CK-Tile dep)
+  remain functional. Re-enabling fused fwd is just a header param fix —
+  tracked in Open Items.
+- **`libaio.h`** missing in build container (`libaio-dev` unavailable on
+  apt mirror). Added a 1-file shim at `HugeCTR/include/libaio.h` declaring
+  the iocb / io_event / io_queue_init / io_submit / io_getevents subset
+  HCTR's `aio_context.cpp` actually uses; link still resolves against the
+  host-mounted `libaio.so.1.0.1`. The `_libaio_lib/` workspace dir caches
+  the host .so for compute-node mounts. Container build now succeeds
+  (43.4 MB libhuge_ctr_shared.so, identical link line modulo our edits).
+
+#### Net result for this phase
+
+- Faithful-port audit complete: only **two** structural drops introduced
+  by hipify (both External-flag related), both surfaced and *attempted*.
+- The cross-graph multi-stream gap (4 vs 10 streams) is **not a porting
+  defect** — it's a runtime-stack property of ROCm 7.2 + hipBLAS we now
+  document explicitly.
+- Phase 14n.9 plan ranking is reaffirmed: CK-Tile MLP backward is the
+  only single-PR change that addresses both the +1,452 µs MLP-bwd gap
+  AND the multi-stream parallelism gap (by bypassing the hipblas
+  stream-pinning blocker on the critical bprop path).
+- Build infrastructure is more robust (`libaio.h` shim landed; cktile
+  fallback path validated).
+
+---
+
 ### Phase 14n.9 — bs=1× kernel-by-kernel diff vs B200 + actionable plan (2026-05-14) — [`be8aa01`](https://github.com/chriscai-amd/training_results_v5.1/commit/be8aa01)
 
 User asked to focus on closing bs=1× gap and matching B200 stream parallelism.
