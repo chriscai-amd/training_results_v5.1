@@ -1,0 +1,4 @@
+/apps/chcai/hugectr_rocm_port/runtime_test/build/CMakeFiles/hugectr_rocm_smoke.dir
+/apps/chcai/hugectr_rocm_port/runtime_test/build/CMakeFiles/embedding_test.dir
+/apps/chcai/hugectr_rocm_port/runtime_test/build/CMakeFiles/edit_cache.dir
+/apps/chcai/hugectr_rocm_port/runtime_test/build/CMakeFiles/rebuild_cache.dir

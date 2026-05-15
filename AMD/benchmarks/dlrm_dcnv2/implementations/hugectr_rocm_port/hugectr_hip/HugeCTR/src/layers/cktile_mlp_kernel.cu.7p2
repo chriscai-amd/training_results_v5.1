@@ -1,0 +1,299 @@
+// CK-Tile fused MLP kernel implementation (.cu, separately compiled with isolated flags).
+// Public API in HugeCTR/include/cktile_mlp_kernel.hpp uses extern "C" so this file
+// can be compiled WITHOUT HCTR-specific defines (-fopenmp, warp-mask shim include,
+// etc.) that break CK-Tile's WarpGemmDispatcher template instantiation.
+//
+// Build flags (configured in HugeCTR/src/CMakeLists.txt via set_source_files_properties):
+//   - GPU arch: gfx950
+//   - C++17
+//   - O2
+//   - NO -fopenmp, NO -include warp-mask shims
+//
+// Phase 14p re-enable (2026-05-14): the Phase 14n.8 working version was broken
+// when the upstream CK-Tile (in /opt/rocm/include/ck_tile) added `MemoryOperation`
+// as REQUIRED template parameter #17 in `CShuffleEpilogueProblem`. Restored by
+// passing `memory_operation_enum::set` after `isCTransposed`. KernelPlain (no
+// bias/relu) is implemented via GemmKernelMultiD with empty Ds tuple.
+
+#include "ck_tile/core.hpp"
+#include "ck_tile/host.hpp"
+#include "ck_tile/ops/gemm.hpp"
+#include "ck_tile/ops/epilogue.hpp"
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <cstdint>
+
+namespace HugeCTR {
+namespace cktile {
+namespace detail {
+
+using ADataType    = ck_tile::half_t;
+using BDataType    = ck_tile::half_t;
+using AccDataType  = float;
+using CDataType    = ck_tile::half_t;
+using BiasDataType = ck_tile::half_t;
+
+// LAYOUT (Phase 14n.2 weight pre-transpose path):
+//   ALayout = RowMajor (X is M×K row-major)         ← matches HCTR
+//   BLayout = ColumnMajor (W^T is K×N col-major)    ← REQUIRES caller to pass
+//                                                     pre-transposed W
+//   CLayout = RowMajor (Y is M×N row-major)
+using ALayout    = ck_tile::tensor_layout::gemm::RowMajor;
+using BLayout    = ck_tile::tensor_layout::gemm::ColumnMajor;
+using CLayout    = ck_tile::tensor_layout::gemm::RowMajor;
+using BiasLayout = ck_tile::tensor_layout::gemm::RowMajor;
+
+// Per Phase 14i.2: 128x128x32 with 2x2x1 warps and 32x32x16 MFMA is best for all
+// supported MLP shapes (6 of 8). bot[0] K=13 + top[4] N=1 fall back to hipblasGemmEx.
+constexpr ck_tile::index_t M_Tile = 128, N_Tile = 128, K_Tile = 32;
+constexpr ck_tile::index_t M_Warp = 2, N_Warp = 2, K_Warp = 1;
+constexpr ck_tile::index_t M_Warp_Tile = 32, N_Warp_Tile = 32, K_Warp_Tile = 16;
+constexpr ck_tile::index_t kBlockSize = 256;
+
+using GemmShape = ck_tile::TileGemmShape<
+    ck_tile::sequence<M_Tile, N_Tile, K_Tile>,
+    ck_tile::sequence<M_Warp, N_Warp, K_Warp>,
+    ck_tile::sequence<M_Warp_Tile, N_Warp_Tile, K_Warp_Tile>>;
+using TilePartitioner = ck_tile::GemmTile1DPartitioner<GemmShape>;
+using GemmTraits      = ck_tile::TileGemmTraits<true, true, true, ALayout, BLayout, CLayout>;
+using PipelineProblem = ck_tile::GemmPipelineProblem<
+    ADataType, BDataType, AccDataType, GemmShape, GemmTraits,
+    ck_tile::element_wise::PassThrough, ck_tile::element_wise::PassThrough, ADataType>;
+using GemmPipeline = ck_tile::GemmPipelineAGmemBGmemCRegV1<PipelineProblem>;
+
+// --- Custom CDElementwise functors (bias-add + ReLU / no-activation) ---
+struct AddRelu {
+    template <typename Y, typename X0, typename X1>
+    __host__ __device__ constexpr void operator()(Y& y, const X0& x0, const X1& x1) const {
+        const float sum = static_cast<float>(x0) + static_cast<float>(x1);
+        y = ck_tile::type_convert<Y>(sum > 0.0f ? sum : 0.0f);
+    }
+};
+struct AddOnly {
+    template <typename Y, typename X0, typename X1>
+    __host__ __device__ constexpr void operator()(Y& y, const X0& x0, const X1& x1) const {
+        const float sum = static_cast<float>(x0) + static_cast<float>(x1);
+        y = ck_tile::type_convert<Y>(sum);
+    }
+};
+
+// Phase 14p (re-enable): the upstream API order is now
+//   (As, Bs, Ds, Acc, O, DsLayout, ELayout, CDElementwise,
+//    kM, kN, MWave, NWave, MPerXdl, NPerXdl, KPerXdl,
+//    isCTransposed, MemoryOperation, ...)
+// `memory_operation_enum::set` matches the original "store" semantics
+// hipBLASLt's RELU_AUX_BIAS epilogue uses (which we also use here).
+template <typename CDElementwise>
+using EpilogueWithBias = ck_tile::CShuffleEpilogue<
+    ck_tile::CShuffleEpilogueProblem<
+        ADataType, BDataType, ck_tile::tuple<BiasDataType>, AccDataType, CDataType,
+        ck_tile::tuple<BiasLayout>, CLayout, CDElementwise,
+        TilePartitioner::MPerBlock, TilePartitioner::NPerBlock,
+        M_Warp, N_Warp, M_Warp_Tile, N_Warp_Tile, K_Warp_Tile,
+        PipelineProblem::TransposeC,
+        ck_tile::memory_operation_enum::set>>;
+
+using KernelBiasRelu = ck_tile::GemmKernelMultiD<TilePartitioner, GemmPipeline, EpilogueWithBias<AddRelu>>;
+using KernelBias     = ck_tile::GemmKernelMultiD<TilePartitioner, GemmPipeline, EpilogueWithBias<AddOnly>>;
+// KernelPlain (no-bias) deliberately omitted — upstream CK-Tile static_asserts
+// `Ds tuple size > 0` so GemmKernelMultiD<…> with empty Ds doesn't compile.
+// The plain entry point falls back to hipblasGemmEx (see stub below). Plain
+// path is unused on the bs=1×/bs=8× MLP fprop critical path anyway (every
+// MLP layer has bias).
+
+}  // namespace detail
+}  // namespace cktile
+}  // namespace HugeCTR
+
+// === Public extern "C" API ===
+using namespace HugeCTR::cktile::detail;
+
+// Custom transpose kernel: HCTR's W is K×N row-major (stride N). Output d_WT
+// is K×N col-major (stride K) — i.e., element [k, n] at offset n*K + k.
+__global__ void cktile_transpose_weight_kernel(
+    const __half* __restrict__ d_W, __half* __restrict__ d_WT, int K, int N) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    int n = blockIdx.y * blockDim.y + threadIdx.y;
+    if (k < K && n < N) {
+        d_WT[n * K + k] = d_W[k * N + n];
+    }
+}
+
+extern "C" hipError_t hctr_cktile_transpose_weight_fp16(
+    const __half* d_W_row_major, __half* d_W_col_major, int K, int N, hipStream_t stream) {
+    if (K < 1 || N < 1) return hipErrorInvalidValue;
+    constexpr int TX = 16, TY = 16;
+    dim3 block(TX, TY);
+    dim3 grid((K + TX - 1) / TX, (N + TY - 1) / TY);
+    hipLaunchKernelGGL(cktile_transpose_weight_kernel, grid, block, 0, stream,
+                       d_W_row_major, d_W_col_major, K, N);
+    return hipGetLastError();
+}
+
+// Phase 14n.7: bit-pack ReLU mask in hipBLASLt's RELU_AUX format.
+__global__ void cktile_pack_relu_mask_kernel(
+    const __half* __restrict__ top, uint8_t* __restrict__ aux,
+    int M_hctr, int N_hctr, int aux_ld) {
+    int byte_i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j      = blockIdx.y * blockDim.y + threadIdx.y;
+    int max_byte = (N_hctr + 7) / 8;
+    if (byte_i >= max_byte || j >= M_hctr) return;
+    uint8_t mask = 0;
+    int base_n = byte_i * 8;
+    #pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        int n = base_n + b;
+        if (n >= N_hctr) break;
+        size_t off = static_cast<size_t>(j) * N_hctr + n;
+        if (__half2float(top[off]) > 0.0f) {
+            mask |= static_cast<uint8_t>(1u << b);
+        }
+    }
+    aux[static_cast<size_t>(byte_i) + static_cast<size_t>(j) * aux_ld] = mask;
+}
+
+extern "C" hipError_t hctr_cktile_pack_relu_mask_fp16(
+    const __half* d_top, void* d_aux, int M, int N, int aux_ld, hipStream_t stream) {
+    if (M < 1 || N < 1 || aux_ld < (N + 7) / 8) return hipErrorInvalidValue;
+    constexpr int TX = 8, TY = 32;
+    int max_byte = (N + 7) / 8;
+    dim3 block(TX, TY);
+    dim3 grid((max_byte + TX - 1) / TX, (M + TY - 1) / TY);
+    hipLaunchKernelGGL(cktile_pack_relu_mask_kernel, grid, block, 0, stream,
+                       d_top, reinterpret_cast<uint8_t*>(d_aux), M, N, aux_ld);
+    return hipGetLastError();
+}
+
+extern "C" hipError_t hctr_cktile_gemm_bias_relu_fp16(
+    const __half* d_A, const __half* d_B, const __half* d_bias, __half* d_C,
+    int M, int N, int K, hipStream_t stream) {
+    if (M < 64 || N < 64 || K < 32) return hipErrorInvalidValue;
+    // d_B is expected pre-transposed (K×N col-major, stride K).
+    ck_tile::GemmMultiDHostArgs<1> args(
+        d_A, d_B, {d_bias}, d_C, /*k_batch=*/1, M, N, K,
+        /*stride_A=*/K, /*stride_B=*/K, /*stride_Ds=*/{0}, /*stride_E=*/N);
+    auto kargs = KernelBiasRelu::MakeKernelArgs(args);
+    auto grids = KernelBiasRelu::GridSize(M, N, 1);
+    auto blocks = KernelBiasRelu::BlockSize();
+    if (!KernelBiasRelu::IsSupportedArgument(kargs)) return hipErrorInvalidValue;
+    hipLaunchKernelGGL((ck_tile::kentry<kBlockSize, KernelBiasRelu>),
+                       grids, blocks, 0, stream, kargs);
+    return hipGetLastError();
+}
+
+extern "C" hipError_t hctr_cktile_gemm_bias_fp16(
+    const __half* d_A, const __half* d_B, const __half* d_bias, __half* d_C,
+    int M, int N, int K, hipStream_t stream) {
+    if (M < 64 || N < 64 || K < 32) return hipErrorInvalidValue;
+    ck_tile::GemmMultiDHostArgs<1> args(
+        d_A, d_B, {d_bias}, d_C, /*k_batch=*/1, M, N, K,
+        /*stride_A=*/K, /*stride_B=*/K, /*stride_Ds=*/{0}, /*stride_E=*/N);
+    auto kargs = KernelBias::MakeKernelArgs(args);
+    auto grids = KernelBias::GridSize(M, N, 1);
+    auto blocks = KernelBias::BlockSize();
+    if (!KernelBias::IsSupportedArgument(kargs)) return hipErrorInvalidValue;
+    hipLaunchKernelGGL((ck_tile::kentry<kBlockSize, KernelBias>),
+                       grids, blocks, 0, stream, kargs);
+    return hipGetLastError();
+}
+
+extern "C" hipError_t hctr_cktile_gemm_plain_fp16(
+    const __half*, const __half*, __half*,
+    int, int, int, hipStream_t) {
+    // Plain (no-bias) path: see comment near KernelBiasRelu — upstream
+    // CK-Tile blocks empty-Ds. Caller falls back to hipblasGemmEx.
+    return hipErrorInvalidValue;
+}
+
+// Phase 14p.2 (2026-05-14): MLP backward dgrad via CK-Tile.
+//
+// Math: bottom_bprop[m, k] = sum_n grad_top[m, n] * kernel[k, n]
+//
+// Layout fit (no extra transpose needed):
+//   A = grad_top, M×N_dgrad row-major (where N_dgrad = out_size = K_gemm)
+//       → M×K row-major, matches existing ALayout=Row
+//   B = kernel, K_dgrad×N_dgrad row-major in HCTR memory
+//       (where K_dgrad=out_size, N_dgrad=in_size)
+//       Viewed as N_dgrad×K_dgrad col-major = SAME memory.
+//       For the GEMM we want B as K×N col-major where K=out_size, N=in_size.
+//       Identical to viewing kernel as K_gemm×N_gemm col-major. ✓
+//   C = bottom_bprop, M×N_dgrad row-major = matches CLayout=Row
+//
+// CK-Tile only supports KernelBias (not bias-less) due to upstream Ds-tuple
+// static_assert. We work around by passing a pre-allocated zero-bias buffer:
+// `bias = 0` makes the bias-add a no-op. Identical numerical result to plain
+// GEMM, modulo the extra zero-load (negligible vs the GEMM compute).
+//
+// Zero-bias buffer: allocate once on first call up to max needed N (4096),
+// then re-use across all calls. Safe because we only READ from the buffer.
+
+// Per-device zero-bias buffer (graph-capture-safe). Allocated at MLPLayer::initialize()
+// time via hctr_cktile_init_dgrad_zero_bias() — BEFORE any HIP graph capture starts.
+// Indexed by hipGetDevice() since each rank/GPU has its own context.
+static constexpr int kMaxDevices = 16;
+static __half* g_cktile_zero_bias_buf [kMaxDevices] = {nullptr};
+static int     g_cktile_zero_bias_size[kMaxDevices] = {0};
+
+extern "C" hipError_t hctr_cktile_init_dgrad_zero_bias(int max_n) {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) {
+        return hipErrorInvalidValue;
+    }
+    if (g_cktile_zero_bias_buf[dev] != nullptr && g_cktile_zero_bias_size[dev] >= max_n) {
+        return hipSuccess;
+    }
+    if (g_cktile_zero_bias_buf[dev] != nullptr) {
+        hipFree(g_cktile_zero_bias_buf[dev]);
+        g_cktile_zero_bias_buf[dev] = nullptr;
+    }
+    int alloc_n = max_n < 4096 ? 4096 : max_n;
+    hipError_t err = hipMalloc(&g_cktile_zero_bias_buf[dev], sizeof(__half) * alloc_n);
+    if (err != hipSuccess) return err;
+    // hipMemset (sync, no stream) — ensure zero before any GEMM consumes it.
+    err = hipMemset(g_cktile_zero_bias_buf[dev], 0, sizeof(__half) * alloc_n);
+    if (err != hipSuccess) return err;
+    g_cktile_zero_bias_size[dev] = alloc_n;
+    return hipSuccess;
+}
+
+static __half* get_zero_bias_buf(int N) {
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDevices) return nullptr;
+    if (g_cktile_zero_bias_buf[dev] == nullptr || g_cktile_zero_bias_size[dev] < N) {
+        return nullptr;
+    }
+    return g_cktile_zero_bias_buf[dev];
+}
+
+extern "C" hipError_t hctr_cktile_gemm_dgrad_fp16(
+    const __half* d_grad_top,    // M × K_dgrad row-major (= grad_top, K_dgrad=out_size)
+    const __half* d_kernel,      // K_dgrad × N_dgrad row-major (= kernel, K=out, N=in)
+    __half*       d_bottom_bprop,// M × N_dgrad row-major (= bottom_bprop, N=in_size)
+    int M,                       // batch
+    int N_dgrad,                 // in_size
+    int K_dgrad,                 // out_size (contraction dim)
+    hipStream_t stream) {
+    if (M < 64 || N_dgrad < 64 || K_dgrad < 32) return hipErrorInvalidValue;
+    __half* zero_bias = get_zero_bias_buf(N_dgrad);
+    if (zero_bias == nullptr) {
+        // Buffer not initialised (or too small). Caller must invoke
+        // hctr_cktile_init_dgrad_zero_bias(MAX_N) BEFORE graph capture.
+        // Returning InvalidValue triggers fallback to hipBLAS dgrad.
+        return hipErrorInvalidValue;
+    }
+    ck_tile::GemmMultiDHostArgs<1> args(
+        d_grad_top, d_kernel, {zero_bias}, d_bottom_bprop,
+        /*k_batch=*/1, M, N_dgrad, K_dgrad,
+        /*stride_A=*/K_dgrad,
+        /*stride_B=*/K_dgrad,   // kernel as N×K col-major, leading stride = K
+        /*stride_Ds=*/{0},       // bias broadcast on K dim
+        /*stride_E=*/N_dgrad);
+    auto kargs  = KernelBias::MakeKernelArgs(args);
+    auto grids  = KernelBias::GridSize(M, N_dgrad, 1);
+    auto blocks = KernelBias::BlockSize();
+    if (!KernelBias::IsSupportedArgument(kargs)) return hipErrorInvalidValue;
+    hipLaunchKernelGGL((ck_tile::kentry<kBlockSize, KernelBias>),
+                       grids, blocks, 0, stream, kargs);
+    return hipGetLastError();
+}

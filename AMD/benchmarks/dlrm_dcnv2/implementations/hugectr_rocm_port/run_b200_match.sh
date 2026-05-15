@@ -106,6 +106,26 @@ PRECISION_FLAGS=${HCTR_PRECISION_FLAGS:-"--use_mixed_precision --scaler 16348"}
 echo "[run] ngpus=$NGPU batch=$BATCH eval_batch=$EVAL_BATCH ev_size=$EV_SIZE lr=$LR max_iter=$MAX_ITER"
 echo "[run] precision_flags='$PRECISION_FLAGS'"
 
+# 2026-05-13 Phase-14: batch-size-aware MLP fusion knob picker.
+# At bs >= 220k (bs4x+), the fused-top-MLP path beats the InnerProduct
+# path on AMD by +5-6 % (bs8x = 16.99 -> 17.86 / +5.2 %; bs8x with
+# FUSE_WB stacks to 17.93 / +5.5 %). At bs <= 110k the kernel-launch
+# overhead per FC layer doesn't amortize and FUSE_TOP regresses 4-14 %.
+# This was a measurement artifact from before NCCL_BUFFSIZE=32MB was
+# baked in (Phase-14 retest at 32MB unlocks the win). Loss validated
+# healthy across bs1x..bs8x with both knob settings.
+if [ -z "${HCTR_FUSE_TOP_MLP:-}" ]; then
+    if [ "$BATCH" -ge 220000 ]; then export HCTR_FUSE_TOP_MLP=1
+    else                              export HCTR_FUSE_TOP_MLP=0
+    fi
+fi
+if [ -z "${HCTR_FUSE_WB:-}" ]; then
+    if [ "$BATCH" -ge 440000 ]; then export HCTR_FUSE_WB=True
+    else                              export HCTR_FUSE_WB=False
+    fi
+fi
+echo "[run] HCTR_FUSE_TOP_MLP=$HCTR_FUSE_TOP_MLP  HCTR_FUSE_WB=$HCTR_FUSE_WB"
+
 # MI350X has 288 GB HBM3; use 256 GB for embedding budget (default is 60 GB
 # which OOMs against the real 204 M-ID TABLE_SIZE_ARRAY at ev_size=128).
 MEM_CAP=${HCTR_MEM_CAP:-256}

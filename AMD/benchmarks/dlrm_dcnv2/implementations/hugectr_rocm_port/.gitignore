@@ -1,27 +1,27 @@
-# Build artefacts (rebuilt in container; not in git).
-build/
-build_rocm72/
-*.o
+# Build artifacts
+hugectr_hip/build_rocm72/
+hugectr_hip/build_rocm712/
 *.so
-*.a
+*.o
+*.so.[0-9]*
 
-# Python / pytest caches.
+# Python
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.pytest_cache/
 
-# Editor / IDE.
-.vscode/
-.idea/
-*.swp
-
-# Hipify backups (only useful at hipify time, regeneratable from upstream).
-*.prehip
-hipify_*.log
-
-# Run-time artefacts.
+# Run logs from this dir
 *.log
-core
-core.*
+*.log.bak
+
+# NV upstream reference (107 MB; not needed for repro, kept locally for diff'ing)
+hugectr/
+
+# Hipify intermediate output (17 MB; regenerable from upstream via run_hipify.sh)
+hipify_pass/
+
+# Workspace-only helpers (already in submission scripts/ dir)
+_libaio_lib/
+
+# Old hipify-pre files (rsync left some)
+*.prehip
+*.preq14q

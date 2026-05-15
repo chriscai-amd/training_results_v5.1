@@ -61,12 +61,25 @@ if os.environ.get("HCTR_USE_SUBSAMPLED_CRITEO", "0") == "1":
     else:
         MULTI_HOT_SIZES = [1] * 26
     _slot_floor = _i("HCTR_SLOT_SIZE", 65536)
+    # ROCm port: when training on REAL MLPerf Criteo, IDs are correctly
+    # bounded by real table cardinalities -- no clamp needed. The clamp was
+    # only added because our synthetic-data preprocessor hashes IDs mod
+    # 65536, which would index OOB into tables with cardinalities like 3 / 36 / 63.
+    # IMPORTANT: with the clamp on, every table is >= 65536 elements * 128 ev *
+    # 8 B (Adagrad) = 64 KB. The auto-sharding planner's DP_SHARDING_THRESHOLD
+    # = 0.008 GiB / unit_mem_cost picks DP-replication for tables < ~7800
+    # elements -- with the clamp, NO table is small enough, so all 26 tables
+    # MP-shard. Disabling the clamp on real MLPerf data lets the planner
+    # DP-replicate the 11 small tables (cardinalities 3..7424), eliminating
+    # ~80 % of the embedding all-to-all volume. Per NV b200/README §7.5
+    # this win is ~1.6x on bs=1x and stacks across all batch sizes.
+    use_real_mlperf = os.environ.get("HCTR_USE_MLPERF_CRITEO", "0") == "1"
+    drop_clamp = os.environ.get("HCTR_DROP_TABLE_SIZE_CLAMP", "1" if use_real_mlperf else "0") == "1"
     if os.environ.get("HCTR_USE_REAL_TABLE_SIZES", "0") == "1":
-        # Clamp real B200 sizes to >= slot_floor: our preprocessor hashed every
-        # slot mod 65536 so IDs span 0..65535. Some real cardinalities are
-        # tiny (3, 36, 63) and would index OOB on the GPU. The 40 M caps
-        # survive the clamp -> we keep memory pressure of the big tables.
-        TABLE_SIZE_ARRAY = [max(s, _slot_floor) for s in _DEFAULT_TABLE_SIZE_ARRAY]
+        if drop_clamp:
+            TABLE_SIZE_ARRAY = list(_DEFAULT_TABLE_SIZE_ARRAY)
+        else:
+            TABLE_SIZE_ARRAY = [max(s, _slot_floor) for s in _DEFAULT_TABLE_SIZE_ARRAY]
     else:
         TABLE_SIZE_ARRAY = [_slot_floor] * 26
 else:
