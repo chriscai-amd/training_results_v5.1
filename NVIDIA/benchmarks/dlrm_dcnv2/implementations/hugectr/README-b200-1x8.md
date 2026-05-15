@@ -268,7 +268,7 @@ env DLRM_BIND="numactl --interleave=0,1" \
     --image-tar $DATA_ROOT/docker_images/mlperf-nvidia-recommendation-hugectr.tar.zst \
     --train-data $DATA_ROOT/criteo_1tb_multihot_raw_full/train_data.bin \
     --val-data   $DATA_ROOT/criteo_1tb_multihot_raw_full/val_data.bin \
-    --logdir     $DATA_ROOT/criteo_synth/results \
+    --logdir     $DATA_ROOT/hctr_runs/results \
     --time       01:00:00
 ```
 
@@ -363,7 +363,7 @@ An earlier round of kernel-level analysis ran at 4.08 ms/iter
 patch) and produced compute-vs-comm, top-kernel, and per-stream
 critical-path breakdowns from a 1900-iter `nsys` trace
 (`b200_1x8_rr_full.nsys-rep`, 181 MB, still in
-`/home/chcai/criteo_synth/results/`). Headline findings at that
+`/home/chcai/hctr_runs/results/`). Headline findings at that
 state — NCCL ~37 % of GPU work, embedding ops ~21 %, MLP GEMMs ~21 %,
 exposed-comm budget ~1.0 ms/iter, host-idle between graph replays
 ~1.4 ms/iter — have all been **superseded** by the more recent
@@ -599,7 +599,7 @@ docker run --rm \
     "
 ```
 
-(See `criteo_synth/results/bs4x_shm_inline2.sh` for the full wrapper.
+(See `hctr_runs/results/bs4x_shm_inline2.sh` for the full wrapper.
 RAM cost: 218 GB (200 train + 18 val). Available on hosts with
 ≥ 256 GB free; falls back to `/mnt/local_disk` otherwise.)
 
@@ -970,7 +970,7 @@ This bs=4× trace is the **direct confirmation** of the host-bound
 hypothesis at the peak config: same host overhead, 4× more useful
 work per iter, so throughput rises from 69 % → 87 % of MLPerf
 reference. The trace itself is preserved at
-`/home/chcai/criteo_synth/results/nsys_bs4x_*.nsys-rep`.
+`/home/chcai/hctr_runs/results/nsys_bs4x_*.nsys-rep`.
 
 ### 8.2d Per-component breakdown at the winning config (bs=1× auto + tmpfs, May 13)
 
@@ -1121,7 +1121,7 @@ Comparison to MLPerf 5.1-0040 reference: their pure-train iter is
 batch / hyperparams / DL config. The reference uses the same `auto`
 sharding plan we now use, and presumably has a similar host overhead
 that hides similarly behind GPU work. The trace is preserved at
-`/home/chcai/criteo_synth/results/nsys_bs1x_auto_tmpfs_*.nsys-rep`.
+`/home/chcai/hctr_runs/results/nsys_bs1x_auto_tmpfs_*.nsys-rep`.
 
 ### 8.3 Final state (May 2026)
 
@@ -1253,6 +1253,257 @@ margin because it data-parallel-replicates the 21 small tables
   this batch; we measured steady-state throughput on 10 k iters with
   real loss values (0.123 → 0.097, training is converging). A full
   TTT comparison would require a multi-hour run.
+
+### 8.4 Stream-architecture analysis: matching MI350X's 4-stream layout (May 15)
+
+**Trace produced with `async_wgrad=False`** (single one-line patch from upstream
+`train.py`'s default `DenseLayerComputeConfig(async_wgrad=True)`).
+
+Motivation: AMD's MI350X HCTR submission ([5.1-0033 GigaComputing G894-AB1 +
+ZT-T8GR-K01-AMD-AI3.0]) shows exactly **4 GPU streams per rank** in its trace
+— `main HCTR pipeline`, `embedding "mp"`, `embedding "dp"`, `sparse-prep /
+data-reader` — corresponding 1:1 to HCTR's documented architecture
+(`computation_stream_` + 3 EBC scheduler side streams). Our stock
+`config_b200_1x8_rr_bs1x_auto_long.sh` baseline shows **9 streams** because:
+(a) `async_wgrad=True` adds `computation_stream_2_` for parallel wgrad, and
+(b) the resulting two-handle / two-stream cuBLAS setup makes cuBLASLt spawn
+4 internal helper streams to overlap split-K reductions across the handles.
+
+A clean 4-stream layout is reachable from B200 via a single config change
+(`config_b200_1x8_rr_bs1x_auto_mi350.sh` + `train_mi350.py`), at a
+**5 % perf cost**.
+
+#### Reproduction recipe
+
+```bash
+# train_mi350.py is byte-identical to train.py except for one block:
+#   compute_config = hugectr.DenseLayerComputeConfig(
+#       async_wgrad=False,    # <-- vs upstream True
+#       fuse_wb=False,
+#   )
+bash hctr_runs/results/bs1x_trace_inline.sh 2 nsys_bs1x_mi350 \
+    CONFIG=config_b200_1x8_rr_bs1x_auto_mi350.sh \
+    NSYS_DELAY=90 NSYS_DURATION=3
+```
+
+The `train_intra/inter_iteration_overlap=True` flags are **kept** (they are
+what creates the 3 EBC scheduler side streams that MI350X also has).
+
+#### Stream count and role mapping
+
+```
+config            HCTR-owned   cuBLASLt internal   memcpy   total visible
+─────────────────────────────────────────────────────────────────────────
+baseline (A=T)        5             4                1            10
+mi350    (A=F)        4             0                1             5
+```
+
+(`A=T/F` = `async_wgrad=True/False`. "5 HCTR-owned" in baseline =
+`computation_stream_` + `computation_stream_2_` (wgrad) + 3 EBC side
+streams; "4 HCTR-owned" in mi350 = same minus `computation_stream_2_`
+because wgrad now folds back into `computation_stream_`.)
+
+All 8 GPUs symmetric in both configs; concrete IDs from a fresh GPU 0
+trace (5-iter window iter 1000..1004 = 12.44 ms wall, **2.49 ms/iter
+inside the trace window**, 2.22 ms/iter steady-state):
+
+| Stream | Role | Equivalent in `gpu_resource.hpp` / MI350X table | Per-iter busy |
+| -----: | ---- | ---- | ---: |
+| 166 | **`computation_stream`** | `computation_stream_` (= MI350X "Main HCTR pipeline") | 1903 µs |
+| 346 | **`embedding_mp`** | EBC scheduler MP-table side stream (= MI350X "Embedding 'mp'") | 841 µs |
+| 357 | **`embedding_dp`** | EBC scheduler DP/index side stream (= MI350X "Embedding 'dp'") | 574 µs |
+| 356 | **`sparse_prep`** | EBC scheduler sparse-prep side stream (= MI350X "Sparse-prep / data-reader") | 506 µs |
+| 294 | **`memcpy_stream`** | `memcpy_stream_` (AsyncDataReader H2D lane) | 0 (5 H2D / iter) |
+
+`p2p_stream_` (declared in `gpu_resource.hpp`) is created but never carries
+kernels in steady-state — no peer-broadcast happens, so it doesn't appear in
+the trace.
+
+#### Per-stream computation and communication
+
+**Stream 166 — `computation_stream`** (main; carries everything dense)
+
+| Bucket | Kernels | µs/iter |
+|---|---|---:|
+| Bottom MLP fwd (13→512→256→128) | `nvjet_hsh_*_NNT`, `concat_fwd_kernel` | ~190 |
+| Cross network (3 layers, proj=512) | `cutlass3x_sm100_*`, `vector_mul_fma3_align`, `vector_fma4_align8` | ~280 |
+| Top MLP fwd (3456→1024→1024→512→256→1) | `cutlass3x_sm100_tensorop_s256x256x16gemm`, `nvjet_hsh_128x192_*` | ~250 |
+| BCE loss | `BinaryCrossEntropy_Kernel`, `binaryOpKernel` | ~20 |
+| Top MLP bwd dgrad+wgrad | `nvjet_hsh_*_TNT`, `cutlass3x_sm100_*_bgrada` (fused bias-grad), `gemmk1_kernel`, `globalKernelBgradAB_v1` | ~200 |
+| Cross/Interaction bwd | `concat_bwd_kernel`, `convert_array`, `reverse_relu_kernel` | ~100 |
+| Bottom MLP bwd dgrad+wgrad | `nvjet_hsh_*_TNT`, `nvjet_hsh_64x32_*` | ~80 |
+| **cuBLASLt GEMM tails on the same stream** (because `async_wgrad=False`) | `splitKreduce_kernel(40)`, `Kernel2(40)` | ~240 |
+| Optimizer | `ada_grad_update4_kernel` (Adagrad on dense MLP weights) | ~100 |
+| **DDP gradient AllReduce (1/iter)** | `ncclDevKernel_AllReduce_Sum_f16_RING_LL` | **269** |
+
+* Comm: 1× NCCL AllReduce/iter (dense MLP grad sync, ~60 MB BF16, RING-LL).
+* H2D: 50 small copies/iter (~11 MB) — per-iter dense-input staging
+  piggy-backed on the compute lane.
+
+**Stream 346 — `embedding_mp`** (the 5 large 40 M-cap tables: tables 0, 9, 19, 20, 21)
+
+| Bucket | Kernels | µs/iter |
+|---|---|---:|
+| Forward gather from MP-sharded tables | `ragged_static_embedding_table_lookup_kernel`, `multi_to_one_warp_per_ev_vec4_less_block_kernel` | ~158 |
+| Per-row sum combiner (multi-hot rows → ev-vector) | `multi_to_one_reduce_vec4_v2`, `multi_to_one_reduce_final_v2` | ~130 |
+| Backward scatter (grad → weight rows) | `one_to_multi_warp_per_ev_vec4_less_block_kernel` | ~46 |
+| Pointer / offset arithmetic | `mp_cal_src_ptrs_same_ev_size`, `compress_offset_kernel` | ~10 |
+| Embedding optimizer (Adagrad on the 5 big MP tables) | `update4_kernel` | **257** |
+
+* Comm: **2× `ncclDevKernel_SendRecv` per iter (~239 µs/iter total)** — the
+  **embedding-VALUE all-to-all**: forward (gather looked-up vectors back to
+  the requesting GPU) + backward (ship gradient deltas to the owner GPU).
+
+**Stream 357 — `embedding_dp`** (key bucketing for the a2a + the index-side a2a)
+
+| Bucket | Kernels | µs/iter |
+|---|---|---:|
+| Per-key destination labeling (which GPU owns each key) | `label_and_count_keys` | **127** |
+| Bucket assembly for SendRecv | `swizzle_keys`, `concat_keys_and_bucket_range`, `count_keys_per_gpu`, `compute_shard_ranges`, `transpose_buckets` | ~42 |
+| Post-a2a key→local-index | `keys_to_indices_kernel` (2/iter), `compress_offset_kernel` (2/iter) | ~34 |
+| Secondary radix-sort + scan on post-a2a buffer | `DeviceRadixSort*`, `DeviceScan*` | ~55 |
+
+* Comm: **2× `ncclDevKernel_SendRecv` per iter (~316 µs/iter total)** — the
+  **embedding-INDEX all-to-all**, partner of stream 346's value a2a.
+  Indices (4 B/key) and embedding values (256 B/key) have very different
+  message sizes; running them on separate NCCL streams lets them pipeline.
+* Memcpys: 5× HtoD (5 µs, control flow) + 15× DtoH (236 µs, count/index info
+  back to the host scheduler).
+
+**Stream 356 — `sparse_prep`** (radix-sort dominant; also handles DP-replicated small tables)
+
+| Bucket | Kernels | µs/iter |
+|---|---|---:|
+| `cub::DeviceRadixSort` (sort multi-hot keys per table for coalesced gather) | `DeviceRadixSortHistogramKernel`, `DeviceRadixSortOnesweepKernel`, `DeviceRadixSortExclusiveSumKernel` | ~190 |
+| `cub::DeviceScan` (prefix sums over sorted offsets) | `DeviceScanInitKernel`, `DeviceScanKernel` | ~37 |
+| Unique-key dedup (avoid redundant lookups) | `get_keys_flag`, `get_unique_key_same_ev_size`, `replicate_bucket_range_kernel` | ~88 |
+| **DP-replicated small-table fwd+bwd** (the 21 tables ≤ `DP_SHARDING_THRESHOLD=0.008 GiB` stay local) | `multi_to_one_warp_per_ev_vec4_kernel`, `multi_to_one_reduce_vec4_v2`, `multi_to_one_reduce_final_v2`, `ragged_static_embedding_table_lookup_kernel`, `compress_offset_kernel` | ~104 |
+| DP-table optimizer | `update4_kernel` (Adagrad on the 21 small DP tables) | ~81 |
+| AllReduce-wgrad index prep | `cal_ev_start_indices_in_allreduce_wgrad_using_indices_kernel` | ~4 |
+
+* Comm: **none** — all-local. The DP-replicated small tables don't need any
+  a2a, which is exactly the saving that `SHARDING_PLAN=auto` (§7.5) buys.
+
+**Stream 294 — `memcpy_stream`** (no kernels)
+
+| Activity | Count | Bytes | µs/iter |
+|---|---:|---:|---:|
+| `cudaMemcpyAsync(HtoD)` from pinned host buffer (filled by AsyncReader threads from `/ramdata/train_data.bin`) | 5/iter | **6.3 MB/iter** = 6912 rows × 912 B | 218 |
+
+This is HCTR's static `memcpy_stream_`. It runs entirely orthogonal to the
+compute pipeline — prefetching iter N+1's row payload while iter N is still
+on streams 166/346/356/357. Owning a dedicated stream avoids creating false
+dependencies between data prefetch and compute kernels.
+
+#### Per-iter time accounting
+
+```
+Stream             Busy/iter    Role
+─────────────────────────────────────────────────────────────
+166 computation     1903 µs     MLP fwd+bwd+wgrad + AllReduce + opt
+346 embedding_mp     841 µs     MP-table lookup/scatter + value a2a
+357 embedding_dp     574 µs     Index bucketing + index a2a
+356 sparse_prep      506 µs     Radix-sort + DP-table fwd+bwd
+294 memcpy             0 µs     (data prefetch — async)
+─────────────────────────────────────────────────────────────
+Sum of busy times   3824 µs     (concurrent across streams)
+Wall iter time      2490 µs     -> 1.54x oversubscription factor
+                                -> ~65% effective parallel efficiency
+```
+
+The ~1.3 ms gap between sum-of-busy and wall is overlap actually being
+extracted by `train_intra/inter_iteration_overlap=True` — i.e., the 4-stream
+layout still pipelines aggressively even without the wgrad-side cuBLASLt
+helpers.
+
+#### Communication summary (per iter, GPU 0)
+
+```
+Type                                          Stream   Calls/iter   µs/iter
+────────────────────────────────────────────────────────────────────────────
+NCCL AllReduce (dense DDP grad sync, RING-LL)   166        1          269
+NCCL SendRecv  (embedding INDEX a2a fwd+bwd)    357        2          316
+NCCL SendRecv  (embedding VALUE a2a fwd+bwd)    346        2          239
+H2D async      (per-iter row payload prefetch)  294        5          218
+────────────────────────────────────────────────────────────────────────────
+Total comm                                                           1042 µs
+Total wall iter                                                      2490 µs
+                                                              =        42 %
+                                                       (~19 % exposed)
+```
+
+#### Performance impact of the `async_wgrad=False` change
+
+| Config | streams/GPU | iter (steady) | M samples/s | % of MLPerf 5.1-0040 ref (22.80) | vs baseline |
+| ------ | ----------: | ------------: | ----------: | -------------------------------: | ----------: |
+| **Baseline** (`config_b200_1x8_rr_bs1x_auto_long.sh`, async_wgrad=True) | **9** (5 HCTR + 4 cuBLASLt) | **2.10 ms** | **26.27** | **115.2 %** | (baseline) |
+| **mi350** (`config_b200_1x8_rr_bs1x_auto_mi350.sh`, async_wgrad=False) | **4 (+1 memcpy = 5)** | **2.22 ms** | **24.94** | 109.4 % | **−5.1 %** |
+
+The 5 % perf cost is paid because:
+1. With `async_wgrad=True` the wgrad GEMMs and the next iter's fwd GEMMs
+   can run on parallel streams (`computation_stream_` and
+   `computation_stream_2_`). With `async_wgrad=False` they serialize.
+2. cuBLASLt no longer pipelines split-K reductions across the two handles
+   (because there's only one handle).
+
+In trade we get a **clean 4-stream layout that maps 1-to-1 onto MI350X's
+trace structure**, which is useful for:
+
+- **Trace readability** — Perfetto views become directly comparable across
+  AMD and NVIDIA traces, with the same lane semantics in the same visual
+  position.
+- **Architecture-equivalence checking** — confirms HCTR's per-platform
+  ports (NVIDIA cuBLASLt vs AMD HIP/RCCL) implement the **same** EBC
+  scheduling pipeline at the HCTR level; the extra streams in the NVIDIA
+  baseline are a cuBLASLt-internal optimization, not a per-iter
+  architectural difference.
+- **Bare-metal isolation experiments** — fewer streams means less host-side
+  scheduling noise, easier to attribute residual `cudaGraphLaunch` cost
+  to the virtualization layer (§8.2a).
+
+#### Why the 4 cuBLASLt-internal helper streams disappear with `async_wgrad=False`
+
+cuBLASLt only spawns its split-K helper streams when there is *concurrency
+to extract between two cuBLAS handles* — i.e., when:
+
+1. HCTR creates two cuBLAS handles (`cublas_handle_` + `cublas_handle_wgrad_`,
+   per `gpu_resource.hpp`), AND
+2. They are bound to different streams (`computation_stream_` vs
+   `computation_stream_2_`), AND
+3. Both handles have outstanding split-K-eligible matmuls.
+
+With `async_wgrad=False`, condition (2) breaks: HCTR uses only
+`cublas_handle_`. Split-K reductions still happen — `splitKreduce_kernel(40)`
+and `Kernel2(40)` are still visible in the trace — but they run **on the
+same stream as the matmul itself** instead of on a helper stream.
+
+Also tested but did NOT eliminate them while keeping `async_wgrad=True`:
+- `LD_PRELOAD` shim that forces `cublasLtMatmulPreferenceSetAttribute(
+  CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK, ...)` to NONE (mask=0) or
+  NONE+INPLACE (mask=1). Verified the shim intercepts (672 PrefCreate hits
+  per run), but stream count stays at 9 — because (a) HCTR also calls
+  legacy `cublasGemmEx`/`cublasHgemm` which bypass our preference, and
+  (b) the helper streams are an emergent property of the two-handle setup,
+  not a preference decision. See
+  `hctr_runs/results/cublaslt_no_splitk_shim.cpp` and the `nsys_bs1x_no_splitk_mask{0,1}.*` traces for the negative-result evidence.
+
+#### Where the trace and analysis live
+
+```
+hctr_runs/results/nsys_bs1x_mi350.nsys-rep                       118 MB  raw nsys
+hctr_runs/results/nsys_bs1x_mi350.sqlite                         282 MB  exported db
+hctr_runs/results/nsys_bs1x_mi350.all8gpu.iter1000-1005.json     4.6 MB  Perfetto JSON
+                                                                          (5 lanes per GPU,
+                                                                           role-labeled)
+```
+
+Drag-drop the JSON into <https://ui.perfetto.dev>. Each "GPU N" process
+shows 5 thread lanes labeled like `stream 166 (computation_stream)`,
+`stream 346 (embedding_mp)`, etc., ordered by role rather than raw stream
+id (so the same role lives in the same vertical position across GPUs and
+across configs — useful for diffing).
+
+[gigaab1]: https://github.com/mlcommons/training_results_v5.1/tree/main/GigaComputing/results/G894-AB1_hugectr/dlrm_dcnv2
 
 ## 9. Profiling / debugging notes
 
