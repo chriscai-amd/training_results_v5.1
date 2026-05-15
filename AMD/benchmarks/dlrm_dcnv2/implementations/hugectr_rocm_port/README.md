@@ -190,12 +190,14 @@ report at the **peak batch 442,368 (8×)** instead.
 | 14a | 2026-05-13 | **`NCCL_BUFFSIZE=8 MiB → 32 MiB`** — at bs1x embedding output is 46 MB ≫ 8 MB so RCCL splits each logical SendRecv into ~6 chunks; bumping the buffer to 32 MB merges most chunks → fewer per-call inter-launch gaps | baked in `run_b200_match.sh` | bs1x 12.90 → **13.07**; bs8x 16.98 → 16.99 (flat) | **+1.3 % @ bs1x; flat @ bs8x** (RCCL only 10 % of bs8x kernel-time, dominant at bs1x) |
 | 14b | 2026-05-13 | **`HCTR_FUSE_TOP_MLP=1` (re-enabled at bs ≥ 4×)** — Phase-5's negative measurement (-6 % at all batches) was a measurement artifact: with `NCCL_BUFFSIZE=8 MiB` the fused top-MLP path's larger NCCL chunks couldn't pipeline. With `BUFFSIZE=32 MiB` + bs ≥ 4× the fused-MLP epilogue chain (1 GEMM + 1 epilogue kernel per FC layer instead of 5–6 unfused) finally amortizes. | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 16.99 → **17.86**; bs4x 16.50 → **17.49**; bs2x 15.31 → 14.59 (regress); bs1x 13.07 → 12.46 (regress) | **+5.2 % @ bs8x; +6.0 % @ bs4x; ‑4.7 % @ bs2x; ‑4.6 % @ bs1x** — auto-disabled below bs4× |
 | 14c | 2026-05-13 | **`HCTR_FUSE_WB=True` (at bs ≥ 8×)** — fold weight-bias post-pass into the fused MLP. Stacks on top of 14b. At bs ≤ 4× this is flat or slightly negative (kernel overhead dominates the bias-fuse savings). | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 17.86 → **17.93**; bs4x 17.49 → 17.14 (regress) | **+0.4 % @ bs8x; ‑2.0 % @ bs4x** — auto-disabled below bs8× |
+| **15** | **2026-05-15** | **Dedicated RCCL streams for DP-allreduce + MLP-wgrad-allreduce** (`set_absolute_stream("rccl_emb_ar")`, `set_absolute_stream("rccl_mlp_wgrad")` in `model_pipeline.cpp`). Phase-14r 8-GPU trace showed default stream tid=32 carrying 553 µs of RCCL serialised with 4071 µs of MLP compute; this lever is the AMD-side equivalent of NV's cuBLASLt-internal worker streams (which hipBLASLt does NOT replicate on gfx950). 2-trial bs=1× A/B at 13.080→13.604, 13.125→13.455 → +3.3 % avg lift; loss bit-equivalent (0.291667). Default ON; set `HCTR_DEDICATED_RCCL_STREAM=0` to disable. | (perf-push branch, src/pybind/model_pipeline.cpp lines 222-236, 309-315) | bs1x 13.07 → **13.476** | **+3.0 % @ bs1x** |
 
 **Peak result post-Phase-14: 17.93 M sps at bs8x (442,368)** = 54.7 % of NV B200's May-13 auto+tmpfs bs8x peak (32.77 M sps).
+**bs=1× post-Phase-15 (dedicated RCCL stream): 13.476 M sps** = 51.2 % of NV B200's bs=1× (26.33 M sps).
 
-| Batch (global) | Per-GPU | M sps (post-Phase-14) | vs Phase-13 | vs NV B200 May-13 (same batch) |
+| Batch (global) | Per-GPU | M sps (post-Phase-15) | vs Phase-13 | vs NV B200 May-13 (same batch) |
 |---:|---:|---:|---:|---:|
-| 55,296 (1×, MLPerf-spec) | 6,912 | **13.07** | +1.3 % (BUFFSIZE) | 49.6 % of 26.33 |
+| 55,296 (1×, MLPerf-spec) | 6,912 | **13.48** | +1.3 % (BUFFSIZE) +3.0 % (Phase-15) | 51.2 % of 26.33 |
 | 110,592 (2×) | 13,824 | **15.31** | flat | 49.8 % of 30.72 |
 | 221,184 (4×) | 27,648 | **17.49** | +6.0 % (FUSE_TOP) | 55.3 % of 31.60 |
 | 442,368 (8×, peak) | 55,296 | **17.93** | +5.6 % (FUSE_TOP+FUSE_WB) | **54.7 %** of 32.77 |
