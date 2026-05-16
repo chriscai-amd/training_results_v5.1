@@ -84,6 +84,14 @@ AGENT_CSV = args.trace_prefix + "_agent_info.csv"
 # "memcpy_d2h" lane in the Perfetto JSON so the trace matches NV nsys's
 # default memcpy lane visibility.
 MEMCPY_CSV = args.trace_prefix + "_memory_copy_trace.csv"
+# Optional: rocprofv3 --rccl-trace output (RCCL API calls: ncclAllReduce,
+# ncclAllGather, ncclSend, ncclRecv, ncclGroupStart/End, ...).  schema has
+# no nelements/datatype args (those would require HCTR-side roctx markers),
+# but we use the Function counts + time ranges to (a) summarise per-window
+# op-type breakdown as a marker event, and (b) tag the rccl kernel events
+# by their stream role (rccl_dedicated -> allreduce; embedding_a2a ->
+# alltoall; etc.) so the trace distinguishes operation types.
+RCCL_CSV = args.trace_prefix + "_rccl_api_trace.csv"
 GPU = args.gpu
 FIRST_ITER = args.first_iter
 N_ITERS = args.n_iters
@@ -226,6 +234,10 @@ COLOR = {
     "memcpy_h2d":    "thread_state_iowait",
     "memcpy_d2h":    "thread_state_runnable",
     "memcpy_d2d":    "grey",
+    "rccl_allreduce":  "rail_response",
+    "rccl_allgather":  "rail_response",
+    "rccl_alltoall":   "rail_response",
+    "rccl_collective": "rail_response",
     "memset":        "grey",
     "hctr_other":    "white",
     "emb_other":     "white",
@@ -814,14 +826,126 @@ ROLE_SORT = {
 }
 
 print("  --- per-stream role classification ---", file=sys.stderr)
+stream_role_by_tid = {}
 for sid in unique_streams:
     role = stream_role(sid)
+    stream_role_by_tid[sid] = role
     name = f"stream {sid} ({role})"
     print(f"    tid={sid}  role={role}", file=sys.stderr)
     events.append({"name": "thread_name", "ph": "M", "pid": PID_GPU, "tid": sid,
                    "args": {"name": name}})
     events.append({"name": "thread_sort_index", "ph": "M", "pid": PID_GPU, "tid": sid,
                    "args": {"sort_index": ROLE_SORT.get(role, 90)}})
+
+# ----------------------------------------------------------------------------
+# Phase-19b enhancement: RCCL operation-type tagging
+#
+# RCCL kernels on AMD ROCm 7.2 all share one generic name
+# (ncclDevKernel_Generic_1) so we can't tell allreduce / allgather /
+# alltoall apart from the kernel name alone.  Two complementary fixes:
+#
+#   (a) Stream-role heuristic: kernels on a rccl_dedicated stream
+#       (Phase-15 dedicated rccl_emb_ar / rccl_mlp_wgrad lanes) are
+#       almost certainly ncclAllReduce; kernels on the embedding_a2a
+#       stream are the all-to-all send/recv collectives; kernels on the
+#       sparse_prep / embedding_mp streams that match the rccl category
+#       are ncclAllGather (swizzle-key all-gather).  Relabel each
+#       [rccl] event in-place by stream role.
+#
+#   (b) Per-window summary: parse rccl_api_trace.csv (rocprofv3
+#       --rccl-trace output) and emit a single instant-event annotation
+#       with the per-operation-type counts in the trace window
+#       (so the user can confirm e.g. "5 iters: 90 allreduces, 16
+#       allgathers, 2756 send/recv = ~167 alltoall groups").
+# ----------------------------------------------------------------------------
+RCCL_ROLE_OP = {
+    # rccl_dedicated lanes carry the Phase-15-isolated AllReduce ops
+    # (rccl_emb_ar / rccl_mlp_wgrad).
+    "rccl_dedicated":  "rccl_allreduce",
+    # embedding_a2a / sparse_prep / embedding_mp streams all carry
+    # send/recv pairs that implement the embedding alltoall (RCCL's
+    # alltoall is built from grouped ncclSend+ncclRecv collectives, not
+    # an ncclAllToAll primitive). DLRM-DCNv2 doesn't use ncclAllGather
+    # in steady state (RCCL API summary confirms 0 allgather calls).
+    "embedding_a2a":   "rccl_alltoall",
+    "sparse_prep":     "rccl_alltoall",
+    "embedding_mp":    "rccl_alltoall",
+}
+
+# (a) relabel each rccl event by its stream role
+rccl_relabel_counts = defaultdict(int)
+for e in events:
+    if e.get("cat") == "rccl" and e.get("ph") == "X":
+        role = stream_role_by_tid.get(e.get("tid"), "")
+        op = RCCL_ROLE_OP.get(role, "rccl_collective")
+        e["cat"] = op
+        # rewrite display name with operation type prefix
+        if e["name"].startswith("[rccl] "):
+            e["name"] = f"[{op}] " + e["name"][len("[rccl] "):]
+        # color hint
+        e["cname"] = {"rccl_allreduce": "rail_response",
+                      "rccl_alltoall":  "rail_response",
+                      "rccl_allgather": "rail_response",
+                      "rccl_collective": "rail_response"}[op]
+        rccl_relabel_counts[op] += 1
+
+if rccl_relabel_counts:
+    print(f"  --- RCCL operation-type tagging (by stream role) ---",
+          file=sys.stderr)
+    for op, n in sorted(rccl_relabel_counts.items(), key=lambda x: -x[1]):
+        print(f"    {n:4d}  -> {op}", file=sys.stderr)
+
+# (b) per-window RCCL API summary from rocprofv3 --rccl-trace
+if os.path.exists(RCCL_CSV):
+    print(f"Loading {RCCL_CSV} (RCCL API summary) ...", file=sys.stderr)
+    rccl_op_counts = defaultdict(int)
+    n_rccl_in_window = 0
+    with open(RCCL_CSV) as f:
+        for row in csv.DictReader(f):
+            fn = row.get("Function", "").strip('"')
+            try:
+                start = int(row["Start_Timestamp"])
+            except (ValueError, KeyError):
+                continue
+            if start < T_START or start >= T_END:
+                continue
+            # only count collective ops, skip util calls
+            if fn.startswith("nccl") and fn not in (
+                    "ncclCommGetAsyncError", "ncclCommCount",
+                    "ncclGetVersion", "ncclCommDestroy",
+                    "ncclGetUniqueId", "ncclCommInitAll"):
+                rccl_op_counts[fn] += 1
+                n_rccl_in_window += 1
+    if rccl_op_counts:
+        print(f"  RCCL API calls in window: {n_rccl_in_window}", file=sys.stderr)
+        for fn, n in sorted(rccl_op_counts.items(), key=lambda x: -x[1]):
+            print(f"    {n:5d}  {fn}", file=sys.stderr)
+        # number of all-to-all groups = number of ncclGroupStart calls
+        # (each group bracket = one logical alltoall collective)
+        n_a2a_groups = rccl_op_counts.get("ncclGroupStart", 0)
+        n_send = rccl_op_counts.get("ncclSend", 0)
+        # emit a single instant marker at trace start with the summary
+        summary = (
+            f"RCCL API in window ({N_ITERS} iters): "
+            f"{rccl_op_counts.get('ncclAllReduce', 0)} allreduce, "
+            f"{rccl_op_counts.get('ncclAllGather', 0)} allgather, "
+            f"~{n_a2a_groups} alltoall groups "
+            f"({n_send} send/recv pairs)"
+        )
+        events.append({
+            "name": summary,
+            "cat": "rccl_summary",
+            "ph": "I",   # instant event
+            "ts": 0.0,
+            "pid": PID_GPU,
+            "tid": 0,
+            "s": "p",    # process-wide
+            "args": dict(rccl_op_counts),
+        })
+else:
+    print(f"  (no {RCCL_CSV} present -- run rocprofv3 with "
+          f"--rccl-trace to populate the RCCL op-type summary)",
+          file=sys.stderr)
 
 for tid, lane in host_tid_to_lane.items():
     events.append({"name": "thread_name", "ph": "M", "pid": PID_HOST, "tid": lane,
