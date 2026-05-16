@@ -20,6 +20,10 @@
 #include <embedding/data_distributor/data_distributor.hpp>
 #include <utils.cuh>
 #include <utils.hpp>
+// Phase-19 (AMD perf-port): dynamic_cast to the concrete hctr_internal::GPUResource
+// to reach the dedicated memcpy stream + cached events without touching
+// the abstract core::GPUResourceBase ABI.
+#include <core/hctr_impl/hctr_backend.hpp>
 
 namespace embedding {
 namespace tf {
@@ -132,6 +136,28 @@ __global__ void fill_unique_range(uint32_t *__restrict__ unique_table_range, int
 
 namespace swizzle_key {
 
+namespace {
+// Phase-19 (AMD perf-port): opt-in knob to park the per-table swizzle d2d
+// copies on a dedicated memcpy stream so they overlap with subsequent
+// computation_stream work. Disabled by default; enable with
+// HCTR_USE_MEMCPY_STREAM=1.
+inline bool use_memcpy_stream() {
+  static const bool enabled = []() {
+    const char *e = std::getenv("HCTR_USE_MEMCPY_STREAM");
+    return e && e[0] == '1';
+  }();
+  return enabled;
+}
+
+// Reach the concrete hctr_internal::GPUResource so we can use the dedicated
+// memcpy stream + cached events. Returns nullptr if the backing GPUResource
+// is not the hctr_internal flavor (e.g. unit-test mocks).
+inline hctr_internal::GPUResource *as_hctr_internal(
+    const std::shared_ptr<core::GPUResourceBase> &local_gpu) {
+  return dynamic_cast<hctr_internal::GPUResource *>(local_gpu.get());
+}
+}  // namespace
+
 void weighted_sparse_forward_per_gpu(std::shared_ptr<CoreResourceManager> core,
                                      const std::vector<core23::Tensor> &keys,
                                      const std::vector<core23::Tensor> &row_lengths,
@@ -139,27 +165,43 @@ void weighted_sparse_forward_per_gpu(std::shared_ptr<CoreResourceManager> core,
                                      core23::Tensor &key_all_gather_send_buffer,
                                      core23::Tensor &row_lengths_all_gather_send_buffer,
                                      core23::Tensor &sp_weight_all_gather_send_buffer) {
+  auto local_gpu = core->get_local_gpu();
+  hipStream_t main_stream = local_gpu->get_stream();
+  hctr_internal::GPUResource *gpu_internal = use_memcpy_stream() ? as_hctr_internal(local_gpu) : nullptr;
+  const bool route_to_memcpy = (gpu_internal != nullptr);
+  hipStream_t copy_stream = main_stream;
+  hipEvent_t pre_evt = nullptr;
+  hipEvent_t post_evt = nullptr;
+  if (route_to_memcpy) {
+    copy_stream = gpu_internal->get_memcpy_stream();
+    pre_evt = gpu_internal->get_event("hctr_p19_swizzle_w_pre");
+    post_evt = gpu_internal->get_event("hctr_p19_swizzle_w_post");
+    HCTR_LIB_THROW(hipEventRecord(pre_evt, main_stream));
+    HCTR_LIB_THROW(hipStreamWaitEvent(copy_stream, pre_evt, 0));
+  }
   size_t key_bytes_offset = 0;
   size_t sp_weight_bytes_offset = 0;
   size_t row_lengths_bytes_offset = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
     HCTR_LIB_THROW(hipMemcpyAsync(
         reinterpret_cast<char *>(key_all_gather_send_buffer.data()) + key_bytes_offset,
-        keys[i].data(), keys[i].num_bytes(), hipMemcpyDeviceToDevice,
-        core->get_local_gpu()->get_stream()));
+        keys[i].data(), keys[i].num_bytes(), hipMemcpyDeviceToDevice, copy_stream));
     key_bytes_offset += keys[i].num_bytes();
     HCTR_LIB_THROW(hipMemcpyAsync(
         reinterpret_cast<char *>(sp_weight_all_gather_send_buffer.data()) + sp_weight_bytes_offset,
-        sp_weights[i].data(), sp_weights[i].num_bytes(), hipMemcpyDeviceToDevice,
-        core->get_local_gpu()->get_stream()));
+        sp_weights[i].data(), sp_weights[i].num_bytes(), hipMemcpyDeviceToDevice, copy_stream));
     sp_weight_bytes_offset += sp_weights[i].num_bytes();
 
     HCTR_LIB_THROW(
         hipMemcpyAsync(reinterpret_cast<char *>(row_lengths_all_gather_send_buffer.data()) +
                             row_lengths_bytes_offset,
                         row_lengths[i].data(), row_lengths[i].num_bytes(), hipMemcpyDeviceToDevice,
-                        core->get_local_gpu()->get_stream()));
+                        copy_stream));
     row_lengths_bytes_offset += row_lengths[i].num_bytes();
+  }
+  if (route_to_memcpy) {
+    HCTR_LIB_THROW(hipEventRecord(post_evt, copy_stream));
+    HCTR_LIB_THROW(hipStreamWaitEvent(main_stream, post_evt, 0));
   }
 }
 
@@ -168,21 +210,38 @@ void sparse_forward_per_gpu(std::shared_ptr<CoreResourceManager> core,
                             const std::vector<core23::Tensor> &row_lengths,
                             core23::Tensor &key_all_gather_send_buffer,
                             core23::Tensor &row_lengths_all_gather_send_buffer) {
+  auto local_gpu = core->get_local_gpu();
+  hipStream_t main_stream = local_gpu->get_stream();
+  hctr_internal::GPUResource *gpu_internal = use_memcpy_stream() ? as_hctr_internal(local_gpu) : nullptr;
+  const bool route_to_memcpy = (gpu_internal != nullptr);
+  hipStream_t copy_stream = main_stream;
+  hipEvent_t pre_evt = nullptr;
+  hipEvent_t post_evt = nullptr;
+  if (route_to_memcpy) {
+    copy_stream = gpu_internal->get_memcpy_stream();
+    pre_evt = gpu_internal->get_event("hctr_p19_swizzle_pre");
+    post_evt = gpu_internal->get_event("hctr_p19_swizzle_post");
+    HCTR_LIB_THROW(hipEventRecord(pre_evt, main_stream));
+    HCTR_LIB_THROW(hipStreamWaitEvent(copy_stream, pre_evt, 0));
+  }
   size_t key_bytes_offset = 0;
   size_t row_lengths_bytes_offset = 0;
   for (size_t i = 0; i < keys.size(); ++i) {
     HCTR_LIB_THROW(hipMemcpyAsync(
         reinterpret_cast<char *>(key_all_gather_send_buffer.data()) + key_bytes_offset,
-        keys[i].data(), keys[i].num_bytes(), hipMemcpyDeviceToDevice,
-        core->get_local_gpu()->get_stream()));
+        keys[i].data(), keys[i].num_bytes(), hipMemcpyDeviceToDevice, copy_stream));
     key_bytes_offset += keys[i].num_bytes();
 
     HCTR_LIB_THROW(
         hipMemcpyAsync(reinterpret_cast<char *>(row_lengths_all_gather_send_buffer.data()) +
                             row_lengths_bytes_offset,
                         row_lengths[i].data(), row_lengths[i].num_bytes(), hipMemcpyDeviceToDevice,
-                        core->get_local_gpu()->get_stream()));
+                        copy_stream));
     row_lengths_bytes_offset += row_lengths[i].num_bytes();
+  }
+  if (route_to_memcpy) {
+    HCTR_LIB_THROW(hipEventRecord(post_evt, copy_stream));
+    HCTR_LIB_THROW(hipStreamWaitEvent(main_stream, post_evt, 0));
   }
 }
 }  // namespace swizzle_key
