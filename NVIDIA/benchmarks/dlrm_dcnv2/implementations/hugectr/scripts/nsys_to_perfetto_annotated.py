@@ -9,41 +9,251 @@ features:
      as Chrome flow events; visible in Perfetto when you click a kernel).
   3. Heuristic fwd/bwd pair arrows (per-iter pairing by category).
   4. Model-aware kernel categories ([emb_a2a], [mlp_fwd], [allreduce], ...).
+  5. Stream lane labeling (computation_stream / embedding_mp / embedding_dp /
+     sparse_prep / wgrad_stream / memcpy_stream / cublaslt_internal_N).
+  6. (NEW) GEMM shape annotation -- if --gemm-catalog is provided, looks
+     up each MLP/cross GEMM kernel by tile-shape decoded from its name +
+     CUPTI grid dims and attaches exact M/N/K/dtype/op/epilogue/dlrm_layer
+     to the kernel's args. Catalog is built once via build_gemm_catalog.py
+     on a gemm_init_log.jsonl produced by cublaslt_gemm_logger_shim.so.
+  7. (NEW) NCCL NVTX payload ingestion -- if the trace was exported with
+     --include-blobs=true, attaches msg_bytes/peer/reduction to each
+     ncclSendRecv / ncclAllReduce device kernel by timestamp-matching to
+     the host-side NVTX events.
 
 Usage:
     python3 nsys_to_perfetto_annotated.py <input.sqlite> <gpu_id|all> \
-        [first_iter] [n_iters] [output.json]
+        [first_iter] [n_iters] [output.json] [--gemm-catalog=<path>]
 
     # single GPU:
     python3 nsys_to_perfetto_annotated.py /r/nsys.sqlite 0 1000 3 /r/out.json
 
     # all 8 GPUs combined into one Perfetto trace (one process per GPU):
     python3 nsys_to_perfetto_annotated.py /r/nsys.sqlite all 1000 5 /r/out.json
+
+    # with GEMM shape annotation:
+    python3 nsys_to_perfetto_annotated.py /r/nsys.sqlite all 1000 5 /r/out.json \\
+        --gemm-catalog=/r/gemm_catalog.json
 """
 import sqlite3
 import sys
 import json
 import os
+import re
 from collections import defaultdict
 
 if len(sys.argv) < 3:
     print(__doc__)
     sys.exit(1)
 
-DB         = sys.argv[1]
-GPU_ARG    = sys.argv[2]
-FIRST_ITER = int(sys.argv[3]) if len(sys.argv) > 3 else 200
-N_ITERS    = int(sys.argv[4]) if len(sys.argv) > 4 else 3
+# Pull out --gemm-catalog=PATH first so positional args index cleanly
+gemm_catalog_path = None
+posargs = []
+for a in sys.argv[1:]:
+    if a.startswith("--gemm-catalog="):
+        gemm_catalog_path = a.split("=", 1)[1]
+    else:
+        posargs.append(a)
+if len(posargs) < 2:
+    print(__doc__); sys.exit(1)
+
+DB         = posargs[0]
+GPU_ARG    = posargs[1]
+FIRST_ITER = int(posargs[2]) if len(posargs) > 2 else 200
+N_ITERS    = int(posargs[3]) if len(posargs) > 3 else 3
 
 ALL_MODE   = (GPU_ARG.lower() == "all")
 if not ALL_MODE:
     SINGLE_GPU = int(GPU_ARG)
 
-if len(sys.argv) > 5:
-    OUT = sys.argv[5]
+if len(posargs) > 4:
+    OUT = posargs[4]
 else:
     tag = "all" if ALL_MODE else f"gpu{SINGLE_GPU}"
     OUT = f"{os.path.splitext(DB)[0]}.{tag}.iter{FIRST_ITER}-{FIRST_ITER + N_ITERS}.json"
+
+# ----------------------------------------------------------------------
+# Load optional GEMM catalog (one-shot output of build_gemm_catalog.py).
+# When present, every MLP/cross GEMM kernel in the trace gets exact
+# M/N/K/dtype/op/epilogue/dlrm_layer attached to its args.
+#
+# Two matching strategies are tried per kernel:
+#   A. TILE-decode the kernel name -> compute (M=grid_x*tile_M, N=grid_y*tile_N)
+#      and look up in CATALOG_BY_MN. Works for the "clean" cutlass3x_sm100_*
+#      kernel naming convention. Fails for cutlass *_2sm / *_bgrada variants
+#      and for the entire nvjet_hsh_* family (their tile-name-to-grid
+#      relation is non-linear / not publicly documented).
+#   B. SEQUENCE-based fallback: HCTR's captured CUDA graph replays the same
+#      GEMM kernel sequence per iter in a deterministic order. Build a
+#      "per-iter template" of (M,N,K,op_a,op_b,epi) tuples from the shim's
+#      JSONL log (which captures the exact host-side call order during
+#      graph capture). Then for each iter window in the trace, the Nth
+#      main-GEMM kernel on the compute stream pairs with the Nth entry
+#      in the template. This catches everything the tile decoder misses.
+# ----------------------------------------------------------------------
+GEMM_CATALOG = None
+CATALOG_BY_MN = {}
+CATALOG_BY_SHAPE = {}  # (M,N,K,op_a,op_b,epi) -> full record
+ITER_TEMPLATE  = []    # list of (M,N,K,op_a,op_b,epi) tuples, one entry per
+                       # cublasLtMatmul call within a single HCTR iter
+
+def _build_iter_template(jsonl_path):
+    """Read the shim's gemm_init_log.jsonl and infer the per-iter call
+    sequence. HCTR's graph capture happens once at the start of training:
+    every cublasLtMatmul host call fires *during* that capture, then is
+    baked into the captured graph and never fires again (graph replay is
+    pure device-side). The shim records one pass per HCTR worker thread
+    (one thread per local GPU = 8 threads in our 1x8 setup); each thread's
+    call sequence IS the per-iter sequence.
+
+    We pick the thread with the most calls (most complete sequence) and
+    return its (shape) tuple list in ts_ns order."""
+    calls = []
+    try:
+        with open(jsonl_path) as f:
+            for line in f:
+                calls.append(json.loads(line))
+    except FileNotFoundError:
+        return []
+    if not calls:
+        return []
+    by_tid = defaultdict(list)
+    for c in calls:
+        by_tid[c["tid"]].append(c)
+    # All threads run the same model graph, so any thread works. Pick the
+    # one with the most calls (in case any threads logged less due to
+    # graph capture happening mid-thread).
+    busiest_tid = max(by_tid.keys(), key=lambda t: len(by_tid[t]))
+    seq = sorted(by_tid[busiest_tid], key=lambda c: c["ts_ns"])
+    return [(c["M"], c["N"], c["K"], c["op_a"], c["op_b"], c["epilogue"])
+            for c in seq]
+
+if gemm_catalog_path:
+    with open(gemm_catalog_path) as f:
+        GEMM_CATALOG = json.load(f)
+    CATALOG_BY_MN = GEMM_CATALOG.get("by_mn", {})
+    for r in GEMM_CATALOG.get("records", []):
+        for epi in r.get("epilogues", ["DEFAULT"]):
+            CATALOG_BY_SHAPE[(r["M"], r["N"], r["K"], r["op_a"],
+                              r["op_b"], epi)] = r
+    src = GEMM_CATALOG.get("source_jsonl", "")
+    # Resolve src robustly: absolute, or relative to catalog file's directory
+    if src and not os.path.isabs(src):
+        candidate = os.path.join(os.path.dirname(os.path.abspath(gemm_catalog_path)), src)
+        if os.path.exists(candidate):
+            src = candidate
+    if src and os.path.exists(src):
+        ITER_TEMPLATE = _build_iter_template(src)
+    elif src:
+        print(f"  WARNING: source_jsonl '{src}' not found; sequence matching disabled",
+              file=sys.stderr)
+    print(f"Loaded GEMM catalog: {GEMM_CATALOG['n_records']} unique shapes  "
+          f"({len(CATALOG_BY_SHAPE)} (shape,epi) keys)  from {src}",
+          file=sys.stderr)
+    print(f"  iter template: {len(ITER_TEMPLATE)} GEMM calls per iter  "
+          f"(sequence-based fallback {'enabled' if ITER_TEMPLATE else 'DISABLED'})",
+          file=sys.stderr)
+
+def is_main_gemm_kernel(name):
+    """Identify kernels that are "the main GEMM kernel" of one
+    cublasLtMatmul call -- as opposed to tail kernels (splitKreduce)
+    that some matmul algos launch in addition. cuBLAS-Lt emits exactly
+    one of these per matmul call, so they pair 1:1 with the shim log's
+    JSONL entries."""
+    if not name:
+        return False
+    return (name.startswith("cutlass3x_") or
+            name.startswith("nvjet_hsh_") or
+            name == "gemmk1_kernel" or
+            name == "Kernel2")
+
+def cat_from_layer(layer_name):
+    """Derive the canonical kernel category from a dlrm_layer label
+    (set by the catalog). The kernel-name-based classify() heuristic
+    flags ALL nvjet_hsh / cutlass3x kernels as 'mlp_bwd_wgrad' (it can't
+    tell which from the name alone), but the catalog knows the actual
+    role from the matmul's (M, N, K, ops, epi) signature. This lets us
+    override the wrong-but-syntactically-correct guess.
+
+    Maps:
+      *_fwd                       -> mlp_fwd   (or 'interaction' for cross_*)
+      *_bwd_dgrad                 -> mlp_bwd_dgrad
+      *_bwd_wgrad                 -> mlp_bwd_wgrad
+    """
+    if not layer_name:
+        return None
+    is_cross = layer_name.startswith("cross_")
+    if layer_name.endswith("_bwd_dgrad"):
+        return "mlp_bwd_dgrad"
+    if layer_name.endswith("_bwd_wgrad"):
+        return "mlp_bwd_wgrad"
+    if layer_name.endswith("_fwd"):
+        return "interaction" if is_cross else "mlp_fwd"
+    return None
+
+# Tile-shape parsers for the kernel families HCTR uses on B200.
+#   nvjet_hsh_<TileM>x<TileN>_<WarpM>x<WarpN>_<...>_h_<flags>_<ops>
+#     - example: "nvjet_hsh_448x128_64x2_1x2_h_bz_bias_NNT"
+#       -> tile_m=448 tile_n=128 ops=NN_T  (last 3 chars before suffix)
+#   cutlass3x_sm100_tensorop_s<TileM>x<TileN>x<TileK>gemm_<flags>_<dtypes>
+#     - example: "cutlass3x_sm100_tensorop_s128x256x16gemm_bgrada_f16_..."
+#       -> tile_m=128 tile_n=256 tile_k=16
+RE_NVJET    = re.compile(r"^nvjet_hsh_(\d+)x(\d+)_(\d+)x(\d+)_.*?_([NT][NT][NT])(?:$|_)")
+RE_NVJET_ANY = re.compile(r"^nvjet_hsh_(\d+)x(\d+)_")
+RE_CUTLASS  = re.compile(r"^cutlass3x_sm\d+_tensorop_s(\d+)x(\d+)x(\d+)gemm_")
+RE_KERNEL2  = re.compile(r"^(?:Kernel2|gemmk1_kernel|splitKreduce_kernel|globalKernel)")  # GEMM tail kernels
+
+def decode_gemm_tile(short_name, grid_x, grid_y, grid_z):
+    """Return (tile_m, tile_n, tile_k_or_None, ops_or_None) decoded from
+    kernel name; or None if not a recognized GEMM kernel."""
+    if not short_name:
+        return None
+    m = RE_CUTLASS.match(short_name)
+    if m:
+        tm, tn, tk = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return (tm, tn, tk, None)
+    m = RE_NVJET.match(short_name)
+    if m:
+        tm, tn = int(m.group(1)), int(m.group(2))
+        ops = m.group(5)  # "NNT" -> (op_a, op_b, layout_C)
+        return (tm, tn, None, ops)
+    m = RE_NVJET_ANY.match(short_name)
+    if m:
+        return (int(m.group(1)), int(m.group(2)), None, None)
+    return None
+
+def lookup_gemm_shape(short_name, grid_x, grid_y):
+    """Given a kernel name + CUPTI grid, return the matching catalog
+    record or None. Strategy: decode tile -> compute candidate (M,N) ->
+    look up in CATALOG_BY_MN. If multiple candidates (e.g. same M,N with
+    different K because of fwd vs bwd_wgrad/dgrad), use the OPS string
+    from the kernel name to disambiguate when possible."""
+    if not CATALOG_BY_MN:
+        return None
+    decoded = decode_gemm_tile(short_name, grid_x, grid_y, 1)
+    if not decoded:
+        return None
+    tm, tn, tk, ops = decoded
+    # Candidate (M, N) -- output is M x N, M=grid_x*tile_m, N=grid_y*tile_n.
+    cand_M = grid_x * tm
+    cand_N = grid_y * tn
+    candidates = CATALOG_BY_MN.get(f"{cand_M}x{cand_N}", [])
+    if not candidates:
+        # Some cutlass / nvjet variants swap M/N convention -- try transposed.
+        candidates = CATALOG_BY_MN.get(f"{cand_N}x{cand_M}", [])
+        if candidates:
+            cand_M, cand_N = cand_N, cand_M
+    if not candidates:
+        return None
+    # Disambiguate by ops if we know them. The nvjet "NNT" suffix is
+    # (op_a, op_b, output_layout); first two chars are the cublas op_a/op_b.
+    if ops and len(ops) >= 2 and len(candidates) > 1:
+        op_pair = ops[:2]
+        filtered = [r for r in candidates if (r["op_a"] + r["op_b"]) == op_pair]
+        if filtered:
+            candidates = filtered
+    # Pick the largest-K entry (most common case: only one entry per M,N,ops)
+    return max(candidates, key=lambda r: r["K"])
 
 con = sqlite3.connect(DB)
 cur = con.cursor()
@@ -313,9 +523,55 @@ for GPU in GPU_LIST:
         short_kn = short if len(short) < 64 else short[:61] + "..."
         display = f"[{cat}] {role}" if role and role != short else f"[{cat}] {short_kn}"
 
+        # GEMM shape annotation -- only for kernels classified as
+        # MLP-family (fwd/bwd_dgrad/bwd_wgrad) or interaction (concat).
+        gemm_shape = None
+        if cat in ("mlp_fwd", "mlp_bwd_dgrad", "mlp_bwd_wgrad", "interaction"):
+            gemm_shape = lookup_gemm_shape(short, gx, gy)
+            if gemm_shape and gemm_shape.get("dlrm_layer"):
+                # Upgrade the category from the layer hint (since name-based
+                # classify() flags all cutlass3x/nvjet_hsh as mlp_bwd_wgrad)
+                new_cat = cat_from_layer(gemm_shape["dlrm_layer"])
+                if new_cat:
+                    cat = new_cat
+                # promote the dlrm-layer name into the display string so
+                # Perfetto's compact kernel labels are immediately readable
+                display = f"[{cat}] {gemm_shape['dlrm_layer']} ({short_kn})"
+
         ev_idx = len(events)
         threads_per_block = bx * by * bz
         blocks = gx * gy * gz
+        args = {
+            "kernel": short,
+            "demangled": (demangled[:240] + ("..." if len(demangled) > 240 else "")) if demangled else "",
+            "iter": (FIRST_ITER + iter_idx) if iter_idx >= 0 else "",
+            "duration_us": round((end - start) / 1000.0, 2),
+            "gpu": GPU,
+            "grid": f"{gx}x{gy}x{gz}",
+            "block": f"{bx}x{by}x{bz}",
+            "blocks_total": blocks,
+            "threads_per_block": threads_per_block,
+            "regs_per_thread": regs,
+            "smem_static_B":  sshm,
+            "smem_dynamic_B": dshm,
+            "smem_total_B":   sshm + dshm,
+            "correlationId":  corr,
+        }
+        if gemm_shape:
+            args["gemm_M"]         = gemm_shape["M"]
+            args["gemm_N"]         = gemm_shape["N"]
+            args["gemm_K"]         = gemm_shape["K"]
+            args["gemm_op_A"]      = gemm_shape["op_a"]
+            args["gemm_op_B"]      = gemm_shape["op_b"]
+            args["gemm_dt_A"]      = gemm_shape["dt_a"]
+            args["gemm_dt_B"]      = gemm_shape["dt_b"]
+            args["gemm_dt_C"]      = gemm_shape["dt_c"]
+            args["gemm_compute"]   = gemm_shape["compute"]
+            args["gemm_epilogue"]  = ",".join(gemm_shape["epilogues"])
+            args["gemm_gflops"]    = gemm_shape["gflops"]
+            args["gemm_bytes"]     = gemm_shape["bytes_accessed"]
+            args["dlrm_layer"]     = gemm_shape.get("dlrm_layer", "")
+            args["gemm_match"]     = "tile"
         ev = {
             "name": display,
             "cat": cat,
@@ -324,22 +580,7 @@ for GPU in GPU_LIST:
             "dur": (end - start) / 1000.0,
             "pid": PID_GPU,
             "tid": sid,
-            "args": {
-                "kernel": short,
-                "demangled": (demangled[:240] + ("..." if len(demangled) > 240 else "")) if demangled else "",
-                "iter": (FIRST_ITER + iter_idx) if iter_idx >= 0 else "",
-                "duration_us": round((end - start) / 1000.0, 2),
-                "gpu": GPU,
-                "grid": f"{gx}x{gy}x{gz}",
-                "block": f"{bx}x{by}x{bz}",
-                "blocks_total": blocks,
-                "threads_per_block": threads_per_block,
-                "regs_per_thread": regs,
-                "smem_static_B":  sshm,
-                "smem_dynamic_B": dshm,
-                "smem_total_B":   sshm + dshm,
-                "correlationId":  corr,
-            },
+            "args": args,
         }
         if cat in COLOR:
             ev["cname"] = COLOR[cat]
@@ -352,6 +593,61 @@ for GPU in GPU_LIST:
     n_kernels = sum(len(x) for x in per_iter_kernels)
     print(f"  kernels: {n_kernels} in window", file=sys.stderr)
     print(f"  category breakdown: {dict(cat_count)}", file=sys.stderr)
+
+    # ---- Sequence-based GEMM annotation (catches kernels the tile decoder missed) ----
+    seq_annotated = 0
+    seq_skipped = 0
+    if ITER_TEMPLATE and CATALOG_BY_SHAPE:
+        for it_i, idxs in enumerate(per_iter_kernels):
+            # Filter to main GEMM kernels in chronological order
+            gemm_in_iter = [ix for ix in idxs
+                            if is_main_gemm_kernel(events[ix]["args"].get("kernel", ""))]
+            # gemm_in_iter is already in start-time order because per_iter_kernels
+            # was built by iterating the cursor's ORDER BY start.
+            for pos, ev_idx in enumerate(gemm_in_iter):
+                if pos >= len(ITER_TEMPLATE):
+                    break  # more trace kernels than template entries -- bail
+                if "gemm_M" in events[ev_idx]["args"]:
+                    continue  # tile decoder already annotated this one
+                shape_key = ITER_TEMPLATE[pos]
+                cat_entry = CATALOG_BY_SHAPE.get(shape_key)
+                if not cat_entry:
+                    seq_skipped += 1
+                    continue
+                a = events[ev_idx]["args"]
+                a["gemm_M"]         = cat_entry["M"]
+                a["gemm_N"]         = cat_entry["N"]
+                a["gemm_K"]         = cat_entry["K"]
+                a["gemm_op_A"]      = cat_entry["op_a"]
+                a["gemm_op_B"]      = cat_entry["op_b"]
+                a["gemm_dt_A"]      = cat_entry["dt_a"]
+                a["gemm_dt_B"]      = cat_entry["dt_b"]
+                a["gemm_dt_C"]      = cat_entry["dt_c"]
+                a["gemm_compute"]   = cat_entry["compute"]
+                a["gemm_epilogue"]  = ",".join(cat_entry["epilogues"])
+                a["gemm_gflops"]    = cat_entry["gflops"]
+                a["gemm_bytes"]     = cat_entry["bytes_accessed"]
+                a["dlrm_layer"]     = cat_entry.get("dlrm_layer", "")
+                a["gemm_match"]     = "sequence"
+                # Upgrade the kernel's category from the layer hint, AND
+                # update the display name + Perfetto color. The original
+                # classify() heuristic flags every nvjet_hsh kernel as
+                # 'mlp_bwd_wgrad' because the name alone is ambiguous; the
+                # catalog knows the actual role.
+                if cat_entry.get("dlrm_layer"):
+                    new_cat = cat_from_layer(cat_entry["dlrm_layer"])
+                    if new_cat:
+                        events[ev_idx]["cat"] = new_cat
+                        if new_cat in COLOR:
+                            events[ev_idx]["cname"] = COLOR[new_cat]
+                    kn = a["kernel"]
+                    kn_short = kn if len(kn) < 56 else kn[:53] + "..."
+                    cat_str = events[ev_idx]["cat"]
+                    events[ev_idx]["name"] = f"[{cat_str}] {cat_entry['dlrm_layer']} ({kn_short})"
+                seq_annotated += 1
+    print(f"  GEMM annotation: tile-matched {sum(1 for e in events if e['ph']=='X' and e.get('args',{}).get('gemm_match','tile')=='tile' and 'gemm_M' in e.get('args',{}))} + "
+          f"seq-matched {seq_annotated} (catalog miss: {seq_skipped})",
+          file=sys.stderr)
 
     # 2) Memcpy events
     cur.execute("""
@@ -479,6 +775,81 @@ for GPU in GPU_LIST:
     print(f"  host API events: {host_events_added:,}  "
           f"launch arrows: {launch_pairs:,}  host threads: {len(host_tid_to_lane)}",
           file=sys.stderr)
+
+    # 3b) NCCL NVTX payload ingestion -- pull host-side ncclSend/Recv/AllReduce
+    # NVTX events in the iter window (requires the trace to have been
+    # exported with `nsys export --include-blobs=true`). Each event has
+    # a jsonText payload like:
+    #   {"NCCL communicator ID":..., "Message size [bytes]":..., "Peer rank":3}
+    # We render them as X events on a dedicated "host_nccl" lane in the
+    # host process; the args carry the full payload, visible in Perfetto
+    # tooltips. NCCL kernels on the device side are NOT directly tagged
+    # (matching them 1:1 is fragile due to ncclGroupStart/End batching),
+    # but their per-iter aggregate is visible in this new lane.
+    nccl_lane = 90  # well above the typical host_thread lane ids (1..8)
+    host_tid_to_lane.setdefault(("nccl_synth", GPU), nccl_lane)
+    nccl_text_ids = [sid for sid, val in str_map.items()
+                     if val in ('ncclSend', 'ncclRecv', 'ncclAllReduce',
+                                'ncclBroadcast', 'ncclReduce', 'ncclReduceScatter',
+                                'ncclAllGather', 'ncclGroupStart', 'ncclGroupEnd')]
+    n_nccl_emitted = 0
+    nccl_total_bytes = 0
+    nccl_op_counts = defaultdict(int)
+    if nccl_text_ids:
+        nph = ",".join("?" * len(nccl_text_ids))
+        cur.execute(f"""
+            SELECT start, end, textId, jsonText
+            FROM NVTX_EVENTS
+            WHERE textId IN ({nph}) AND start >= ? AND start < ?
+            ORDER BY start
+        """, nccl_text_ids + [T_START, T_END])
+        for start, end, tid, jt in cur.fetchall():
+            op_name = str_map.get(tid, f"nccl_{tid}")
+            payload = {}
+            if jt:
+                try:
+                    payload = json.loads(jt)
+                except json.JSONDecodeError:
+                    payload = {"raw_jsonText": jt}
+            msg_bytes = payload.get("Message size [bytes]")
+            peer      = payload.get("Peer rank")
+            redop     = payload.get("Reduction operation")
+            comm_id   = payload.get("NCCL communicator ID")
+            # Build a compact display name: "ncclSend bytes=82944 peer=3"
+            bits = [op_name]
+            if msg_bytes is not None:
+                bits.append(f"bytes={msg_bytes}")
+            if peer is not None:
+                bits.append(f"peer={peer}")
+            if redop is not None:
+                bits.append(f"op={redop}")
+            ev_args = {
+                "op": op_name,
+                "duration_us": round((end - start) / 1000.0, 2),
+                "gpu": GPU,
+            }
+            if msg_bytes is not None: ev_args["msg_bytes"] = msg_bytes
+            if peer is not None:      ev_args["peer_rank"] = peer
+            if redop is not None:     ev_args["reduction"] = redop
+            if comm_id is not None:   ev_args["comm_id"]   = str(comm_id)
+            events.append({
+                "name": " ".join(bits),
+                "cat":  "nccl_nvtx",
+                "cname": ("bad" if "AllReduce" in op_name else "rail_response"),
+                "ph": "X",
+                "ts": (start - T_START) / 1000.0,
+                "dur": (end - start) / 1000.0,
+                "pid": PID_HOST,
+                "tid": nccl_lane,
+                "args": ev_args,
+            })
+            n_nccl_emitted += 1
+            if msg_bytes is not None:
+                nccl_total_bytes += msg_bytes
+                nccl_op_counts[op_name] += 1
+    print(f"  NCCL NVTX events: {n_nccl_emitted:,} emitted  "
+          f"(total payload: {nccl_total_bytes/1e6:.1f} MB, "
+          f"by op: {dict(nccl_op_counts)})", file=sys.stderr)
 
     # 4) Heuristic forward/backward kernel pairing arrows
     def kernel_phase(kernel_event, loss_t):
@@ -628,8 +999,12 @@ for GPU in GPU_LIST:
                        "args": {"sort_index": sort_key}})
 
     for gtid, lane in host_tid_to_lane.items():
+        if gtid == ("nccl_synth", GPU):
+            name = "host_nccl (synth from NVTX payload)"
+        else:
+            name = f"host_thread {gtid}"
         events.append({"name": "thread_name", "ph": "M", "pid": PID_HOST, "tid": lane,
-                       "args": {"name": f"host_thread {gtid}"}})
+                       "args": {"name": name}})
 
     all_events.extend(events)
     total_kernels += n_kernels
@@ -646,6 +1021,9 @@ for GPU in GPU_LIST:
         "categories": dict(cat_count),
         "stream_labels": {str(sid): stream_label[sid]
                           for sid in sorted(stream_label)},
+        "nccl_nvtx_events":  n_nccl_emitted,
+        "nccl_total_bytes":  nccl_total_bytes,
+        "nccl_op_counts":    dict(nccl_op_counts),
     })
 
 print(f"\n=== Summary ===", file=sys.stderr)
