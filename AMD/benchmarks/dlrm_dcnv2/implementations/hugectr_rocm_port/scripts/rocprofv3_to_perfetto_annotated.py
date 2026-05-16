@@ -46,8 +46,53 @@ Examples:
     python3 rocprofv3_to_perfetto_annotated.py \
         /home/chcai/trace_a2a_bs55296_5step/a2a_bs55296_5step 0 5 3
 """
-import csv, json, os, sys, argparse
+import csv, json, os, re, sys, argparse
 from collections import defaultdict
+
+# Hot-path parser for hipBLASLt (Tensile) GEMM kernel names. Names look like:
+#   Cijk_Ailk_Bjlk_HHS_BH_Bias_HA_S_SAV_UserArgs_MT128x176x128_MI16x16x1_..._WG64_4_1
+# We extract macro-tile (MT), MFMA shape (MI), dtype prefix, and A/B layout
+# tokens so the converter can surface GEMM problem-size class in event args
+# without requiring HCTR-side instrumentation or hipBLASLt log capture.
+_RE_HIPBLASLT_MT = re.compile(r"_MT(\d+)x(\d+)x(\d+)_")
+_RE_HIPBLASLT_MI = re.compile(r"_MI(\d+)x(\d+)x(\d+)")
+_RE_HIPBLASLT_LAYOUT = re.compile(r"^Cijk_(\w{4})_(\w{4})_")
+_RE_HIPBLASLT_DTYPE = re.compile(r"^Cijk_\w{4}_\w{4}_([A-Z]{2,4})_([A-Z]{1,4})_")
+
+def parse_hipblaslt_kernel_name(name):
+    """Extract GEMM shape/dtype hints from a Tensile-generated kernel name.
+
+    Returns dict with keys (any subset present):
+      macro_tile_m, macro_tile_n, macro_tile_k     -- per-WG output tile
+      mfma_m, mfma_n, mfma_k                         -- MFMA instruction shape
+      layout_a, layout_b                             -- "Ailk"/"Alik" etc.
+      dtype, dtype_compute                           -- "HHS_BH" -> ("HHS","BH")
+    Returns {} if the name doesn't match the Tensile pattern.
+    """
+    if not name or not name.startswith("Cijk_"):
+        return {}
+    info = {}
+    m = _RE_HIPBLASLT_MT.search(name)
+    if m:
+        info["macro_tile_m"] = int(m.group(1))
+        info["macro_tile_n"] = int(m.group(2))
+        info["macro_tile_k"] = int(m.group(3))
+        info["macro_tile"] = f"{m.group(1)}x{m.group(2)}x{m.group(3)}"
+    m = _RE_HIPBLASLT_MI.search(name)
+    if m:
+        info["mfma_m"] = int(m.group(1))
+        info["mfma_n"] = int(m.group(2))
+        info["mfma_k"] = int(m.group(3))
+        info["mfma"] = f"{m.group(1)}x{m.group(2)}x{m.group(3)}"
+    m = _RE_HIPBLASLT_LAYOUT.match(name)
+    if m:
+        info["layout_a"] = m.group(1)
+        info["layout_b"] = m.group(2)
+    m = _RE_HIPBLASLT_DTYPE.match(name)
+    if m:
+        info["dtype"] = m.group(1)
+        info["dtype_compute"] = m.group(2)
+    return info
 
 # ----------------------------------------------------------------------------
 # CLI
@@ -393,8 +438,47 @@ for k in all_kernels:
 
     cat_count[k["cat"]] += 1
     short_kn = k["name"][:60] if len(k["name"]) > 60 else k["name"]
-    display = (f"[{k['cat']}] {k['role']}" if k["role"] and k["role"] != k["name"]
-               else f"[{k['cat']}] {short_kn}")
+    # Parse hipBLASLt GEMM kernel name for macro-tile/MFMA/dtype hints. For
+    # MLP forward/backward GEMMs these go straight into the display string
+    # so each event's lane label shows e.g. [mlp_fwd] MT128x176x128 (HHS).
+    gemm_info = parse_hipblaslt_kernel_name(k["name"])
+    if gemm_info.get("macro_tile"):
+        gemm_label = f"MT{gemm_info['macro_tile']}"
+        if gemm_info.get("dtype"):
+            gemm_label += f" ({gemm_info['dtype']})"
+        display = f"[{k['cat']}] hipBLASLt {gemm_label}"
+    else:
+        display = (f"[{k['cat']}] {k['role']}" if k["role"] and k["role"] != k["name"]
+                   else f"[{k['cat']}] {short_kn}")
+
+    ev_args = {
+        "kernel": k["name"],
+        "iter": (FIRST_ITER + iter_idx) if iter_idx >= 0 else "",
+        "duration_us": round((k["end"] - k["start"]) / 1000.0, 3),
+        # PyTorch-profiler-style launch args (AMD-native)
+        "grid_workgroups": f"{k['gx_blocks']}x{k['gy_blocks']}x{k['gz_blocks']}",
+        "workgroup_size":  f"{k['wgx']}x{k['wgy']}x{k['wgz']}",
+        "blocks_total":    k["blocks_total"],
+        "threads_per_block": k["threads_per_block"],
+        "vgpr_per_thread":  k["vgpr"],
+        "sgpr_count":       k["sgpr"],
+        "lds_bytes":        k["lds"],
+        "scratch_bytes":    k["scratch"],
+        "correlationId":    k["corr"],
+    }
+    if gemm_info:
+        # Surface the parsed GEMM shape directly in the event args so users
+        # can sort/filter by macro-tile or MFMA shape in Perfetto.
+        ev_args.update(gemm_info)
+        # Best-effort problem-size class: workgroups * tile_m * tile_n is
+        # a proxy for output flops (modulo K, batch, and split-K). Real
+        # M/N/K would need hipBLASLt log capture (HIPBLASLT_LOG_FILE=...).
+        wg_total = k["blocks_total"]
+        if (gemm_info.get("macro_tile_m") and gemm_info.get("macro_tile_n")):
+            ev_args["estimated_output_elems"] = (
+                wg_total * gemm_info["macro_tile_m"]
+                         * gemm_info["macro_tile_n"]
+            )
 
     ev = {
         "name": display,
@@ -404,21 +488,7 @@ for k in all_kernels:
         "dur": (k["end"] - k["start"]) / 1000.0, # us
         "pid": PID_GPU,
         "tid": k["sid"],
-        "args": {
-            "kernel": k["name"],
-            "iter": (FIRST_ITER + iter_idx) if iter_idx >= 0 else "",
-            "duration_us": round((k["end"] - k["start"]) / 1000.0, 3),
-            # PyTorch-profiler-style launch args (AMD-native)
-            "grid_workgroups": f"{k['gx_blocks']}x{k['gy_blocks']}x{k['gz_blocks']}",
-            "workgroup_size":  f"{k['wgx']}x{k['wgy']}x{k['wgz']}",
-            "blocks_total":    k["blocks_total"],
-            "threads_per_block": k["threads_per_block"],
-            "vgpr_per_thread":  k["vgpr"],
-            "sgpr_count":       k["sgpr"],
-            "lds_bytes":        k["lds"],
-            "scratch_bytes":    k["scratch"],
-            "correlationId":    k["corr"],
-        },
+        "args": ev_args,
     }
     if k["cat"] in COLOR:
         ev["cname"] = COLOR[k["cat"]]
