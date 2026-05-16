@@ -78,6 +78,12 @@ args = ap.parse_args()
 KT_CSV  = args.trace_prefix + "_kernel_trace.csv"
 HIP_CSV = args.trace_prefix + "_hip_api_trace.csv"
 AGENT_CSV = args.trace_prefix + "_agent_info.csv"
+# Optional: rocprofv3 --memory-copy-trace output (DMA H2D/D2H/D2D events
+# that don't appear under --kernel-trace because they aren't KERNEL_DISPATCH
+# events on ROCm). When present, we surface them as a "memcpy_h2d" /
+# "memcpy_d2h" lane in the Perfetto JSON so the trace matches NV nsys's
+# default memcpy lane visibility.
+MEMCPY_CSV = args.trace_prefix + "_memory_copy_trace.csv"
 GPU = args.gpu
 FIRST_ITER = args.first_iter
 N_ITERS = args.n_iters
@@ -217,6 +223,9 @@ COLOR = {
     "dtype_cast":    "grey",
     "fused_fma":     "grey",
     "memcpy":        "grey",
+    "memcpy_h2d":    "thread_state_iowait",
+    "memcpy_d2h":    "thread_state_runnable",
+    "memcpy_d2d":    "grey",
     "memset":        "grey",
     "hctr_other":    "white",
     "emb_other":     "white",
@@ -413,11 +422,111 @@ print(f"  kernels in window: {n_kern_in_window:,}", file=sys.stderr)
 print(f"  category breakdown: {dict(cat_count)}", file=sys.stderr)
 
 # ----------------------------------------------------------------------------
+# 3b) Load MEMORY_COPY events from rocprofv3 --memory-copy-trace output
+#
+# These are HSA-level DMA transfers (H2D / D2H / D2D). They are NOT captured
+# by --kernel-trace (which only sees KERNEL_DISPATCH ops), so without this
+# step the trace appears to lack a memcpy lane even though the data reader's
+# placement_streams_ are firing per-iter (matches NV nsys's default memcpy
+# lane). Filtered to the same iter window + target Agent as kernels.
+# Schema: Kind,Direction,Stream_Id,Source_Agent_Id,Destination_Agent_Id,
+#         Correlation_Id,Start_Timestamp,End_Timestamp
+# ----------------------------------------------------------------------------
+n_memcpy_in_window = 0
+if os.path.exists(MEMCPY_CSV):
+    print(f"Loading {MEMCPY_CSV} (DMA memcpy events) ...", file=sys.stderr)
+    memcpy_count_by_dir_stream = defaultdict(int)
+    with open(MEMCPY_CSV) as f:
+        for row in csv.DictReader(f):
+            direction = row.get("Direction", "")
+            src = row.get("Source_Agent_Id", "")
+            dst = row.get("Destination_Agent_Id", "")
+            # filter: keep events whose source OR destination is our target GPU
+            if src != TARGET_AGENT and dst != TARGET_AGENT:
+                continue
+            try:
+                start = int(row["Start_Timestamp"])
+                end   = int(row["End_Timestamp"])
+            except (ValueError, KeyError):
+                continue
+            if start < T_START or start >= T_END:
+                continue
+            sid = int(row.get("Stream_Id", 0) or 0)
+            corr = int(row.get("Correlation_Id", 0) or 0)
+            # short label: H2D / D2H / D2D
+            if "HOST_TO_DEVICE" in direction:
+                short_dir = "H2D"
+                cat = "memcpy_h2d"
+            elif "DEVICE_TO_HOST" in direction:
+                short_dir = "D2H"
+                cat = "memcpy_d2h"
+            elif "DEVICE_TO_DEVICE" in direction:
+                short_dir = "D2D"
+                cat = "memcpy_d2d"
+            else:
+                short_dir = direction
+                cat = "memcpy"
+            # which iter
+            iter_idx = -1
+            for i in range(N_ITERS):
+                lo = iter_ends[FIRST_ITER - 1 + i]
+                hi = iter_ends[FIRST_ITER + i]
+                if lo <= start < hi:
+                    iter_idx = i
+                    break
+            src_clean = src.replace('"', '')
+            dst_clean = dst.replace('"', '')
+            events.append({
+                "name": f"[{cat}] {short_dir} {src_clean}->{dst_clean}",
+                "cat": cat,
+                "ph": "X",
+                "ts": (start - T_START) / 1000.0,
+                "dur": (end - start) / 1000.0,
+                "pid": PID_GPU,
+                "tid": sid,
+                "args": {
+                    "direction": direction,
+                    "source": src,
+                    "destination": dst,
+                    "duration_us": round((end - start) / 1000.0, 3),
+                    "correlationId": corr,
+                    "iter": (FIRST_ITER + iter_idx) if iter_idx >= 0 else "",
+                },
+                "cname": "grey",
+            })
+            n_memcpy_in_window += 1
+            memcpy_count_by_dir_stream[(short_dir, sid)] += 1
+    print(f"  DMA memcpy events in window (on {TARGET_AGENT}): {n_memcpy_in_window:,}",
+          file=sys.stderr)
+    if n_memcpy_in_window:
+        print(f"  --- memcpy count by (direction, stream) ---", file=sys.stderr)
+        for (d, sid), c in sorted(memcpy_count_by_dir_stream.items(),
+                                  key=lambda x: -x[1])[:10]:
+            print(f"    {d}  stream {sid:5d}  count={c}", file=sys.stderr)
+else:
+    print(f"  (no {MEMCPY_CSV} present -- run rocprofv3 with "
+          f"--memory-copy-trace to populate the memcpy lane)", file=sys.stderr)
+
+# ----------------------------------------------------------------------------
 # 4) Host-side HIP API events + launch flow arrows
 # ----------------------------------------------------------------------------
 print(f"Loading {HIP_CSV} (host API events) ...", file=sys.stderr)
 
-# Map host TIDs to small lane indices (per process)
+# Determine the "owner" host thread for this GPU: the host TID that issued
+# the most kernels for our target GPU agent. NV trace convention: only one
+# host thread per GPU section. We filter out all other host TIDs to keep
+# the trace lane count low and the visualization clean.
+host_tid_kernel_count = defaultdict(int)
+for k in all_kernels:
+    if k["tid"] > 0:
+        host_tid_kernel_count[k["tid"]] += 1
+gpu_owner_host_tid = (max(host_tid_kernel_count, key=host_tid_kernel_count.get)
+                     if host_tid_kernel_count else 0)
+print(f"  GPU owner host TID: {gpu_owner_host_tid} "
+      f"({host_tid_kernel_count.get(gpu_owner_host_tid, 0)} kernels)",
+      file=sys.stderr)
+
+# Map host TIDs to small lane indices (per process). Only the owner gets a lane.
 host_tid_to_lane = {}
 def lane_of(tid):
     if tid not in host_tid_to_lane:
@@ -429,6 +538,7 @@ def lane_of(tid):
 window_corrs = set(kernel_by_corr.keys())
 launch_pairs = 0
 host_api_added = 0
+host_api_skipped_nonowner = 0
 
 with open(HIP_CSV) as f:
     reader = csv.DictReader(f)
@@ -457,6 +567,13 @@ with open(HIP_CSV) as f:
             "LaunchKernel", "GraphLaunch", "MemcpyAsync", "Memcpy",
             "StreamSync", "EventSync", "DeviceSync"))
         if not match and not (in_window and is_interesting):
+            continue
+        # Only keep host events from THIS GPU's owner host thread. Other host
+        # threads' events would clutter the host lane with unrelated activity
+        # from sibling GPUs (each GPU has its own owner). Match NV's nsys
+        # convention of one host_thread per GPU section.
+        if tid != gpu_owner_host_tid:
+            host_api_skipped_nonowner += 1
             continue
 
         cname = ("bad" if "GraphLaunch" in fname
@@ -497,6 +614,8 @@ with open(HIP_CSV) as f:
             launch_pairs += 1
 
 print(f"  host API events kept: {host_api_added:,}", file=sys.stderr)
+print(f"  host API events skipped (non-owner TID): {host_api_skipped_nonowner:,}",
+      file=sys.stderr)
 print(f"  host->device launch arrows: {launch_pairs:,}", file=sys.stderr)
 print(f"  host threads (lanes): {len(host_tid_to_lane)}", file=sys.stderr)
 
@@ -598,14 +717,117 @@ events.append({"name": "process_name", "ph": "M", "pid": PID_GPU, "tid": 0,
 events.append({"name": "process_name", "ph": "M", "pid": PID_HOST, "tid": 0,
                "args": {"name": f"Host (rank {GPU})"}})
 
+# --- Stream semantic-role classifier ---
+# Match NV's nsys convention of naming streams by their role
+# (computation_stream, embedding_mp, embedding_dp, sparse_prep, memcpy_stream,
+# rccl_emb_ar, rccl_mlp_wgrad, etc.) by inspecting each stream's category mix.
 unique_streams = sorted({e["tid"] for e in events
                          if e.get("pid") == PID_GPU and e.get("ph") == "X"})
+
+def stream_role(sid):
+    """Classify a stream's purpose from its kernel category mix."""
+    cat_dur = defaultdict(float)
+    for e in events:
+        if e.get("pid") == PID_GPU and e.get("ph") == "X" and e["tid"] == sid:
+            cat_dur[e.get("cat", "?")] += e.get("dur", 0.0)
+    total = sum(cat_dur.values())
+    if total < 1.0:
+        return "idle_stream"
+    rccl    = cat_dur.get("rccl", 0) + cat_dur.get("allreduce", 0) + cat_dur.get("emb_a2a", 0)
+    mlp     = sum(cat_dur.get(c, 0) for c in
+                  ("mlp_fwd", "mlp_bwd_dgrad", "mlp_bwd_wgrad",
+                   "fused_fma", "interaction"))
+    emb     = sum(cat_dur.get(c, 0) for c in
+                  ("emb_fwd", "emb_reduce", "emb_scatter", "opt_emb",
+                   "emb_other"))
+    sparse  = cat_dur.get("sparse_prep", 0)
+    memcpy  = (cat_dur.get("memcpy", 0) + cat_dur.get("memcpy_h2d", 0) +
+               cat_dur.get("memcpy_d2h", 0) + cat_dur.get("memcpy_d2d", 0))
+    memset  = cat_dur.get("memset", 0)
+    loss    = cat_dur.get("loss", 0)
+    other   = total - (rccl + mlp + emb + sparse + memcpy + memset + loss)
+
+    f_rccl, f_mlp, f_emb = rccl/total, mlp/total, emb/total
+    f_sparse, f_memcpy = sparse/total, memcpy/total
+
+    # 0. Pure-memcpy streams (H2D-dominated → data reader's placement_streams_,
+    #    NV's "memcpy lane"). We catch these first because pure-DMA streams
+    #    have ZERO kernel events and would otherwise fall through to "idle".
+    h2d_dur = cat_dur.get("memcpy_h2d", 0)
+    d2h_dur = cat_dur.get("memcpy_d2h", 0)
+    if h2d_dur > 0 and (h2d_dur / total) > 0.85:
+        return "memcpy_h2d"     # placement_stream-style data reader H2D
+    if d2h_dur > 0 and (d2h_dur / total) > 0.85:
+        return "memcpy_d2h"
+    if f_memcpy > 0.85:
+        return "memcpy_stream"  # generic memcpy lane
+
+    # 1. Pure-RCCL streams (no compute) → Phase-15 dedicated RCCL streams
+    #    (rccl_emb_ar / rccl_mlp_wgrad). Threshold tight: ≥95% pure rccl.
+    if f_rccl > 0.95 and f_sparse < 0.05 and f_emb < 0.05:
+        return "rccl_dedicated"
+
+    # 2. RCCL-heavy with some sparse_prep → embedding-a2a stream
+    #    (NV labels this "embedding_mp" but it's the a2a-dominated variant).
+    if f_rccl > 0.65 and f_sparse > 0.05:
+        return "embedding_a2a"
+
+    # 3. RCCL + embedding compute → embedding_mp (model-parallel emb, mixed)
+    if f_rccl > 0.30 and f_emb > 0.15:
+        return "embedding_mp"
+
+    # 4. MLP-dominated → main computation stream (default)
+    if f_mlp > 0.50:
+        return "computation_stream"
+
+    # 5. Embedding-dominated, low RCCL → embedding_dp (data-parallel emb)
+    if f_emb > 0.50 and f_rccl < 0.20:
+        return "embedding_dp"
+
+    # 6. Sparse-prep dominated
+    if f_sparse > 0.50:
+        return "sparse_prep"
+
+    # 7. Memcpy/memset only
+    if f_memcpy > 0.85 or (f_memcpy + cat_dur.get("memset", 0) / total) > 0.85:
+        return "memcpy_stream"
+
+    # 8. Mixed app stream (MLP + embedding + sparse + RCCL all moderate)
+    if f_mlp > 0.20 or f_emb > 0.20:
+        return "mixed_app"
+    return "other"
+
+# NV-style sort_index per role so similar streams group visually
+ROLE_SORT = {
+    "computation_stream":  10,
+    "embedding_mp":        20,
+    "embedding_dp":        30,
+    "embedding_a2a":       35,
+    "rccl_dedicated":      40,
+    "sparse_prep":         50,
+    "memcpy_stream":       60,
+    "memcpy_h2d":          61,
+    "memcpy_d2h":          62,
+    "mixed_app":           70,
+    "other":               80,
+    "idle_stream":         99,
+}
+
+print("  --- per-stream role classification ---", file=sys.stderr)
 for sid in unique_streams:
+    role = stream_role(sid)
+    name = f"stream {sid} ({role})"
+    print(f"    tid={sid}  role={role}", file=sys.stderr)
     events.append({"name": "thread_name", "ph": "M", "pid": PID_GPU, "tid": sid,
-                   "args": {"name": f"stream {sid}"}})
+                   "args": {"name": name}})
+    events.append({"name": "thread_sort_index", "ph": "M", "pid": PID_GPU, "tid": sid,
+                   "args": {"sort_index": ROLE_SORT.get(role, 90)}})
+
 for tid, lane in host_tid_to_lane.items():
     events.append({"name": "thread_name", "ph": "M", "pid": PID_HOST, "tid": lane,
                    "args": {"name": f"host_thread {tid}"}})
+    events.append({"name": "thread_sort_index", "ph": "M", "pid": PID_HOST, "tid": lane,
+                   "args": {"sort_index": 0}})
 
 # ----------------------------------------------------------------------------
 # Write JSON
