@@ -162,10 +162,11 @@ multi-node (`NetworkExchangeWgrad` over RDMA); `mlperf_common` package
 ## Part 2 — Performance Optimization Timeline
 
 Each phase = one logical optimization (often spanning multiple commits).
-All deltas measured at **NVIDIA's exact MLPerf-spec batch (55,296)**
-unless noted, FP16 mixed, real MLPerf Criteo (HF subsample), 8 × MI350X.
-"Sweet spot" used to mean batch 110,592 (Phase 8); after Phase 11 we
-report at the **peak batch 442,368 (8×)** instead.
+All deltas measured at **NVIDIA's MLPerf-spec batch (55,296 = bs=1×, 6,912/GPU)**,
+FP16 mixed, real MLPerf Criteo (HF subsample), 8 × MI350X. The single
+metric we track and compare against NV B200 is bs=1× steady-state M sps;
+historical bs ≥ 2× numbers in individual phase rows are kept for context
+only and are no longer maintained.
 
 ## 2.1 Master timeline table
 
@@ -192,27 +193,15 @@ report at the **peak batch 442,368 (8×)** instead.
 | 14c | 2026-05-13 | **`HCTR_FUSE_WB=True` (at bs ≥ 8×)** — fold weight-bias post-pass into the fused MLP. Stacks on top of 14b. At bs ≤ 4× this is flat or slightly negative (kernel overhead dominates the bias-fuse savings). | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 17.86 → **17.93**; bs4x 17.49 → 17.14 (regress) | **+0.4 % @ bs8x; ‑2.0 % @ bs4x** — auto-disabled below bs8× |
 | **15** | **2026-05-15** | **Dedicated RCCL streams for DP-allreduce + MLP-wgrad-allreduce** (`set_absolute_stream("rccl_emb_ar")`, `set_absolute_stream("rccl_mlp_wgrad")` in `model_pipeline.cpp`). Phase-14r 8-GPU trace showed default stream tid=32 carrying 553 µs of RCCL serialised with 4071 µs of MLP compute; this lever is the AMD-side equivalent of NV's cuBLASLt-internal worker streams (which hipBLASLt does NOT replicate on gfx950). 2-trial bs=1× A/B at 13.080→13.604, 13.125→13.455 → +3.3 % avg lift; loss bit-equivalent (0.291667). Default ON; set `HCTR_DEDICATED_RCCL_STREAM=0` to disable. | (perf-push branch, src/pybind/model_pipeline.cpp lines 222-236, 309-315) | bs1x 13.07 → **13.48** | **+3.0 % @ bs1x** |
 | **16** | **2026-05-15** | **MultiCross dx-accumulator memset elimination.** Phase-14r trace: AMD MI350X has 1003 µs/iter of `__amd_rocclr_fillBufferAligned` (NV has 0). Largest single contributor was `accum_dx_tensor_` (47 MB at bs=1×) zero-init in `MultiCrossBackwardFunctorv2`. Phase-16 adds a "first-iter overwrite" variant of `vector_mul_fma3_align<__half, 8, 4>` that stores `out1 = a * c` instead of `out1 += a * c`, equivalent to "memset(0) + accumulate" but skipping the memset. Uses overwrite path on the first bwd loop iteration only. 2-trial bs=1× A/B at 13.545→13.634, 13.554→13.654 → +0.7 % avg lift; loss bit-equivalent. Default ON; set `HCTR_SKIP_DX_MEMSET=0` to disable. | (perf-push branch, src/layers/multi_cross_layer.cu lines 198-238 + 822-852) | bs1x 13.48 → **13.55** | **+0.7 % @ bs1x** |
-| **18** | **2026-05-15** | **`compute_config.async_wgrad=False` at bs=1×** (set via `HCTR_ASYNC_WGRAD=0` in run script). NV B200 uses `async_wgrad=True` because cuBLASLt-internal worker streams make the parallel wgrad path actually overlap with subsequent compute; on AMD MI350X hipBLASLt has no such workers, so the async path's `computation_stream_2_` ends up paying the cross-stream sync cost without actually overlapping anything (wgrad is the LAST kernel chain in bprop — nothing after it on the same iter to overlap with). 2-trial bs=1× A/B at `=1` vs `=0`: 13.300 vs 13.709 (+3.1 %) and 13.626 vs 13.737 (+0.8 %) → +1.9 % avg lift. Loss bit-equivalent (0.291644 vs 0.291672). 4 runs, 0 divergences. **AMD-specific config inversion vs NV** — train.py default keeps `True` to match NV upstream; `run_apple_to_apple.sh` sets `HCTR_ASYNC_WGRAD=0`. | `run_apple_to_apple.sh:58` | bs1x 13.55 → **13.72** | **+1.2 % @ bs1x** (cumulative over Phase-15+16 baseline) |
 | **17** | **2026-05-15** | **Higher-priority RCCL streams (opt-in only)**. Tried HIP stream priority `-1` for `rccl_emb_ar` + `rccl_mlp_wgrad` to mimic NV cuBLASLt-internal worker streams' implicit higher priority. Initial 2-trial A/B looked like +1.8 % at bs=1×, but a follow-up 3-trial validation revealed **INTERMITTENT first-iter divergence** (1 of 3 runs hit "Loss cannot converge" before iter 200). Likely a HIP runtime scheduling-order non-determinism that interacts badly with FP16 loss-scaling at scaler=16348. **Default OFF for production safety**; opt in via `HCTR_RCCL_STREAM_PRIORITY=-1` (with retry-on-failure). p=-2 always diverges; MI350X HIP min priority is -1 (p=-5 clamps to same). | (perf-push branch, src/pybind/model_pipeline.cpp lines 244-249, 327-333) | bs1x 13.55 → 13.55 (default OFF) | **0 % @ bs1x default; opt-in +1.8 % w/ ~33 % first-iter divergence** |
+| **18** | **2026-05-15** | **`compute_config.async_wgrad=False` at bs=1×** (set via `HCTR_ASYNC_WGRAD=0` in run script). NV B200 uses `async_wgrad=True` because cuBLASLt-internal worker streams make the parallel wgrad path actually overlap with subsequent compute; on AMD MI350X hipBLASLt has no such workers, so the async path's `computation_stream_2_` ends up paying the cross-stream sync cost without actually overlapping anything (wgrad is the LAST kernel chain in bprop — nothing after it on the same iter to overlap with). 2-trial bs=1× A/B at `=1` vs `=0`: 13.300 vs 13.709 (+3.1 %) and 13.626 vs 13.737 (+0.8 %) → +1.9 % avg lift. Loss bit-equivalent (0.291644 vs 0.291672). 4 runs, 0 divergences. **AMD-specific config inversion vs NV** — train.py default keeps `True` to match NV upstream; `run_apple_to_apple.sh` sets `HCTR_ASYNC_WGRAD=0`. | `run_apple_to_apple.sh:58` | bs1x 13.55 → **13.72** | **+1.2 % @ bs1x** (cumulative over Phase-15+16 baseline) |
+| ~~19~~ | 2026-05-15 | **REVERTED — patched dead code path.** First attempt routed `embedding::tf::swizzle_key::sparse_forward_per_gpu` d2d copies onto `GPUResource::memcpy_stream_`. Two issues uncovered post-merge: (1) the `tf::` namespace is the TensorFlow embedding plugin path and is **never called** from the HCTR DLRM-DCNv2 pipeline, so the patch was a no-op; (2) the original audit ("77 in-graph d2d copies/iter on `computation_stream`") was derived from the trace-converter's filtered output, which silently drops streams it doesn't classify — the raw rocprofv3 csv shows ~2,000 d2d copies/5-iter window already distributed across 5 streams in baseline. The reported +0.6-0.9 % A/B "lift" was within ±0.5 % run-to-run noise. Reverted in [next commit]; see `perf_push_status.log` for the post-mortem and re-audit plan. | (reverted) | bs1x 14.20 → 14.20 | **0 %** (no-op) |
 
-**Peak result post-Phase-14: 17.93 M sps at bs8x (442,368)** = 54.7 % of NV B200's May-13 auto+tmpfs bs8x peak (32.77 M sps).
-**bs=1× post-Phase-18 (dedicated RCCL stream + dx-memset elim + async_wgrad off): 13.72 M sps** = 52.1 % of NV B200's bs=1× (26.33 M sps). Phase 17 (RCCL stream priority -1) is opt-in only due to intermittent first-iter divergence — see Phase 17 row.
+**bs=1× post-Phase-18 (default-ON config): 14.20 M sps** = **54.0 %** of NV B200's bs=1× (26.33 M sps).
 
-| Batch (global) | Per-GPU | M sps (default-ON wins only) | vs Phase-13 | vs NV B200 May-13 (same batch) |
-|---:|---:|---:|---:|---:|
-| 55,296 (1×, MLPerf-spec) | 6,912 | **13.72** | +1.3 % (BUFFSIZE) +3.0 % (Phase-15) +0.7 % (Phase-16) +1.9 % (Phase-18 async_wgrad=0) | 52.1 % of 26.33 |
-| 55,296 with `HCTR_RCCL_STREAM_PRIORITY=-1` (opt-in) | 6,912 | ~13.85 (when run converges; ~33 % first-iter divergence rate) | + further +0.7-1.8 % | up to 52.6 % of 26.33 |
-| 110,592 (2×) | 13,824 | **15.31** | flat | 49.8 % of 30.72 |
-| 221,184 (4×) | 27,648 | **17.49** | +6.0 % (FUSE_TOP) | 55.3 % of 31.60 |
-| 442,368 (8×, peak) | 55,296 | **17.93** | +5.6 % (FUSE_TOP+FUSE_WB) | **54.7 %** of 32.77 |
-
-The +29 % bs1x → bs8x win is **not free** — it relaxes the MLPerf-spec
-global batch constraint (55,296). It IS free if the calling task can
-tolerate a larger batch (which our convergence runs do, since DLRM-DCNv2
-converges at any batch size up to ~512K with appropriate LR). NV's
-b200/README §8.2b documents the same batch-size lever giving them
-69 % → 87 % of MLPerf-ref-23M (bs1x → bs4x) for the same reason: the
-~1 ms host-const overhead per iter amortizes over 4–8× more samples.
+| bs=1× config (global batch 55,296, 6,912/GPU) | M sps | trial source | vs NV B200 May-13 bs=1× |
+|---|---:|---|---:|
+| **default-ON wins only (Phase 13 → 18)** | **14.20** | 2026-05-15 4-trial avg (250 iters), σ ≈ 0.06 | **54.0 %** of 26.33 |
 
 ## 2.2 Selected sub-tables (key wins in detail)
 

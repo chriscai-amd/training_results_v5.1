@@ -41,15 +41,6 @@ class GPUResource final : public core::GPUResourceBase {
   }
 
   hipStream_t get_stream() override { return gpu_resource_->get_stream(); }
-
-  // Phase-19 (AMD perf-port): non-virtual accessors used by the swizzle hot
-  // path so call-sites can park d2d copies onto a dedicated memcpy stream
-  // without modifying the abstract core::GPUResourceBase ABI.
-  hipStream_t get_memcpy_stream() { return gpu_resource_->get_memcpy_stream(); }
-
-  hipEvent_t get_event(const std::string &name) {
-    return gpu_resource_->get_event(name);
-  }
 };
 
 class HCTRCoreResourceManager : public core::CoreResourceManager {
