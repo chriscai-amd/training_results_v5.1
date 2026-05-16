@@ -65,6 +65,19 @@ export HCTR_SHARDING_PLAN=auto OMP_NUM_THREADS=8
 # dispatches + HIP API + DMA memcpys + RCCL collective API). Omitting
 # --memory-copy-trace makes the data reader's H2D lane invisible;
 # omitting --rccl-trace makes RCCL kernels indistinguishable by op type.
+#
+# Method 2 (GEMM M/N/K capture): HIPBLASLT_LOG_LEVEL=4 + TENSILE_DB
+# enable hipBLASLt/Tensile debug logging that exposes the actual
+# problem dimensions of every matmul call (visible in stdout as
+# "[a/b/c/d]3-tensor<Half>( sizes(M, N, K), strides(...) )" blocks).
+# With HIP graph capture (which we always use), this overhead fires
+# only once at capture/warmup time -- steady-state perf is unaffected.
+# Post-step extract_gemm_shapes.py parses these into a sidecar JSON.
+export HIPBLASLT_LOG_FILE=$TRACE_DIR/hipblaslt.log
+export HIPBLASLT_LOG_LEVEL=4
+export HIPBLASLT_LOG_MASK=0xffff
+export TENSILE_DB=0xff
+
 HCTR_PROFILE_PREFIX="rocprofv3 \
     --kernel-trace \
     --hip-trace \
@@ -73,7 +86,14 @@ HCTR_PROFILE_PREFIX="rocprofv3 \
     --output-format csv \
     -d $TRACE_DIR \
     --output-file $BASENAME --" \
-    bash /workspace/run_b200_match.sh
+    bash /workspace/run_b200_match.sh > "$TRACE_DIR/run_stdout.log" 2>&1
+RUN_EXIT=$?
+echo "  HCTR run exit=$RUN_EXIT (stdout captured for GEMM shape extraction)"
+# replay the tail of the HCTR run summary so the outer log shows
+# steady-state throughput etc. (full stdout lives in TRACE_DIR/run_stdout.log
+# alongside the hipBLASLt/TENSILE debug output for the extractor)
+grep -aE "Steady|Final loss|Loss range|Per-iter|samples/sec|Multi-Hot AsyncDataReader" \
+    "$TRACE_DIR/run_stdout.log" | tail -15
 
 echo
 echo "=== raw CSVs produced ==="
@@ -102,6 +122,13 @@ python3 /workspace/scripts/merge_perfetto_gpus.py \
     "$OUT/iter_steady_gpu*.json" \
     "$OUT/iter_steady_all8gpus.json" \
     "$START_ITER" "$N_ITERS" 2>&1 | tail -12
+
+echo
+echo "=== extract GEMM problem shapes (Method 2 lite) -> gemm_shapes.json ==="
+python3 /workspace/scripts/extract_gemm_shapes.py \
+    --hipblaslt-log "$TRACE_DIR/hipblaslt.log" \
+    --stdout-log    "$TRACE_DIR/run_stdout.log" \
+    --output        "$OUT/gemm_shapes.json" 2>&1 | tail -20
 
 echo
 echo "=== final output files ==="
