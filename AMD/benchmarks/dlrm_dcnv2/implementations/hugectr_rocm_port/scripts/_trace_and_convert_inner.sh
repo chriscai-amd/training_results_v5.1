@@ -124,11 +124,12 @@ python3 /workspace/scripts/merge_perfetto_gpus.py \
     "$START_ITER" "$N_ITERS" 2>&1 | tail -12
 
 echo
-echo "=== extract GEMM problem shapes (Method 2 lite) -> gemm_shapes.json ==="
+echo "=== extract GEMM problem shapes (Method 2 lite) -> gemm_shapes.json + embed into per-GPU JSONs ==="
 python3 /workspace/scripts/extract_gemm_shapes.py \
     --hipblaslt-log "$TRACE_DIR/hipblaslt.log" \
     --stdout-log    "$TRACE_DIR/run_stdout.log" \
-    --output        "$OUT/gemm_shapes.json" 2>&1 | tail -20
+    --output        "$OUT/gemm_shapes.json" \
+    --embed-into-perfetto "$OUT/iter_steady_gpu*.json" 2>&1 | tail -25
 
 echo
 echo "=== final output files ==="

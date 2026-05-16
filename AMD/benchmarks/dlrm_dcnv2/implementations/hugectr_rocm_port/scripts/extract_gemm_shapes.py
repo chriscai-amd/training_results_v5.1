@@ -33,7 +33,7 @@ Usage:
       --stdout-log    /path/to/stdout.log \\
       --output        /path/to/gemm_shapes.json
 """
-import argparse, json, re, sys
+import argparse, glob, json, re, sys
 from collections import Counter, defaultdict
 
 
@@ -124,6 +124,12 @@ def main():
     ap.add_argument("--stdout-log", required=True,
                     help="path to captured stdout (TENSILE_DB output)")
     ap.add_argument("--output", required=True, help="output JSON path")
+    ap.add_argument("--embed-into-perfetto", default=None,
+                    help="optional glob (e.g. /results/perfetto_*/iter_steady_gpu*.json) "
+                         "of Perfetto JSON files; we will inject a single "
+                         "process-wide instant marker into each one carrying "
+                         "the top GEMM problem shapes so they're directly "
+                         "visible in the Perfetto UI without opening this sidecar")
     args = ap.parse_args()
 
     print(f"Parsing TENSILE_DB blocks from {args.stdout_log} ...", file=sys.stderr)
@@ -207,6 +213,68 @@ def main():
               f"{s['dtype']:<5}  occ={s['occurrences']:>4}  "
               f"flops={s['flops_estimate']:>12,}",
               file=sys.stderr)
+
+    # ----------------------------------------------------------------------
+    # Optional: inject a GEMM summary marker into per-GPU Perfetto JSONs so
+    # the M/N/K info is visible directly in the Perfetto UI (no need to
+    # open the sidecar gemm_shapes.json separately).
+    # ----------------------------------------------------------------------
+    if args.embed_into_perfetto:
+        targets = sorted(glob.glob(args.embed_into_perfetto))
+        if not targets:
+            print(f"  (no Perfetto JSONs matched {args.embed_into_perfetto})",
+                  file=sys.stderr)
+        else:
+            # Build a compact "top-15" string for the marker name (visible
+            # directly on the Perfetto timeline) + full table in args dict
+            # (visible when the user clicks the marker flag).
+            top = unique_shapes[:15]
+            short = " | ".join(
+                f"({s['m']}x{s['n']}x{s['k']}, {s['dtype']}, {s['occurrences']}x)"
+                for s in top
+            )
+            marker_name = (
+                f"GEMM problem shapes ({len(unique_shapes)} unique; "
+                f"top {len(top)}): {short}"
+            )
+            # Full per-shape table for the args panel
+            marker_args = {
+                "n_unique_shapes": len(unique_shapes),
+                "n_unique_macro_tiles": len(sw_matches),
+                "shapes": unique_shapes,  # full list, ordered by occurrences
+            }
+            for jf in targets:
+                try:
+                    with open(jf) as f:
+                        doc = json.load(f)
+                except Exception as e:
+                    print(f"  WARN: could not read {jf}: {e}", file=sys.stderr)
+                    continue
+                evts = doc.get("traceEvents", [])
+                # find PID_GPU (default 1 in our converter); if the first
+                # process_name event uses a different pid, follow it
+                pid_gpu = 1
+                for e in evts:
+                    if (e.get("name") == "process_name"
+                            and isinstance(e.get("args"), dict)
+                            and "GPU" in e["args"].get("name", "")):
+                        pid_gpu = e.get("pid", 1)
+                        break
+                evts.append({
+                    "name": marker_name,
+                    "cat": "gemm_summary",
+                    "ph": "I",       # instant event
+                    "ts": 0.0,
+                    "pid": pid_gpu,
+                    "tid": 0,
+                    "s": "p",        # process-wide
+                    "args": marker_args,
+                })
+                doc["traceEvents"] = evts
+                with open(jf, "w") as f:
+                    json.dump(doc, f)
+                print(f"  embedded GEMM summary marker into {jf}",
+                      file=sys.stderr)
 
 
 if __name__ == "__main__":
