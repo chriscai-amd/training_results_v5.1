@@ -124,12 +124,14 @@ python3 /workspace/scripts/merge_perfetto_gpus.py \
     "$START_ITER" "$N_ITERS" 2>&1 | tail -12
 
 echo
-echo "=== extract GEMM problem shapes (Method 2 lite) -> gemm_shapes.json + embed into per-GPU JSONs ==="
+echo "=== extract GEMM problem shapes (Method 2 lite) -> gemm_shapes.json + embed into ALL JSONs ==="
+# Glob covers both per-GPU files AND the merged all8gpus file so the
+# GEMM summary marker is visible in every Perfetto view we produce.
 python3 /workspace/scripts/extract_gemm_shapes.py \
     --hipblaslt-log "$TRACE_DIR/hipblaslt.log" \
     --stdout-log    "$TRACE_DIR/run_stdout.log" \
     --output        "$OUT/gemm_shapes.json" \
-    --embed-into-perfetto "$OUT/iter_steady_gpu*.json" 2>&1 | tail -25
+    --embed-into-perfetto "$OUT/iter_steady_*.json" 2>&1 | tail -30
 
 echo
 echo "=== final output files ==="

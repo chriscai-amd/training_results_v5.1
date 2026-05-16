@@ -251,6 +251,10 @@ def main():
                     print(f"  WARN: could not read {jf}: {e}", file=sys.stderr)
                     continue
                 evts = doc.get("traceEvents", [])
+                # idempotent: drop any existing gemm_summary markers from
+                # previous invocations so re-running the extractor doesn't
+                # accumulate duplicates
+                evts = [e for e in evts if e.get("cat") != "gemm_summary"]
                 # find PID_GPU (default 1 in our converter); if the first
                 # process_name event uses a different pid, follow it
                 pid_gpu = 1
