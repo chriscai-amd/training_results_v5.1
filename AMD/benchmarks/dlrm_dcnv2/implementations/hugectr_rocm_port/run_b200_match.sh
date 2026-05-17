@@ -12,8 +12,11 @@ apt-get update -qq 2>&1 | tail -1
 apt-get install -y -qq libaio1t64 libnuma-dev libtbb12 > /dev/null 2>&1 || true
 pip install --quiet mpi4py mlperf-logging 2>&1 | tail -3 || true
 
-export LD_LIBRARY_PATH=/opt/rocm/lib:/workspace/hugectr_hip/build_rocm72/lib
-export PYTHONPATH=/workspace/hugectr_hip/build_rocm72/lib:${PYTHONPATH:-}
+# Allow caller to override the HCTR build dir (used for ROCm 7.12 A/B tests).
+# Default keeps the existing 7.2 build mounted at /workspace/hugectr_hip/build_rocm72.
+HCTR_LIB_DIR=${HCTR_LIB_DIR:-/workspace/hugectr_hip/build_rocm72/lib}
+export LD_LIBRARY_PATH=/opt/rocm/lib:${HCTR_LIB_DIR}:${LD_LIBRARY_PATH:-}
+export PYTHONPATH=${HCTR_LIB_DIR}:${PYTHONPATH:-}
 
 # ROCm port: RCCL tunings that bumped sustained perf from 11.76 -> 11.88 M sps
 # at NV's batch (55,296) on /dev/shm. AMD's RCCL default is Simple proto, which
