@@ -314,20 +314,69 @@ print(f"Devices in trace: {all_devices}", file=sys.stderr)
 GPU_LIST = all_devices if ALL_MODE else [SINGLE_GPU]
 
 # ------------------------------------------------------------------
-# Find iteration boundaries via AllReduce kernel (use GPU 0 as the
-# reference clock; same iter index applies to all GPUs since they all
-# step in lockstep at the data-parallel AllReduce).
+# Find iteration boundaries.
+#
+# HCTR's per-iter schedule (HugeCTR/src/pybind/model_pipeline.cpp:387):
+#   distribute_data -> ebc_mp_model_forward -> ebc_mp_network_forward
+#   -> ebc_dp_forward -> network_graph (fwd+bwd+loss)
+#   -> ebc_mp_backward_index_calculation -> ebc_dp_backward_index_calculation
+#   -> distribute_data(next-iter prefetch)
+#   -> ebc_mp_network_backward -> ebc_dp_local_reduce
+#   -> network_exchange_wgrad (the main AllReduce)
+#   -> ebc_dp_allreduce
+#   -> update_params        (MLP optimizer = ada_grad_update4_kernel)
+#   -> ebc_mp_local_reduce -> ebc_mp_update -> ebc_dp_update  (emb opt)
+#   -> sync_back
+#
+# That means optimizers run AFTER AllReduce. Using AR end as the iter
+# boundary therefore pushes each iter's opt to the start of the NEXT
+# iter's window (misattribution). The compute-stream MLP optimizer
+# (ada_grad_update4_kernel from HugeCTR/src/optimizers/adagrad_optimizer.cu)
+# fires exactly ONCE per iter and is the last kernel on the compute
+# stream within the iter, so its END is the correct iter boundary --
+# optimizers now naturally land at the END of the iter window.
+#
+# Fallback: AllReduce_Sum_f16_RING_LL end (legacy behavior) if the
+# adagrad kernel isn't found (e.g. a non-MLP-optimized variant).
 # ------------------------------------------------------------------
-ar_ids = [sid for sid, val in str_map.items() if "AllReduce_Sum_f16_RING_LL" in val]
-ph = ",".join("?" * len(ar_ids))
 REF_GPU = GPU_LIST[0]
-cur.execute(f"""
-    SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL
-    WHERE deviceId = ? AND shortName IN ({ph})
-    ORDER BY start
-""", [REF_GPU] + ar_ids)
-ar_events = cur.fetchall()
-print(f"GPU {REF_GPU} (ref): {len(ar_events)} AllReduce events", file=sys.stderr)
+
+# Primary marker: MLP optimizer kernel (1 per iter on compute stream)
+opt_ids = [sid for sid, val in str_map.items()
+           if val == "ada_grad_update4_kernel"]
+iter_marker_source = None
+ar_events = None
+if opt_ids:
+    ph = ",".join("?" * len(opt_ids))
+    cur.execute(f"""
+        SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL
+        WHERE deviceId = ? AND shortName IN ({ph})
+        ORDER BY start
+    """, [REF_GPU] + opt_ids)
+    opt_events = cur.fetchall()
+    if opt_events:
+        ar_events = opt_events
+        iter_marker_source = "ada_grad_update4_kernel (MLP optimizer, end-of-iter)"
+        print(f"GPU {REF_GPU} (ref): {len(opt_events)} ada_grad_update4_kernel "
+              f"events -- using as end-of-iter marker", file=sys.stderr)
+
+if ar_events is None:
+    ar_ids = [sid for sid, val in str_map.items()
+              if "AllReduce_Sum_f16_RING_LL" in val]
+    ph = ",".join("?" * len(ar_ids))
+    cur.execute(f"""
+        SELECT start, end FROM CUPTI_ACTIVITY_KIND_KERNEL
+        WHERE deviceId = ? AND shortName IN ({ph})
+        ORDER BY start
+    """, [REF_GPU] + ar_ids)
+    ar_events = cur.fetchall()
+    iter_marker_source = ("AllReduce_Sum_f16_RING_LL end "
+                          "(FALLBACK -- optimizer will appear at start "
+                          "of next iter)")
+    print(f"GPU {REF_GPU} (ref): {len(ar_events)} AllReduce events "
+          f"(fallback marker; ada_grad_update4_kernel not found)",
+          file=sys.stderr)
+
 if FIRST_ITER + N_ITERS >= len(ar_events):
     print(f"ERROR: only {len(ar_events)} iters", file=sys.stderr); sys.exit(2)
 
@@ -336,6 +385,7 @@ T_END   = ar_events[FIRST_ITER + N_ITERS - 1][1]
 print(f"Window: iter {FIRST_ITER}..{FIRST_ITER+N_ITERS-1}  "
       f"T_START={T_START}ns  T_END={T_END}ns  span={(T_END-T_START)/1e6:.2f}ms",
       file=sys.stderr)
+print(f"  iter marker: {iter_marker_source}", file=sys.stderr)
 iter_marks = [(FIRST_ITER + i, ar_events[FIRST_ITER - 1 + i][1])
               for i in range(N_ITERS + 1)]
 
@@ -1170,22 +1220,39 @@ for GPU in GPU_LIST:
                 if events[ix]["cat"] == "loss":
                     loss_t = events[ix]["ts"]; break
 
-            # Phase grouping over THIS role's kernels only
-            phase_buckets = defaultdict(list)
-            for ix in idxs:
+            # Walk kernels in time order and emit phase slices as CONTIGUOUS
+            # time-runs. The same logical phase can appear multiple times per
+            # iter because the HCTR schedule interleaves (e.g. on the compute
+            # stream: bot_mlp_fwd -> interaction (cross net) -> top_mlp_fwd ->
+            # loss -> top_mlp_bwd -> interaction_bwd -> bot_mlp_bwd).
+            # Grouping all "mlp_fwd" kernels into one phase span would make it
+            # non-contiguous and collide with interaction_fwd; emitting
+            # contiguous runs preserves time accuracy and keeps siblings
+            # disjoint on the synth lane.
+            idxs_sorted = sorted(idxs, key=lambda i: events[i]["ts"])
+            phase_ivs = []  # list of (ts, te, (phase_key, [event_indices]))
+            cur_phase = None
+            cur_idxs = []
+            cur_ts = cur_te = 0.0
+            for ix in idxs_sorted:
                 ph = _bucket_phase(events[ix]["cat"], events[ix]["ts"], loss_t)
-                phase_buckets[ph].append(ix)
-
-            phase_ivs = []
-            for ph_key, ph_idxs in phase_buckets.items():
-                ph_idxs.sort(key=lambda i: events[i]["ts"])
-                ph_ts = events[ph_idxs[0]]["ts"]
-                ph_te = max(events[i]["ts"] + events[i]["dur"]
-                            for i in ph_idxs)
-                phase_ivs.append((ph_ts, ph_te, (ph_key, ph_idxs)))
-            phase_ivs.sort()
-            # Phases on a single stream ARE serial in time, so clipping is
-            # rarely needed; do it as a safety net.
+                kts = events[ix]["ts"]
+                kte = kts + events[ix]["dur"]
+                if ph != cur_phase:
+                    if cur_idxs:
+                        phase_ivs.append((cur_ts, cur_te, (cur_phase, cur_idxs)))
+                    cur_phase = ph
+                    cur_idxs = [ix]
+                    cur_ts = kts
+                    cur_te = kte
+                else:
+                    cur_idxs.append(ix)
+                    cur_te = max(cur_te, kte)
+            if cur_idxs:
+                phase_ivs.append((cur_ts, cur_te, (cur_phase, cur_idxs)))
+            # Safety net: ensure siblings disjoint (single-stream serial
+            # ordering already guarantees this except across stream-priority
+            # induced overlaps, which can leak in if classify() is wrong).
             phase_ivs = _clip_disjoint(phase_ivs, iter_te_us)
             if not phase_ivs:
                 continue
@@ -1232,23 +1299,36 @@ for GPU in GPU_LIST:
                 })
                 n_phase_slices += 1
 
-                # 3) layer slices (only for mlp/cross/interaction phases)
+                # 3) layer slices (only for mlp/cross/interaction phases).
+                # Same contiguous-run logic as phase grouping: a layer slice
+                # ends as soon as the next kernel's dlrm_layer differs,
+                # preventing non-contiguous layer spans.
                 if ph_key not in ("mlp_fwd", "mlp_bwd",
                                   "interaction_fwd", "interaction_bwd"):
                     continue
-                layer_buckets = defaultdict(list)
-                for ix in ph_idxs:
+                ph_idxs_sorted = sorted(ph_idxs, key=lambda i: events[i]["ts"])
+                layer_ivs = []
+                cur_layer = None
+                cur_lidxs = []
+                cur_lts = cur_lte = 0.0
+                for ix in ph_idxs_sorted:
                     lname = events[ix]["args"].get(
                         "dlrm_layer", "") or "(unannotated)"
-                    layer_buckets[lname].append(ix)
-                layer_ivs = []
-                for lname, lidxs in layer_buckets.items():
-                    lidxs.sort(key=lambda i: events[i]["ts"])
-                    l_ts = events[lidxs[0]]["ts"]
-                    l_te = max(events[i]["ts"] + events[i]["dur"]
-                               for i in lidxs)
-                    layer_ivs.append((l_ts, l_te, (lname, lidxs)))
-                layer_ivs.sort()
+                    kts = events[ix]["ts"]
+                    kte = kts + events[ix]["dur"]
+                    if lname != cur_layer:
+                        if cur_lidxs:
+                            layer_ivs.append(
+                                (cur_lts, cur_lte, (cur_layer, cur_lidxs)))
+                        cur_layer = lname
+                        cur_lidxs = [ix]
+                        cur_lts = kts
+                        cur_lte = kte
+                    else:
+                        cur_lidxs.append(ix)
+                        cur_lte = max(cur_lte, kte)
+                if cur_lidxs:
+                    layer_ivs.append((cur_lts, cur_lte, (cur_layer, cur_lidxs)))
                 layer_ivs = _clip_disjoint(layer_ivs, ph_te)
 
                 for l_ts, l_te, (lname, lidxs) in layer_ivs:
@@ -1341,9 +1421,11 @@ for GPU in GPU_LIST:
     # Iter boundary instant markers (only emit once on the lowest GPU,
     # so they don't visually duplicate across rows)
     if not all_iter_marks_emitted:
+        boundary_short = ("opt_end" if iter_marker_source
+                          and "ada_grad" in iter_marker_source else "AR_end")
         for label, t in iter_marks:
             events.append({
-                "name": f"=== iter {label} (AR end) ===",
+                "name": f"=== iter {label} ({boundary_short}) ===",
                 "cat": "iter_marker", "cname": "black",
                 "ph": "I", "s": "g",
                 "ts": (t - T_START) / 1000.0,
