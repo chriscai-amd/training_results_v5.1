@@ -46,12 +46,15 @@ if len(sys.argv) < 3:
     print(__doc__)
     sys.exit(1)
 
-# Pull out --gemm-catalog=PATH first so positional args index cleanly
+# Pull out --gemm-catalog=PATH and --py-trace=PATH first so positional args index cleanly
 gemm_catalog_path = None
+py_trace_path = None
 posargs = []
 for a in sys.argv[1:]:
     if a.startswith("--gemm-catalog="):
         gemm_catalog_path = a.split("=", 1)[1]
+    elif a.startswith("--py-trace="):
+        py_trace_path = a.split("=", 1)[1]
     else:
         posargs.append(a)
 if len(posargs) < 2:
@@ -96,6 +99,9 @@ CATALOG_BY_MN = {}
 CATALOG_BY_SHAPE = {}  # (M,N,K,op_a,op_b,epi) -> full record
 ITER_TEMPLATE  = []    # list of (M,N,K,op_a,op_b,epi) tuples, one entry per
                        # cublasLtMatmul call within a single HCTR iter
+ITER_TEMPLATE_RICH = [] # list of dicts (one per template entry) carrying
+                        # the per-call src_function + stack_hctr from the
+                        # shim's JSONL log. Same length as ITER_TEMPLATE.
 
 def _build_iter_template(jsonl_path):
     """Read the shim's gemm_init_log.jsonl and infer the per-iter call
@@ -106,27 +112,44 @@ def _build_iter_template(jsonl_path):
     (one thread per local GPU = 8 threads in our 1x8 setup); each thread's
     call sequence IS the per-iter sequence.
 
-    We pick the thread with the most calls (most complete sequence) and
-    return its (shape) tuple list in ts_ns order."""
+    Returns (shape_tuples, rich_records) -- both same length, ts_ns
+    ordered. shape_tuples is the lookup key for CATALOG_BY_SHAPE; rich
+    records carry per-call src_function + HCTR-only stack frames."""
     calls = []
     try:
         with open(jsonl_path) as f:
             for line in f:
                 calls.append(json.loads(line))
     except FileNotFoundError:
-        return []
+        return [], []
     if not calls:
-        return []
+        return [], []
     by_tid = defaultdict(list)
     for c in calls:
         by_tid[c["tid"]].append(c)
-    # All threads run the same model graph, so any thread works. Pick the
-    # one with the most calls (in case any threads logged less due to
-    # graph capture happening mid-thread).
+    # All threads run the same model graph; pick the busiest one.
     busiest_tid = max(by_tid.keys(), key=lambda t: len(by_tid[t]))
     seq = sorted(by_tid[busiest_tid], key=lambda c: c["ts_ns"])
-    return [(c["M"], c["N"], c["K"], c["op_a"], c["op_b"], c["epilogue"])
-            for c in seq]
+    shape_keys = [(c["M"], c["N"], c["K"], c["op_a"], c["op_b"], c["epilogue"])
+                  for c in seq]
+    rich = []
+    for c in seq:
+        stack = c.get("stack", [])
+        # Extract HCTR-only frames, drop arg-list parens for compactness
+        stack_hctr = [f.split("(")[0][:120] for f in stack if "HugeCTR" in f][:6]
+        # Pick best representative function (same heuristic as catalog builder)
+        src_function = ""
+        for needle in ("MLPLayer", "MultiCrossLayer", "FusedReluBiasFully",
+                       "FullyConnectedLayer", "FusedFCLayerFunctors",
+                       "GemmFunctor"):
+            for f in stack:
+                if needle in f:
+                    src_function = f.split("(")[0][:90]
+                    break
+            if src_function:
+                break
+        rich.append({"src_function": src_function, "stack_hctr": stack_hctr})
+    return shape_keys, rich
 
 if gemm_catalog_path:
     with open(gemm_catalog_path) as f:
@@ -143,7 +166,7 @@ if gemm_catalog_path:
         if os.path.exists(candidate):
             src = candidate
     if src and os.path.exists(src):
-        ITER_TEMPLATE = _build_iter_template(src)
+        ITER_TEMPLATE, ITER_TEMPLATE_RICH = _build_iter_template(src)
     elif src:
         print(f"  WARNING: source_jsonl '{src}' not found; sequence matching disabled",
               file=sys.stderr)
@@ -153,6 +176,29 @@ if gemm_catalog_path:
     print(f"  iter template: {len(ITER_TEMPLATE)} GEMM calls per iter  "
           f"(sequence-based fallback {'enabled' if ITER_TEMPLATE else 'DISABLED'})",
           file=sys.stderr)
+
+# Canonical stack for cudaGraphLaunch host events. This is what HCTR's
+# steady-state launch path always looks like (verified in source at
+# HugeCTR/src/graph_wrapper.cpp:41 -- cudaGraphLaunch is called only
+# from GraphWrapper::exec, which is invoked by GraphScheduleable::run,
+# which is invoked by Pipeline::run_graph, which is invoked by
+# Model::train_pipeline_with_ebc, which is invoked by Model::fit at
+# pybind/model.cpp:884 -- the once-per-iter loop body).
+#
+# The LD_PRELOAD hook for cudaGraphLaunch in the shim could in principle
+# verify this empirically, but it currently doesn't fire because libcudart
+# resolves cudaGraphLaunch via ABI-versioning to _ptsz / _v10000 variants
+# that the unversioned LD_PRELOAD export doesn't override. Source-level
+# attribution is deterministic regardless.
+GRAPH_LAUNCH_SRC_FUNCTION = "HugeCTR::GraphWrapper::exec"
+GRAPH_LAUNCH_SRC_STACK_HCTR = [
+    "HugeCTR::GraphWrapper::exec  (graph_wrapper.cpp:41)",
+    "HugeCTR::GraphScheduleable::run",
+    "HugeCTR::Pipeline::run_graph",
+    "HugeCTR::Model::train_pipeline_with_ebc",
+    "HugeCTR::Model::fit  (pybind/model.cpp:884)",
+    "python3 train.py:488 (model.fit())",
+]
 
 def is_main_gemm_kernel(name):
     """Identify kernels that are "the main GEMM kernel" of one
@@ -571,6 +617,9 @@ for GPU in GPU_LIST:
             args["gemm_gflops"]    = gemm_shape["gflops"]
             args["gemm_bytes"]     = gemm_shape["bytes_accessed"]
             args["dlrm_layer"]     = gemm_shape.get("dlrm_layer", "")
+            sfs = gemm_shape.get("src_functions", [])
+            if sfs:
+                args["src_function_candidates"] = sfs
             args["gemm_match"]     = "tile"
         ev = {
             "name": display,
@@ -629,6 +678,15 @@ for GPU in GPU_LIST:
                 a["gemm_bytes"]     = cat_entry["bytes_accessed"]
                 a["dlrm_layer"]     = cat_entry.get("dlrm_layer", "")
                 a["gemm_match"]     = "sequence"
+                # Attach per-call src_function + HCTR-only stack frames
+                # from the rich template (captured by the shim's
+                # backtrace() at each cublasLtMatmul call during init).
+                if pos < len(ITER_TEMPLATE_RICH):
+                    rich = ITER_TEMPLATE_RICH[pos]
+                    if rich.get("src_function"):
+                        a["src_function"] = rich["src_function"]
+                    if rich.get("stack_hctr"):
+                        a["src_stack_hctr"] = rich["stack_hctr"]
                 # Upgrade the kernel's category from the layer hint, AND
                 # update the display name + Perfetto color. The original
                 # classify() heuristic flags every nvjet_hsh kernel as
@@ -699,6 +757,33 @@ for GPU in GPU_LIST:
                          else "rail_idle_busy" if "Sync"     in n
                          else None)
                 tid_lane = lane_of(gtid)
+                host_args = {"correlationId": corr, "globalTid": gtid,
+                             "duration_us": round((end - start) / 1000.0, 2),
+                             "gpu": GPU}
+                # PyTorch-style stack propagation:
+                # (a) If the kernel this host call launched has
+                #     src_function/src_stack_hctr (set by the sequence
+                #     matcher), copy them onto the host event so clicking
+                #     a cublasLtMatmul / cudaLaunchKernel in Perfetto shows
+                #     the same call-chain attribution as the kernel.
+                # (b) For cudaGraphLaunch host events (the per-iter steady-
+                #     state launcher in HCTR's captured-graph world), the
+                #     per-call correlationId DOESN'T match any kernel's
+                #     correlationId (graph-replayed kernels have IDs from
+                #     graph-capture time). So attach the canonical
+                #     hardcoded stack from GRAPH_LAUNCH_SRC_STACK_HCTR.
+                kev_idx = kernel_by_corr.get(corr)
+                if kev_idx is not None:
+                    kev_args = events[kev_idx].get("args", {})
+                    for k in ("src_function", "src_stack_hctr",
+                              "dlrm_layer", "gemm_M", "gemm_N", "gemm_K",
+                              "gemm_op_A", "gemm_op_B", "gemm_epilogue",
+                              "gemm_gflops"):
+                        if k in kev_args:
+                            host_args[k] = kev_args[k]
+                if "GraphLaunch" in n:
+                    host_args["src_function"]   = GRAPH_LAUNCH_SRC_FUNCTION
+                    host_args["src_stack_hctr"] = GRAPH_LAUNCH_SRC_STACK_HCTR
                 ev = {
                     "name": n.replace("_v10000", "").replace("_v11010", "").replace("_v7000", ""),
                     "cat": "host_api",
@@ -706,9 +791,7 @@ for GPU in GPU_LIST:
                     "ts": (start - T_START) / 1000.0,
                     "dur": (end - start) / 1000.0,
                     "pid": PID_HOST, "tid": tid_lane,
-                    "args": {"correlationId": corr, "globalTid": gtid,
-                             "duration_us": round((end - start) / 1000.0, 2),
-                             "gpu": GPU},
+                    "args": host_args,
                 }
                 if cname:
                     ev["cname"] = cname
@@ -757,6 +840,16 @@ for GPU in GPU_LIST:
             cname = ("bad"            if "GraphLaunch" in n
                      else "rail_idle_busy" if "Sync"     in n
                      else None)
+            args2 = {"correlationId": corr, "globalTid": gtid,
+                     "duration_us": round((end - start) / 1000.0, 2),
+                     "gpu": GPU}
+            # Same canonical-stack attachment as in the correlationId-join
+            # path above -- so the cudaGraphLaunch host events that show
+            # up here (the steady-state per-iter launchers) carry the
+            # HCTR call chain in their Perfetto Args panel.
+            if "GraphLaunch" in n:
+                args2["src_function"]   = GRAPH_LAUNCH_SRC_FUNCTION
+                args2["src_stack_hctr"] = GRAPH_LAUNCH_SRC_STACK_HCTR
             ev = {
                 "name": n.replace("_v10000", "").replace("_v11010", "").replace("_v7000", ""),
                 "cat": "host_api",
@@ -764,9 +857,7 @@ for GPU in GPU_LIST:
                 "ts": (start - T_START) / 1000.0,
                 "dur": (end - start) / 1000.0,
                 "pid": PID_HOST, "tid": lane_of(gtid),
-                "args": {"correlationId": corr, "globalTid": gtid,
-                         "duration_us": round((end - start) / 1000.0, 2),
-                         "gpu": GPU},
+                "args": args2,
             }
             if cname:
                 ev["cname"] = cname
@@ -910,6 +1001,343 @@ for GPU in GPU_LIST:
 
     print(f"  fwd/bwd pairs: {flow_pair_count:,}", file=sys.stderr)
 
+    # ------------------------------------------------------------------
+    # Tier A + C: SYNTHETIC NESTED CALL-STACK LANE
+    # ------------------------------------------------------------------
+    # PyTorch-profiler-style nested view on a single host lane (tid=500):
+    #   iter N                    <-- outer slice spanning [iter_start, iter_end]
+    #     mlp_fwd (23 kernels)    <-- phase slice spanning all phase kernels
+    #       bot_mlp_L1_fwd        <-- layer slice (only for mlp/cross phases)
+    #         cutlass3x... M=128 N=512 K=13 ...  <-- innermost kernel slice
+    #
+    # The hierarchy is reconstructed deterministically from:
+    #   - iter boundaries (AR end timestamps)
+    #   - per-kernel cat (already classified)
+    #   - per-kernel dlrm_layer (set by GEMM catalog / sequence matcher)
+    #   - per-kernel src_function + src_stack_hctr (from shim backtraces;
+    #     attached to layer slices as args so clicking shows the call chain)
+    #
+    # Why this works even though steady-state never re-executes layer code:
+    # graph capture happened ONCE during init and recorded exactly the
+    # sequence of (layer-name -> kernel) the GEMM catalog stores. Graph
+    # REPLAY just runs the same kernels in the same order; we re-attach
+    # the layer/phase labels to those kernels via the sequence matcher.
+    # ------------------------------------------------------------------
+    # Tier-C synth lanes live in the host process. To keep nesting clean
+    # (Chrome trace requires siblings on the same tid to be either fully
+    # disjoint or fully nested -- partial overlap breaks Perfetto), each
+    # GPU CUDA stream gets its OWN synth lane: the compute stream's lane
+    # gets the full iter->phase->layer->kernel hierarchy, secondary streams
+    # (embedding, a2a, sparse_prep, etc.) get a flatter iter->phase view
+    # since they don't carry layer info. The compute stream is identified
+    # as the one with the most kernels; its label was set by classify_stream.
+    SYNTH_LANE_BASE = 500
+    SYNTH_LANES = {}  # role -> tid
+    def synth_lane_for(role):
+        if role not in SYNTH_LANES:
+            SYNTH_LANES[role] = SYNTH_LANE_BASE + len(SYNTH_LANES)
+        return SYNTH_LANES[role]
+
+    def _bucket_phase(cat, ts, loss_t):
+        """Map a kernel category to a coarse phase label. Splits emb_a2a
+        and interaction into fwd/bwd halves using the loss timestamp."""
+        if cat == "sparse_prep":     return "sparse_prep"
+        if cat in ("emb_fwd", "emb_reduce"):
+            return "embedding_fwd"
+        if cat == "emb_a2a":
+            return ("embedding_a2a_bwd"
+                    if loss_t is not None and ts > loss_t
+                    else "embedding_a2a_fwd")
+        if cat == "mlp_fwd":         return "mlp_fwd"
+        if cat == "interaction":
+            return ("interaction_bwd"
+                    if loss_t is not None and ts > loss_t
+                    else "interaction_fwd")
+        if cat in ("mlp_bwd_dgrad", "mlp_bwd_wgrad"):
+            return "mlp_bwd"
+        if cat == "loss":            return "loss"
+        if cat in ("emb_scatter", "emb_grad_reduce"):
+            return "embedding_bwd"
+        if cat == "allreduce":       return "allreduce"
+        if cat in ("opt_emb", "opt_dense"):
+            return "optimizer"
+        if cat in ("memcpy", "memset"):
+            return "memcpy"
+        return "misc"
+
+    PHASE_COLOR = {
+        "sparse_prep":        "olive",
+        "embedding_fwd":      "good",
+        "embedding_a2a_fwd":  "rail_response",
+        "embedding_a2a_bwd":  "rail_response",
+        "embedding_bwd":      "good",
+        "interaction_fwd":    "rail_idle_busy",
+        "interaction_bwd":    "rail_idle_busy",
+        "mlp_fwd":            "rail_animation",
+        "mlp_bwd":            "rail_load",
+        "loss":               "bad",
+        "allreduce":          "bad",
+        "optimizer":          "yellow",
+        "misc":               "grey",
+        "memcpy":             "grey",
+    }
+
+    def _clip_disjoint(intervals, outer_end_us):
+        """Take list of (ts_us, te_us, payload) sorted by ts; return a list
+        where each te_us is clipped to next entry's ts_us (or outer_end).
+        Drops entries with non-positive duration. Required because Chrome
+        trace nesting on a single tid demands fully disjoint or fully
+        nested siblings -- partial overlap breaks Perfetto rendering."""
+        out = []
+        n = len(intervals)
+        for i, (ts, te, payload) in enumerate(intervals):
+            limit = intervals[i+1][0] if i+1 < n else outer_end_us
+            te_clip = min(te, limit)
+            if te_clip > ts:
+                out.append((ts, te_clip, payload))
+        return out
+
+    # Partition kernels by their stream's semantic role. Each role gets its
+    # own synth lane that is GUARANTEED serial in time (since a single CUDA
+    # stream serializes its work). Cross-stream parallelism is preserved by
+    # showing each stream on a separate synth lane -- no false serialization,
+    # no broken nesting.
+    #
+    # We classify each stream inline here (using the already-populated
+    # per_stream_cat_hist / per_stream_kernel_names) because the canonical
+    # stream_label dict isn't built until later in the per-GPU loop.
+    synth_sid_to_role = {}
+    for _sid in sorted(per_stream_cat_hist.keys()):
+        synth_sid_to_role[_sid] = classify_stream(
+            per_stream_cat_hist.get(_sid, {}),
+            per_stream_kernel_names.get(_sid, []),
+            per_stream_memcpy_count.get(_sid, 0))
+    sid_to_role = synth_sid_to_role
+    role_kernel_idxs = defaultdict(list)
+    for ix, e in enumerate(events):
+        if e["ph"] != "X" or e.get("pid") != PID_GPU:
+            continue
+        if e.get("cat") in (None, "memcpy", "memset"):
+            # memcpy events live on their own gpu stream lanes already
+            continue
+        sid = e["tid"]
+        role = sid_to_role.get(sid, f"stream_{sid}")
+        role_kernel_idxs[role].append(ix)
+
+    # role priority order (only roles present get a lane)
+    ROLE_PRIORITY = ["computation_stream", "wgrad_stream",
+                     "embedding_mp", "embedding_dp", "sparse_prep"]
+
+    synth_events = []
+    n_iter_slices = 0
+    n_phase_slices = 0
+    n_layer_slices = 0
+    n_kernel_inner_slices = 0
+
+    # Bucket per-role kernels into per-iter sublists once
+    role_iter_kernels = {}
+    for role, all_idxs in role_kernel_idxs.items():
+        bucketed = [[] for _ in range(N_ITERS)]
+        for ix in all_idxs:
+            kts = events[ix]["ts"] * 1000.0 + T_START  # back to ns
+            for i in range(N_ITERS):
+                if (ar_events[FIRST_ITER - 1 + i][1] <= kts
+                        < ar_events[FIRST_ITER + i][1]):
+                    bucketed[i].append(ix)
+                    break
+        role_iter_kernels[role] = bucketed
+
+    # For each role with kernels: emit iter -> phase -> (layer -> kernel)
+    # nested hierarchy on its own lane.
+    for role in ROLE_PRIORITY + sorted(set(role_kernel_idxs) - set(ROLE_PRIORITY)):
+        if role not in role_kernel_idxs:
+            continue
+        if not role_kernel_idxs[role]:
+            continue
+        lane_tid = synth_lane_for(role)
+        for it_i in range(N_ITERS):
+            idxs = role_iter_kernels[role][it_i]
+            if not idxs:
+                continue
+            iter_label = FIRST_ITER + it_i
+            iter_ts_us = (ar_events[FIRST_ITER - 1 + it_i][1] - T_START) / 1000.0
+            iter_te_us = (ar_events[FIRST_ITER + it_i][1] - T_START) / 1000.0
+            iter_dur_us = iter_te_us - iter_ts_us
+
+            # loss_t comes from the GLOBAL loss kernel (only on compute stream)
+            loss_t = None
+            for ix in per_iter_kernels[it_i]:
+                if events[ix]["cat"] == "loss":
+                    loss_t = events[ix]["ts"]; break
+
+            # Phase grouping over THIS role's kernels only
+            phase_buckets = defaultdict(list)
+            for ix in idxs:
+                ph = _bucket_phase(events[ix]["cat"], events[ix]["ts"], loss_t)
+                phase_buckets[ph].append(ix)
+
+            phase_ivs = []
+            for ph_key, ph_idxs in phase_buckets.items():
+                ph_idxs.sort(key=lambda i: events[i]["ts"])
+                ph_ts = events[ph_idxs[0]]["ts"]
+                ph_te = max(events[i]["ts"] + events[i]["dur"]
+                            for i in ph_idxs)
+                phase_ivs.append((ph_ts, ph_te, (ph_key, ph_idxs)))
+            phase_ivs.sort()
+            # Phases on a single stream ARE serial in time, so clipping is
+            # rarely needed; do it as a safety net.
+            phase_ivs = _clip_disjoint(phase_ivs, iter_te_us)
+            if not phase_ivs:
+                continue
+
+            # 1) per-role iter slice (spans only this role's kernels within
+            # the iter -- gives a feel for "this stream's busy time this iter")
+            role_iter_ts = phase_ivs[0][0]
+            role_iter_te = max(p[1] for p in phase_ivs)
+            role_iter_dur = role_iter_te - role_iter_ts
+            synth_events.append({
+                "name": f"iter {iter_label} [{role}]  "
+                        f"({role_iter_dur:.1f} us, {len(idxs)} kernels)",
+                "cat":  "synth_iter",
+                "cname": "black",
+                "ph":   "X",
+                "ts":   role_iter_ts,
+                "dur":  role_iter_dur,
+                "pid":  PID_HOST,
+                "tid":  lane_tid,
+                "args": {"iter": iter_label, "role": role,
+                         "n_kernels": len(idxs),
+                         "duration_us": round(role_iter_dur, 3),
+                         "gpu": GPU},
+            })
+            n_iter_slices += 1
+
+            # 2) phase slices on this lane
+            for ph_ts, ph_te, (ph_key, ph_idxs) in phase_ivs:
+                ph_dur = ph_te - ph_ts
+                synth_events.append({
+                    "name": f"{ph_key}  ({len(ph_idxs)} kernels)",
+                    "cat":  "synth_phase",
+                    "cname": PHASE_COLOR.get(ph_key, "grey"),
+                    "ph":   "X",
+                    "ts":   ph_ts,
+                    "dur":  ph_dur,
+                    "pid":  PID_HOST,
+                    "tid":  lane_tid,
+                    "args": {"phase": ph_key, "iter": iter_label,
+                             "role": role,
+                             "n_kernels": len(ph_idxs),
+                             "duration_us": round(ph_dur, 3),
+                             "gpu": GPU},
+                })
+                n_phase_slices += 1
+
+                # 3) layer slices (only for mlp/cross/interaction phases)
+                if ph_key not in ("mlp_fwd", "mlp_bwd",
+                                  "interaction_fwd", "interaction_bwd"):
+                    continue
+                layer_buckets = defaultdict(list)
+                for ix in ph_idxs:
+                    lname = events[ix]["args"].get(
+                        "dlrm_layer", "") or "(unannotated)"
+                    layer_buckets[lname].append(ix)
+                layer_ivs = []
+                for lname, lidxs in layer_buckets.items():
+                    lidxs.sort(key=lambda i: events[i]["ts"])
+                    l_ts = events[lidxs[0]]["ts"]
+                    l_te = max(events[i]["ts"] + events[i]["dur"]
+                               for i in lidxs)
+                    layer_ivs.append((l_ts, l_te, (lname, lidxs)))
+                layer_ivs.sort()
+                layer_ivs = _clip_disjoint(layer_ivs, ph_te)
+
+                for l_ts, l_te, (lname, lidxs) in layer_ivs:
+                    l_dur = l_te - l_ts
+                    rep = events[lidxs[0]]
+                    largs = {"layer": lname, "iter": iter_label,
+                             "phase": ph_key, "role": role,
+                             "n_kernels": len(lidxs),
+                             "duration_us": round(l_dur, 3),
+                             "gpu": GPU}
+                    if "src_function" in rep["args"]:
+                        largs["src_function"] = rep["args"]["src_function"]
+                    if "src_stack_hctr" in rep["args"]:
+                        largs["src_stack_hctr"] = rep["args"]["src_stack_hctr"]
+                    for k in ("gemm_M","gemm_N","gemm_K","gemm_op_A",
+                              "gemm_op_B","gemm_epilogue","gemm_gflops"):
+                        if k in rep["args"]:
+                            largs[k] = rep["args"][k]
+                    synth_events.append({
+                        "name": f"{lname}  ({len(lidxs)}k, {l_dur:.1f} us)",
+                        "cat":  "synth_layer",
+                        "cname": PHASE_COLOR.get(ph_key, "grey"),
+                        "ph":   "X",
+                        "ts":   l_ts,
+                        "dur":  l_dur,
+                        "pid":  PID_HOST,
+                        "tid":  lane_tid,
+                        "args": largs,
+                    })
+                    n_layer_slices += 1
+
+                    # 4) innermost per-kernel slices (only if disjoint)
+                    kev_iv = sorted(((events[i]["ts"],
+                                      events[i]["ts"] + events[i]["dur"], i)
+                                     for i in lidxs), key=lambda x: x[0])
+                    if any(kev_iv[i][1] > kev_iv[i+1][0]
+                           for i in range(len(kev_iv) - 1)):
+                        continue
+                    clipped = _clip_disjoint(
+                        [(t0, t1, i) for t0, t1, i in kev_iv], l_te)
+                    for k_ts, k_te, ix in clipped:
+                        kev = events[ix]
+                        kargs = dict(kev.get("args", {}))
+                        kn = kargs.get("kernel", "")
+                        M = kargs.get("gemm_M")
+                        if M is not None:
+                            disp = (f"{kn[:32]}  M={M} N={kargs['gemm_N']} "
+                                    f"K={kargs['gemm_K']} "
+                                    f"epi={kargs.get('gemm_epilogue','')}")
+                        else:
+                            disp = kn[:64]
+                        synth_events.append({
+                            "name": disp,
+                            "cat":  "synth_kernel",
+                            "ph":   "X",
+                            "ts":   k_ts,
+                            "dur":  k_te - k_ts,
+                            "pid":  PID_HOST,
+                            "tid":  lane_tid,
+                            "args": kargs,
+                        })
+                        n_kernel_inner_slices += 1
+
+    events.extend(synth_events)
+    print(f"  synth-stack: lanes={len(SYNTH_LANES)} "
+          f"iter={n_iter_slices} phase={n_phase_slices} "
+          f"layer={n_layer_slices} kernel={n_kernel_inner_slices}",
+          file=sys.stderr)
+    for role, tid in SYNTH_LANES.items():
+        events.append({"name": "thread_name", "ph": "M",
+                       "pid": PID_HOST, "tid": tid,
+                       "args": {"name": f"synth_call_stack [{role}]"}})
+        sort_key = (ROLE_PRIORITY.index(role) if role in ROLE_PRIORITY
+                    else 50 + len(ROLE_PRIORITY))
+        events.append({"name": "thread_sort_index", "ph": "M",
+                       "pid": PID_HOST, "tid": tid,
+                       "args": {"sort_index": sort_key}})
+
+    # ------------------------------------------------------------------
+    # Tier B: optional Python-tracer sidecar merge (when --py-trace=PATH
+    # is supplied). The sidecar is produced by scripts/hctr_py_tracer.py
+    # running inside train_mi350.py with HCTR_PY_TRACE=1. It contains a
+    # standalone Chrome trace with Python frame slices in CLOCK_REALTIME
+    # ns. We rewrite ts into the nsys-relative window scale using the
+    # session's utcEpochNs anchor (loaded once outside the per-GPU loop)
+    # and merge as events on a per-rank "python" lane.
+    # ------------------------------------------------------------------
+    # (merge happens once after the per-GPU loop -- see below)
+
     # Iter boundary instant markers (only emit once on the lowest GPU,
     # so they don't visually duplicate across rows)
     if not all_iter_marks_emitted:
@@ -927,12 +1355,17 @@ for GPU in GPU_LIST:
     events.append({"name": "process_name", "ph": "M", "pid": PID_GPU, "tid": 0,
                    "args": {"name": f"GPU {GPU}  ({n_kernels} kernels in iter "
                                     f"{FIRST_ITER}..{FIRST_ITER+N_ITERS-1})"}})
-    events.append({"name": "process_sort_index", "ph": "M", "pid": PID_GPU, "tid": 0,
-                   "args": {"sort_index": PID_GPU}})
     events.append({"name": "process_name", "ph": "M", "pid": PID_HOST, "tid": 0,
                    "args": {"name": f"Host (rank {GPU})"}})
+    # Interleave host+GPU per rank so each GPU's panes sit next to its host
+    # launch process. Layout (low sort_index sorts first):
+    #   rank 0: Host(rank 0) sort=0, GPU 0 sort=1
+    #   rank 1: Host(rank 1) sort=2, GPU 1 sort=3
+    #   ...
     events.append({"name": "process_sort_index", "ph": "M", "pid": PID_HOST, "tid": 0,
-                   "args": {"sort_index": PID_HOST}})
+                   "args": {"sort_index": 2 * GPU}})
+    events.append({"name": "process_sort_index", "ph": "M", "pid": PID_GPU, "tid": 0,
+                   "args": {"sort_index": 2 * GPU + 1}})
     unique_streams = sorted({e["tid"] for e in events
                              if e.get("pid") == PID_GPU and e["ph"] == "X"})
 
@@ -1026,6 +1459,92 @@ for GPU in GPU_LIST:
         "nccl_op_counts":    dict(nccl_op_counts),
     })
 
+# ----------------------------------------------------------------------
+# Tier B merge: optional Python tracer sidecar.
+#
+# The sidecar must be a JSON file with two top-level keys:
+#   {
+#     "clock": "CLOCK_REALTIME",         # or "utc_epoch_ns"
+#     "anchor_realtime_ns": <int>,       # ns since UTC epoch at tracer start
+#     "traceEvents": [
+#         {"name": ..., "ph": "X",
+#          "ts_realtime_ns": <int>,      # CLOCK_REALTIME ns (UTC since epoch)
+#          "dur_ns": <int>,
+#          "rank": <int>,                # which DGX rank (0..7)
+#          "args": {...}},
+#         ...
+#     ]
+#   }
+#
+# We map each Python event's wall-clock ns to nsys-window-relative us by:
+#     ts_window_us = (ts_realtime_ns - utcEpochNs_session
+#                     + ANALYSIS_DETAILS.startTime
+#                     - T_START) / 1000
+# where utcEpochNs_session and startTime are pulled from the nsys sqlite.
+# This assumes the Python tracer ran INSIDE the same nsys session.
+# Python events appear on a per-rank "python" lane (tid=600+) in the
+# corresponding host process.
+# ----------------------------------------------------------------------
+n_py_events = 0
+if py_trace_path:
+    try:
+        cur.execute("SELECT utcEpochNs FROM TARGET_INFO_SESSION_START_TIME LIMIT 1")
+        utc_session_ns = cur.fetchone()[0]
+        cur.execute("SELECT startTime FROM ANALYSIS_DETAILS LIMIT 1")
+        nsys_start_ns = cur.fetchone()[0]
+        nsys_origin_ns = utc_session_ns - nsys_start_ns  # ns where nsys ts=0
+        with open(py_trace_path) as f:
+            py_sidecar = json.load(f)
+        py_evts = py_sidecar.get("traceEvents", [])
+        print(f"\n=== Merging Python tracer sidecar: {py_trace_path} "
+              f"({len(py_evts)} events) ===", file=sys.stderr)
+        # Per-rank python lane numbering
+        PY_LANE_BASE = 600
+        py_lane_per_rank = {}
+        for e in py_evts:
+            ts_real = e.get("ts_realtime_ns")
+            dur_ns  = e.get("dur_ns", 0)
+            rank    = e.get("rank", 0)
+            if ts_real is None:
+                continue
+            # rewrite into nsys window-relative us
+            ts_window_us = (ts_real - nsys_origin_ns - T_START) / 1000.0
+            dur_us = dur_ns / 1000.0
+            # filter to events that fall inside the window
+            if ts_window_us + dur_us < 0:
+                continue
+            if ts_window_us > (T_END - T_START) / 1000.0:
+                continue
+            PID_HOST = PID_HOST_BASE + rank
+            tid = PY_LANE_BASE + py_lane_per_rank.setdefault(rank, 0)
+            ev = {
+                "name": e.get("name", "py_frame"),
+                "cat":  "python",
+                "cname": "rail_animation",
+                "ph":   "X",
+                "ts":   ts_window_us,
+                "dur":  dur_us,
+                "pid":  PID_HOST,
+                "tid":  tid,
+                "args": e.get("args", {}),
+            }
+            all_events.append(ev)
+            n_py_events += 1
+        # Name + sort python lanes
+        for rank in py_lane_per_rank.keys():
+            PID_HOST = PID_HOST_BASE + rank
+            all_events.append({"name": "thread_name", "ph": "M",
+                               "pid": PID_HOST, "tid": PY_LANE_BASE,
+                               "args": {"name": f"python (rank {rank})"}})
+            all_events.append({"name": "thread_sort_index", "ph": "M",
+                               "pid": PID_HOST, "tid": PY_LANE_BASE,
+                               "args": {"sort_index": 1}})
+        print(f"  merged {n_py_events:,} Python frame events into trace",
+              file=sys.stderr)
+    except Exception as e:
+        print(f"  WARNING: failed to merge py-trace '{py_trace_path}': {e}",
+              file=sys.stderr)
+
 print(f"\n=== Summary ===", file=sys.stderr)
 print(f"  GPUs       : {len(GPU_LIST)} {GPU_LIST}", file=sys.stderr)
 print(f"  Window     : iter {FIRST_ITER}..{FIRST_ITER+N_ITERS-1}  "
@@ -1034,6 +1553,7 @@ print(f"  Kernels    : {total_kernels:,}", file=sys.stderr)
 print(f"  Host APIs  : {total_host_apis:,}", file=sys.stderr)
 print(f"  Launch arr : {total_launch_pairs:,}", file=sys.stderr)
 print(f"  FwdBwd arr : {total_fwdbwd_pairs:,}", file=sys.stderr)
+print(f"  Py frames  : {n_py_events:,}", file=sys.stderr)
 print(f"  Total events: {len(all_events):,}", file=sys.stderr)
 
 print(f"\nWriting {OUT} ...", file=sys.stderr)
