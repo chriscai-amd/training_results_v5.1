@@ -123,6 +123,27 @@ target_link_libraries(huge_ctr_shared
     aio
 )
 
+# Phase 20 (2026-05-16): link librocprofiler-sdk-roctx for HCTR_ROCTX=1
+# pipeline-phase tagging in rocprofv3 --marker-trace captures. The lib
+# ships with ROCm 7.2.1+ at /opt/rocm/lib; find via name OR fall back
+# to direct path with .so.1 suffix (no bare .so symlink in 7.2.1 image).
+find_library(HCTR_ROCTX_LIB
+  NAMES rocprofiler-sdk-roctx
+  PATHS /opt/rocm/lib /opt/rocm-7.2.1/lib
+  NO_DEFAULT_PATH)
+if(NOT HCTR_ROCTX_LIB)
+  if(EXISTS /opt/rocm/lib/librocprofiler-sdk-roctx.so.1)
+    set(HCTR_ROCTX_LIB /opt/rocm/lib/librocprofiler-sdk-roctx.so.1)
+  endif()
+endif()
+if(HCTR_ROCTX_LIB)
+  message(STATUS "HCTR: linking ROCTX from ${HCTR_ROCTX_LIB}")
+  target_link_libraries(huge_ctr_shared PUBLIC ${HCTR_ROCTX_LIB})
+  target_include_directories(huge_ctr_shared PUBLIC /opt/rocm/include)
+else()
+  message(WARNING "HCTR: librocprofiler-sdk-roctx not found; HCTR_ROCTX=1 will fail at runtime")
+endif()
+
 target_compile_features(huge_ctr_shared PUBLIC cxx_std_17)
 
 # ============================================================================

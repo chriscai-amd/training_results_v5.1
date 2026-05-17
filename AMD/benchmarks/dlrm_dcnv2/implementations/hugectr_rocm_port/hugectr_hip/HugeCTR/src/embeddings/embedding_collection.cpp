@@ -15,6 +15,8 @@
  */
 
 #include <embeddings/embedding_collection.hpp>
+#include <cstdio>
+#include <hctr_tracing.hpp>
 
 #include "embedding/dense_model_parallel_embedding.hpp"
 #include "embedding/hier_model_parallel_embedding.hpp"
@@ -355,9 +357,41 @@ void EmbeddingCollection::cache_ddl_output(int gpu_id,
   }
 }
 
+// Phase 20.1 (2026-05-17): ROCTX stage-name helper. The Stage enum
+// already prints with operator<< inside HCTR but we keep a tiny ad-hoc
+// table here so the ROCTX range name is a compact "MPModelForward"
+// rather than the longer "embedding::Stage::MPModelForward".
+static const char *stage_name(Stage s) {
+  switch (s) {
+    case Stage::DPForward:                       return "DPForward";
+    case Stage::DPBackwardIndexCalculation:      return "DPBackwardIndexCalculation";
+    case Stage::DPLocalReduce:                   return "DPLocalReduce";
+    case Stage::DPAllreduce:                     return "DPAllreduce";
+    case Stage::MPModelForward:                  return "MPModelForward";
+    case Stage::MPNetworkdForward:               return "MPNetworkForward";
+    case Stage::MPBackwardIndexCalculation:      return "MPBackwardIndexCalculation";
+    case Stage::MPNetworkBackward:               return "MPNetworkBackward";
+    case Stage::MPLocalReduce:                   return "MPLocalReduce";
+    case Stage::HierMPModelForward:              return "HierMPModelForward";
+    case Stage::HierMPNetworkForward:            return "HierMPNetworkForward";
+    case Stage::HierMPBackwardIndexCalculation:  return "HierMPBackwardIndexCalculation";
+    case Stage::HierMPNetworkBackward:           return "HierMPNetworkBackward";
+    case Stage::HierMPLocalReduce:               return "HierMPLocalReduce";
+    case Stage::DenseMPModelForward:             return "DenseMPModelForward";
+    case Stage::DenseMPNetworkForward:           return "DenseMPNetworkForward";
+    case Stage::DenseMPBackwardIndexCalculation: return "DenseMPBackwardIndexCalculation";
+    case Stage::DenseMPNetworkBackward:          return "DenseMPNetworkBackward";
+    case Stage::DenseMPLocalReduce:              return "DenseMPLocalReduce";
+    default:                                     return "UnknownStage";
+  }
+}
+
 void EmbeddingCollection::forward_per_gpu(Stage stage, bool is_train, int gpu_id,
                                           const HugeCTR::DataDistributor::Result &input,
                                           core23::Tensor &output_buffer, int batch_size) {
+  char rng[64];
+  std::snprintf(rng, sizeof(rng), "EBC::forward_per_gpu[%s]", stage_name(stage));
+  HugeCTR::tracing::ScopedRange _scope(rng);
   // embedding ops
   auto &embeddings = is_train ? embeddings_[gpu_id] : eval_embeddings_[gpu_id];
   for (size_t grouped_id = 0; grouped_id < embeddings.size(); ++grouped_id) {
@@ -392,6 +426,9 @@ void EmbeddingCollection::forward_per_gpu(bool is_train, int gpu_id,
 void EmbeddingCollection::backward_per_gpu(Stage stage, int gpu_id,
                                            const HugeCTR::DataDistributor::Result &input,
                                            const core23::Tensor &top_grad, int batch_size) {
+  char rng[64];
+  std::snprintf(rng, sizeof(rng), "EBC::backward_per_gpu[%s]", stage_name(stage));
+  HugeCTR::tracing::ScopedRange _scope(rng);
   for (size_t grouped_id = 0; grouped_id < embeddings_[gpu_id].size(); ++grouped_id) {
     if (!embeddings_[gpu_id][grouped_id]->is_valid_stage(stage)) continue;
 

@@ -30,6 +30,7 @@
 #define HUGECTR_ROCM_NO_WMMA 1
 
 #include <common.hpp>
+#include <hctr_tracing.hpp>
 #include <layers/interaction_layer.hpp>
 #include <network_buffer_channels.hpp>
 #include <type_traits>
@@ -1119,10 +1120,12 @@ void InteractionLayer<T>::fprop_generic(bool is_train) {
 }
 template <>
 void InteractionLayer<float>::fprop(bool is_train) {
+  HugeCTR::tracing::ScopedRange _scope("InteractionLayer::fprop");
   this->fprop_generic(is_train);
 }
 template <>
 void InteractionLayer<__half>::fprop(bool is_train) {
+  HugeCTR::tracing::ScopedRange _scope("InteractionLayer::fprop");
   CudaDeviceContext context(get_device_id());
 
   __half *in_mlp = input_tensors_[0].template data<__half>();
@@ -1224,10 +1227,12 @@ void InteractionLayer<T>::bprop_generic() {
 }
 template <>
 void InteractionLayer<float>::bprop() {
+  HugeCTR::tracing::ScopedRange _scope("InteractionLayer::bprop");
   this->bprop_generic();
 }
 template <>
 void InteractionLayer<__half>::bprop() {
+  HugeCTR::tracing::ScopedRange _scope("InteractionLayer::bprop");
   CudaDeviceContext context(get_device_id());
 
   __half *up_grad = output_tensors_[0].template data<__half>();

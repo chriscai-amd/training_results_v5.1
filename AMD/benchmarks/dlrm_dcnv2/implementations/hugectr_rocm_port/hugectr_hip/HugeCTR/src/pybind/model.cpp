@@ -19,7 +19,9 @@
 #include <hip/hip_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <core/hctr_impl/hctr_backend.hpp>
+#include <hctr_tracing.hpp>
 #include <core23/logger.hpp>
 #include <core23/mpi_init_service.hpp>
 #include <core23_helper.hpp>
@@ -1047,7 +1049,18 @@ long long Model::read_a_batch(bool is_train) {
 }
 
 bool is_first_h2d = true;
+// Phase 20 (2026-05-16): monotonic per-thread iter counter for ROCTX
+// "iter_N" range names. Atomic so multi-rank Python frontends don't race.
+static std::atomic<uint64_t> hctr_train_iter_counter_{0};
 bool Model::train() {
+  // Phase 20: tag the whole iter so the Perfetto trace shows a top-level
+  // "iter_N" range on the host thread, with all per-phase ranges nested
+  // inside. Counter is monotonic across calls.
+  uint64_t iter_idx = hctr_train_iter_counter_.fetch_add(1);
+  char iter_name[64];
+  std::snprintf(iter_name, sizeof(iter_name), "iter_%llu",
+                static_cast<unsigned long long>(iter_idx));
+  tracing::ScopedRange _hctr_iter_roctx_scope(iter_name);
   try {
     if (train_data_reader_->is_started() == false) {
       HCTR_OWN_THROW(Error_t::IllegalCall,

@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include <hctr_tracing.hpp>
 #include <layers/mlp_layer.hpp>
 #include <type_traits>
 // ROCm port Phase 14i.5 (2026-05-13): CK-Tile fused MLP wrapper.
@@ -123,6 +124,7 @@ MLPLayer<T>::MLPLayer(const std::vector<core23::Tensor>& bottom_tensors,
 
 template <typename T>
 void MLPLayer<T>::fprop(bool is_train) {
+  HugeCTR::tracing::ScopedRange _scope("MLPLayer::fprop");
   CudaDeviceContext context(this->get_device_id());
   int num_layers = num_outputs_.size();
   for (int i = 0; i < num_layers; i++) {
@@ -219,6 +221,7 @@ void MLPLayer<T>::fprop(bool is_train) {
 
 template <typename T>
 void MLPLayer<T>::bprop() {
+  HugeCTR::tracing::ScopedRange _scope("MLPLayer::bprop");
   CudaDeviceContext context(this->get_device_id());
 
   int num_layers = num_outputs_.size();

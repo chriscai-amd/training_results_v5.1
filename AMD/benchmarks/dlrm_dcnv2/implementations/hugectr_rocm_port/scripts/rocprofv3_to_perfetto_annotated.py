@@ -137,6 +137,13 @@ MEMCPY_CSV = args.trace_prefix + "_memory_copy_trace.csv"
 # by their stream role (rccl_dedicated -> allreduce; embedding_a2a ->
 # alltoall; etc.) so the trace distinguishes operation types.
 RCCL_CSV = args.trace_prefix + "_rccl_api_trace.csv"
+# Optional: rocprofv3 --marker-trace output (ROCTX ranges/marks emitted
+# by HCTR when HCTR_ROCTX=1, e.g. "iter_42", "fwd/bmlp", "bwd/tmlp",
+# "comm/mlp_wgrad_allreduce"). Phase 20 (2026-05-16): used to show
+# host-side pipeline-phase ranges nested under iter ranges, with the
+# correlationId-derived launch flow arrows linking each phase's host
+# ranges to its GPU kernels.
+MARKER_CSV = args.trace_prefix + "_marker_api_trace.csv"
 GPU = args.gpu
 FIRST_ITER = args.first_iter
 N_ITERS = args.n_iters
@@ -702,6 +709,89 @@ print(f"  host->device launch arrows: {launch_pairs:,}", file=sys.stderr)
 print(f"  host threads (lanes): {len(host_tid_to_lane)}", file=sys.stderr)
 
 # ----------------------------------------------------------------------------
+# 4b) ROCTX marker ranges (Phase 20, HCTR_ROCTX=1)
+# ----------------------------------------------------------------------------
+# rocprofv3 --marker-trace produces marker_api_trace.csv with the schema:
+#   Domain,Function,Process_Id,Thread_Id,Correlation_Id,
+#   Start_Timestamp,End_Timestamp
+# For our HCTR ranges, Domain="MARKER_CORE_API" and Function is the
+# message we pushed (e.g. "iter_42", "fwd/bmlp", "comm/mlp_wgrad_allreduce").
+# We render each range as a Perfetto X event on its own lane on the
+# owner host process, with a category prefix-derived color so iter /
+# fwd / bwd / comm / opt stripes are visually distinct.
+marker_added = 0
+marker_skipped_outside = 0
+if os.path.exists(MARKER_CSV):
+    print(f"Loading {MARKER_CSV} (ROCTX marker ranges) ...", file=sys.stderr)
+    # Pick a lane index dedicated to roctx ranges so they don't intermix
+    # with hipLaunchKernel events on the host_thread lane.
+    roctx_lane = lane_of(-1)  # synthetic tid -1 -> next free lane
+    def _color_for(prefix):
+        # Perfetto reserved color names ("good", "bad", "thread_state_*",
+        # etc.) -- pick distinct colors per phase category.
+        return {
+            "iter":  "thread_state_runnable",
+            "fwd":   "rail_response",     # green-ish
+            "bwd":   "rail_animation",    # orange-ish
+            "comm":  "bad",               # red-ish
+            "opt":   "thread_state_running",
+            "data":  "rail_idle_busy",    # blue-ish
+            "sync_back": "grey",
+            "graph": "yellow",
+        }.get(prefix, None)
+    with open(MARKER_CSV) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            try:
+                start = int(row["Start_Timestamp"])
+                end   = int(row["End_Timestamp"])
+                tid   = int(row.get("Thread_Id", 0) or 0)
+            except (ValueError, KeyError):
+                continue
+            domain = row.get("Domain", "")
+            name   = row.get("Function", "?")
+            # Filter to HCTR-emitted ranges and the active iter window.
+            # rocprofv3 emits ROCTX push/pop ranges in domain
+            # MARKER_CORE_RANGE_API, instant marks in MARKER_CORE_API,
+            # and the SDK control calls (roctxProfilerPause etc.) in
+            # MARKER_CONTROL_API. We want the first two but not API
+            # internals.
+            if name.startswith("roctx"):
+                continue
+            if domain not in ("MARKER_CORE_RANGE_API", "MARKER_CORE_API"):
+                continue
+            if end <= T_START or start >= T_END:
+                marker_skipped_outside += 1
+                continue
+            prefix = name.split("/", 1)[0] if "/" in name else (
+                "iter" if name.startswith("iter_") else "")
+            cname = _color_for(prefix) or _color_for("graph")
+            ev = {
+                "name": name,
+                "cat":  "roctx",
+                "ph":   "X",
+                "ts":   (max(start, T_START) - T_START) / 1000.0,
+                "dur":  (min(end, T_END) - max(start, T_START)) / 1000.0,
+                "pid":  PID_HOST, "tid": roctx_lane,
+                "args": {"phase_prefix": prefix, "thread_id": tid,
+                         "duration_us": round((end - start) / 1000.0, 3)},
+            }
+            if cname:
+                ev["cname"] = cname
+            events.append(ev)
+            marker_added += 1
+    # Label the lane
+    events.append({"name": "thread_name", "ph": "M",
+                   "pid": PID_HOST, "tid": roctx_lane,
+                   "args": {"name": "roctx_ranges (HCTR phases)"}})
+    print(f"  ROCTX marker ranges kept: {marker_added:,} "
+          f"(skipped outside window: {marker_skipped_outside:,})",
+          file=sys.stderr)
+else:
+    print(f"  (no MARKER_CSV at {MARKER_CSV}; skipping ROCTX overlay)",
+          file=sys.stderr)
+
+# ----------------------------------------------------------------------------
 # 5) Heuristic forward/backward kernel pairing arrows
 # ----------------------------------------------------------------------------
 # Per iter:
@@ -832,33 +922,40 @@ def stream_role(sid):
     f_rccl, f_mlp, f_emb = rccl/total, mlp/total, emb/total
     f_sparse, f_memcpy = sparse/total, memcpy/total
 
-    # 0. Pure-memcpy streams (H2D-dominated → data reader's placement_streams_,
-    #    NV's "memcpy lane"). We catch these first because pure-DMA streams
-    #    have ZERO kernel events and would otherwise fall through to "idle".
+    # NV-style stream role names (matches nsys conventions for NV B200
+    # traces so side-by-side comparison is direct):
+    #   computation_stream / embedding_mp / embedding_dp / sparse_prep /
+    #   memcpy_stream  +  AMD-port-only "rccl_dedicated" for the
+    #   Phase-15 dedicated RCCL streams (no NV equivalent because NV
+    #   runs allreduce in-line on computation_stream).
+    #
+    # 0. Pure-memcpy streams (H2D-dominated → data reader's placement_streams_).
+    #    NV labels these "memcpy_stream" regardless of direction.
     h2d_dur = cat_dur.get("memcpy_h2d", 0)
     d2h_dur = cat_dur.get("memcpy_d2h", 0)
     if h2d_dur > 0 and (h2d_dur / total) > 0.85:
-        return "memcpy_h2d"     # placement_stream-style data reader H2D
+        return "memcpy_stream"
     if d2h_dur > 0 and (d2h_dur / total) > 0.85:
-        return "memcpy_d2h"
+        return "memcpy_stream"
     if f_memcpy > 0.85:
-        return "memcpy_stream"  # generic memcpy lane
+        return "memcpy_stream"
 
     # 1. Pure-RCCL streams (no compute) → Phase-15 dedicated RCCL streams
-    #    (rccl_emb_ar / rccl_mlp_wgrad). Threshold tight: ≥95% pure rccl.
+    #    (rccl_emb_ar / rccl_mlp_wgrad). AMD-only; no NV equivalent.
     if f_rccl > 0.95 and f_sparse < 0.05 and f_emb < 0.05:
         return "rccl_dedicated"
 
-    # 2. RCCL-heavy with some sparse_prep → embedding-a2a stream
-    #    (NV labels this "embedding_mp" but it's the a2a-dominated variant).
+    # 2. RCCL-heavy with some sparse_prep → NV's embedding_dp pattern
+    #    (the alltoall-dominated embedding stream).
     if f_rccl > 0.65 and f_sparse > 0.05:
-        return "embedding_a2a"
+        return "embedding_dp"
 
-    # 3. RCCL + embedding compute → embedding_mp (model-parallel emb, mixed)
+    # 3. RCCL + embedding compute → NV's embedding_mp pattern
+    #    (model-parallel embedding work mixed with mp alltoall).
     if f_rccl > 0.30 and f_emb > 0.15:
         return "embedding_mp"
 
-    # 4. MLP-dominated → main computation stream (default)
+    # 4. MLP-dominated → main computation stream
     if f_mlp > 0.50:
         return "computation_stream"
 
@@ -874,23 +971,29 @@ def stream_role(sid):
     if f_memcpy > 0.85 or (f_memcpy + cat_dur.get("memset", 0) / total) > 0.85:
         return "memcpy_stream"
 
-    # 8. Mixed app stream (MLP + embedding + sparse + RCCL all moderate)
-    if f_mlp > 0.20 or f_emb > 0.20:
-        return "mixed_app"
+    # 8. Catch-all for streams that don't cleanly match any single role.
+    #    On AMD we see these when the dedicated-RCCL split leaves a
+    #    "leftover" embedding stream carrying sparse_prep + emb_reduce
+    #    + opt_emb. NV's closest equivalent is sparse_prep (also a
+    #    catch-all for non-mainline embedding work).
+    if f_sparse > 0.30:
+        return "sparse_prep"
+    if f_emb > 0.20:
+        return "embedding_dp"
+    if f_mlp > 0.20:
+        return "computation_stream"
     return "other"
 
-# NV-style sort_index per role so similar streams group visually
+# NV-style sort_index per role so similar streams group visually.
+# Order matches what NVIDIA nsys shows for a GPU 0 section so
+# side-by-side AMD/NV comparison reads top-to-bottom.
 ROLE_SORT = {
     "computation_stream":  10,
     "embedding_mp":        20,
     "embedding_dp":        30,
-    "embedding_a2a":       35,
-    "rccl_dedicated":      40,
-    "sparse_prep":         50,
-    "memcpy_stream":       60,
-    "memcpy_h2d":          61,
-    "memcpy_d2h":          62,
-    "mixed_app":           70,
+    "sparse_prep":         40,
+    "rccl_dedicated":      45,  # AMD-port-only (Phase 15); no NV equivalent
+    "memcpy_stream":       50,
     "other":               80,
     "idle_stream":         99,
 }

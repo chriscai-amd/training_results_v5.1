@@ -78,11 +78,19 @@ export HIPBLASLT_LOG_LEVEL=4
 export HIPBLASLT_LOG_MASK=0xffff
 export TENSILE_DB=0xff
 
+# Phase 20 (2026-05-16): enable HCTR ROCTX phase tagging + capture them
+# via --marker-trace. HCTR_ROCTX=1 makes pipeline.cpp emit
+# roctxRangePushA/Pop around each StreamContextScheduleable / Graph-
+# Scheduleable run, plus an "iter_N" range around the whole iter in
+# model.cpp::train. Free if rocprofv3 is not attached.
+export HCTR_ROCTX=${HCTR_ROCTX:-1}
+
 HCTR_PROFILE_PREFIX="rocprofv3 \
     --kernel-trace \
     --hip-trace \
     --memory-copy-trace \
     --rccl-trace \
+    --marker-trace \
     --output-format csv \
     -d $TRACE_DIR \
     --output-file $BASENAME --" \

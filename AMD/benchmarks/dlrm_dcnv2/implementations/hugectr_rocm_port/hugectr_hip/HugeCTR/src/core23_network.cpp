@@ -18,6 +18,8 @@
 #include <omp.h>
 
 #include <core23_network.hpp>
+#include <cstdio>
+#include <hctr_tracing.hpp>
 #include <io/filesystem.hpp>
 #include <network_helpers.hpp>
 #include <nlohmann/json.hpp>
@@ -229,6 +231,7 @@ void Network::exchange_wgrad() {
 }
 
 void Network::update_params() {
+  HugeCTR::tracing::ScopedRange _scope("Network::update_params");
   optimizer_->update();
   return;
 }
@@ -374,13 +377,27 @@ void Network::conv_weight_(std::optional<core23::TensorContainer<__half, 1, 1>>&
 }
 
 void Network::prop_layers(const std::vector<Layer*>& layers, bool fprop, bool train) {
+  // Phase 20.1 (2026-05-17): ROCTX layer-level depth. The outer
+  // ScopedRange ("Network::prop_layers[fwd|bwd]") nests inside the
+  // phase-level range set by the calling StreamContextScheduleable
+  // (e.g. "fwd/bmlp"); each inner ScopedRange ("layer[i].fprop") then
+  // nests inside that, giving PyTorch-profiler-style 3-deep tree.
+  // Free when HCTR_ROCTX=0.
+  HugeCTR::tracing::ScopedRange _prop_scope(fprop ? "Network::prop_layers[fwd]"
+                                                  : "Network::prop_layers[bwd]");
   if (fprop) {
-    for (auto& layer : layers) {
-      layer->fprop(train);
+    for (size_t i = 0; i < layers.size(); ++i) {
+      char rng_name[40];
+      std::snprintf(rng_name, sizeof(rng_name), "layer[%zu].fprop", i);
+      HugeCTR::tracing::ScopedRange _layer_scope(rng_name);
+      layers[i]->fprop(train);
     }
   } else {
-    for (auto it = layers.rbegin(); it != layers.rend(); it++) {
-      (*it)->bprop();
+    for (size_t i = layers.size(); i-- > 0;) {
+      char rng_name[40];
+      std::snprintf(rng_name, sizeof(rng_name), "layer[%zu].bprop", i);
+      HugeCTR::tracing::ScopedRange _layer_scope(rng_name);
+      layers[i]->bprop();
     }
   }
 }

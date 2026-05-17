@@ -99,6 +99,7 @@ docker run --rm --network=host \
     -v $SCRIPTS_HOST:/scripts:ro \
     -v $RPS_HOST:/rps_out \
     -v $RESULTS_HOST:/results \
+    -e HCTR_ROCTX='${HCTR_ROCTX:-1}' \
     -w /workspace $IMG \
     bash /workspace/scripts/_trace_and_convert_inner.sh \
         '$START_ITER' '$END_ITER' '$MAX_ITER' '$TRACE_SUBDIR' '$OUT_SUBDIR'

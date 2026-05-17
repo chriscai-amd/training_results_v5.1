@@ -45,6 +45,9 @@ class StreamContextScheduleable : public Scheduleable {
   bool wait_external_;
   std::optional<hipEvent_t> completion_event_;
   bool record_external_;
+  // Phase 20 (2026-05-16): optional human-readable name for ROCTX
+  // tagging in traces (HCTR_ROCTX=1). Set via set_debug_name().
+  std::string debug_name_;
 
   std::function<void()> workload_;
 
@@ -58,6 +61,12 @@ class StreamContextScheduleable : public Scheduleable {
   void set_absolute_stream(const std::string &stream_name, int priority = 0);
 
   void set_stream(const std::string &stream_name, int priority = 0);
+
+  // Phase 20: tag this scheduleable so HCTR_ROCTX=1 traces show a
+  // host-side range named `name` around the workload + its kernel
+  // launches.
+  void set_debug_name(std::string name) { debug_name_ = std::move(name); }
+  const std::string &debug_name() const { return debug_name_; }
 
   std::tuple<std::string, int> get_stream_name(std::shared_ptr<GPUResource> gpu);
 
@@ -82,6 +91,10 @@ class GraphScheduleable : public Scheduleable {
   std::optional<std::vector<hipEvent_t>> wait_external_event_;
   std::optional<hipEvent_t> completion_event_;
 
+  // Phase 20 (2026-05-16): optional human-readable name for ROCTX tagging
+  // in traces (HCTR_ROCTX=1). Set via set_debug_name().
+  std::string debug_name_;
+
  public:
   HCTR_DISALLOW_COPY_AND_MOVE(GraphScheduleable);
 
@@ -99,6 +112,11 @@ class GraphScheduleable : public Scheduleable {
       hipEventDestroy(completion_event_.value());
     }
   }
+
+  // Phase 20: tag this graph so HCTR_ROCTX=1 traces show a host-side
+  // range named graph_<name> around capture + replay.
+  void set_debug_name(std::string name) { debug_name_ = std::move(name); }
+  const std::string& debug_name() const { return debug_name_; }
 
   // Make this graph wait for externally-recorded events BEFORE its replay starts.
   // Used to express cross-graph dependencies (e.g., bprop graph waits for fprop graph).

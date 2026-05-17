@@ -25,6 +25,7 @@
 // HugeCTR ROCm port: cuml linalg replaced by hand-written HIP shim
 
 #include <array>  // ROCm port: cuda/std/array -> std array
+#include <hctr_tracing.hpp>
 #include <layers/multi_cross_layer.hpp>
 // HugeCTR ROCm port: cuml linalg replaced by hand-written HIP shim
 // HugeCTR ROCm port: cuml linalg replaced by hand-written HIP shim
@@ -1181,6 +1182,7 @@ MultiCrossLayer<T>::MultiCrossLayer(const std::vector<core23::Tensor>& in_tensor
 
 template <typename T>
 void MultiCrossLayer<T>::fprop(bool is_train) {
+  HugeCTR::tracing::ScopedRange _scope("MultiCrossLayer::fprop");
   CudaDeviceContext context(this->get_device_id());
   std::vector<core23::Tensor> kernel_tensors;
   std::vector<core23::Tensor> bias_tensors;
@@ -1220,6 +1222,7 @@ void MultiCrossLayer<T>::fprop(bool is_train) {
 
 template <typename T>
 void MultiCrossLayer<T>::bprop() {
+  HugeCTR::tracing::ScopedRange _scope("MultiCrossLayer::bprop");
   CudaDeviceContext context(this->get_device_id());
   std::vector<core23::Tensor> kernel_tensors;
   std::vector<core23::Tensor> kernel_output_tensors;

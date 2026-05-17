@@ -16,6 +16,7 @@
 
 #include <unistd.h>
 
+#include <hctr_tracing.hpp>
 #include <pipeline.hpp>
 
 namespace HugeCTR {
@@ -93,6 +94,11 @@ void StreamContextScheduleable::init(std::shared_ptr<GPUResource> gpu) {
 }
 
 void StreamContextScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
+  // Phase 20 (2026-05-16): tag the entire run body (event waits +
+  // workload + record) with a ROCTX range named by set_debug_name().
+  // Free when HCTR_ROCTX is unset.
+  tracing::ScopedRange _hctr_roctx_scope(debug_name_.c_str());
+
   CudaDeviceContext context{gpu->get_device_id()};
 
   auto [current_stream_name, priority] = get_stream_name(gpu);
@@ -131,6 +137,11 @@ void StreamContextScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_g
 
 void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
   if (scheduleable_list_.empty()) return;
+  // Phase 20 (2026-05-16): ROCTX range around the entire graph run.
+  // Each inner StreamContextScheduleable emits its own nested range.
+  std::string outer_name = debug_name_.empty() ? std::string("graph") : "graph_" + debug_name_;
+  tracing::ScopedRange _hctr_graph_roctx_scope(outer_name.c_str());
+
   auto do_it = [=](hipStream_t) {
     for (auto &scheduleable : scheduleable_list_) {
       scheduleable->run(gpu, use_graph);
