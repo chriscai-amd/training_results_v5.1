@@ -27,6 +27,9 @@
 #include <array>  // ROCm port: cuda/std/array -> std array
 #include <hctr_tracing.hpp>
 #include <layers/multi_cross_layer.hpp>
+#include <perfetto_emitter.hpp>
+#include <unordered_map>
+#include <vector>
 // HugeCTR ROCm port: cuml linalg replaced by hand-written HIP shim
 // HugeCTR ROCm port: cuml linalg replaced by hand-written HIP shim
 // HugeCTR ROCm port: cuml linalg replaced by hand-written HIP shim
@@ -765,9 +768,43 @@ void MultiCrossForwardFunctorv2<T>::operator()(
     const std::vector<CublasDesc<T>>& xu_descr_, const std::vector<CublasDesc<T>>& xuvb_descr_,
     const std::vector<CublasAlgo<T>>& xu_fprop_algo_,
     const std::vector<CublasAlgo<T>>& xuvb_fprop_algo_, hipblasLtHandle_t cublaslt_handle) {
+  // Phase 20.6: per-cross-layer GpuPhase tracing. Each cross layer runs
+  // 2 GEMMs (X*U, X*U*V+b) + 1 fused_matrix_elementwise_dot_add. Lazily
+  // registered, one set of phases per (this, layer) pair.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::unordered_map<const void*, std::vector<GpuPhase*>> cross_fwd_phases;
+  std::vector<GpuPhase*>* cf_phases = nullptr;
   auto batchsize = input_tensor.shape().size(0);
   auto projection_dim = kernel_tensors[0].shape().size(1);
   auto vec_length = input_tensor.shape().size(1);
+  // Phase 20.7: per-cross-layer events require DETAIL >= 2.
+  if (HugeCTR::tracing::native_trace_enabled() &&
+      HugeCTR::tracing::native_trace_detail() >= 2) {
+    auto it = cross_fwd_phases.find(this);
+    if (it == cross_fwd_phases.end()) {
+      auto& v = cross_fwd_phases[this];
+      v.reserve(num_layers);
+      int dev = 0;
+      hipGetDevice(&dev);  // approximation: rank == device_id (true for DLRM 8-GPU)
+      for (int j = 0; j < num_layers; ++j) {
+        char nm[48], args[200];
+        std::snprintf(nm, sizeof(nm), "cross/L%d_fprop", j);
+        // Cross-layer fprop: 2 GEMMs (X*U, X*U*V+b) + 1 fused FMA kernel.
+        std::snprintf(args, sizeof(args),
+                      "\"kernel\":\"DCNv2_cross_fprop(X*U->X*U*V+b->FMA)\","
+                      "\"batch\":%ld,\"vec_length\":%ld,\"projection_dim\":%ld,"
+                      "\"layer_idx\":%d,\"dtype\":\"fp16\"",
+                      (long)batchsize, (long)vec_length, (long)projection_dim, j);
+        v.push_back(PerfettoEmitter::instance().register_phase(dev, nm,
+                                                                std::string(args)));
+      }
+      cf_phases = &v;
+    } else {
+      cf_phases = &it->second;
+    }
+  }
   auto U_row = kernel_tensors[0].shape().size(0);
   auto V_col = kernel_tensors[1].shape().size(1);
   float alpha = 1.0f;
@@ -777,6 +814,8 @@ void MultiCrossForwardFunctorv2<T>::operator()(
     HCTR_OWN_THROW(Error_t::WrongInput, "input or output tensor dimensions not matches");
   }
   for (int i = 0; i < num_layers; i++) {
+    GpuPhase* p = (cf_phases && i < (int)cf_phases->size()) ? (*cf_phases)[i] : nullptr;
+    ScopedGpuPhase _p(p, stream, "default");
     const auto& tensor_input = i == 0 ? input_tensor : layer_output_tensors[i - 1];
     // gemm with functor
     // x_i * u
@@ -907,7 +946,44 @@ void MultiCrossBackwardFunctorv2<T>::operator()(
   auto U_row = kernel_tensors[0].shape()[0];
   auto V_col = kernel_tensors[1].shape()[1];
   bool dgrad_act_shared = grad_tensors[0].data() == input_tensor.data();
+  // Phase 20.6: per-cross-layer bprop GpuPhase tracing. Each cross layer's
+  // bprop runs 1 fused kernel + 4 GEMMs. One phase per (this, layer) pair.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::unordered_map<const void*, std::vector<GpuPhase*>> cross_bwd_phases;
+  std::vector<GpuPhase*>* cb_phases = nullptr;
+  // Phase 20.7: per-cross-layer bprop events require DETAIL >= 2.
+  if (HugeCTR::tracing::native_trace_enabled() &&
+      HugeCTR::tracing::native_trace_detail() >= 2) {
+    auto it = cross_bwd_phases.find(this);
+    if (it == cross_bwd_phases.end()) {
+      auto& v = cross_bwd_phases[this];
+      v.reserve(num_layers);
+      int dev = 0;
+      hipGetDevice(&dev);
+      for (int j = 0; j < num_layers; ++j) {
+        char nm[48], args[220];
+        std::snprintf(nm, sizeof(nm), "cross/L%d_bprop", j);
+        // Cross-layer bprop: 1 fused FMA + 4 GEMMs (dH, dV, dU, dY_prev).
+        std::snprintf(args, sizeof(args),
+                      "\"kernel\":\"DCNv2_cross_bprop(FMA->4xGEMM)\","
+                      "\"batch\":%ld,\"vec_length\":%ld,\"projection_dim\":%ld,"
+                      "\"layer_idx\":%d,\"dtype\":\"fp16\","
+                      "\"async_wgrad\":%d",
+                      (long)batchsize, (long)vec_length, (long)projection_dim, j,
+                      async_wgrad ? 1 : 0);
+        v.push_back(PerfettoEmitter::instance().register_phase(dev, nm,
+                                                                std::string(args)));
+      }
+      cb_phases = &v;
+    } else {
+      cb_phases = &it->second;
+    }
+  }
   for (int i = num_layers - 1; i >= 0; i--) {
+    GpuPhase* p = (cb_phases && i < (int)cb_phases->size()) ? (*cb_phases)[i] : nullptr;
+    ScopedGpuPhase _p(p, dgrad_stream, "default");
     // S0 = dY_i .* X , shape: (batchsize, w)
     // dX += dY_i .* H , shape: (batchsize, w)
     if (kSkipDxMemset && i == num_layers - 1) {

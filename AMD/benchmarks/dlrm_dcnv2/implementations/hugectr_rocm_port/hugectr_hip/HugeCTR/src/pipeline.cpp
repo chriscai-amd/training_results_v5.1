@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <hctr_tracing.hpp>
+#include <perfetto_emitter.hpp>
 #include <pipeline.hpp>
 
 namespace HugeCTR {
@@ -101,6 +102,22 @@ void StreamContextScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_g
 
   CudaDeviceContext context{gpu->get_device_id()};
 
+  // Phase 20.4 (2026-05-17): lazily register a GpuPhase for this
+  // Scheduleable on first run (HCTR_NATIVE_TRACE=1 only). Must happen
+  // AFTER CudaDeviceContext so hipEventCreate() lands on the correct GPU.
+  // Per-scheduleable phase recording can be independently disabled via
+  // HCTR_NATIVE_TRACE_NO_PHASES=1 (for bisecting crashes -- keeps
+  // begin_iter/end_iter active but no per-phase event records).
+  static const bool no_phases = []() {
+    const char* e = std::getenv("HCTR_NATIVE_TRACE_NO_PHASES");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (!no_phases && tracing::native_trace_enabled() &&
+      gpu_phase_ == nullptr && !debug_name_.empty()) {
+    gpu_phase_ = tracing::PerfettoEmitter::instance().register_phase(
+        gpu->get_local_id(), debug_name_);
+  }
+
   auto [current_stream_name, priority] = get_stream_name(gpu);
   StreamContext stream_context{gpu, current_stream_name, priority};
   hipStream_t stream = gpu->get_stream();
@@ -127,7 +144,25 @@ void StreamContextScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_g
               ? hipEventWaitExternal : 0));
     }
   }
-  if (workload_) workload_();
+  // Phase 20.4: bracket workload with start/end hipEventRecords.
+  // SKIP recording when the stream is currently in HIP graph capture mode:
+  // recording timing-enabled events into a captured graph triggers a ROCm
+  // 7.2.1 runtime bug (similar root cause as AddExternalEventWaitNode type
+  // confusion). The outer GraphScheduleable still records per-graph timing
+  // on the non-captured stream BEFORE/AFTER graph_.exec(). Standalone
+  // StreamContextScheduleables (data_distribute, ebc_*, comm, opt) are NOT
+  // in capture mode so they DO get per-phase timing.
+  hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+  if (gpu_phase_ != nullptr) {
+    hipStreamIsCapturing(stream, &cap_status);
+  }
+  {
+    tracing::GpuPhase* phase_for_this_run =
+        (cap_status == hipStreamCaptureStatusActive) ? nullptr : gpu_phase_;
+    tracing::ScopedGpuPhase _hctr_gpu_phase(phase_for_this_run, stream,
+                                            current_stream_name);
+    if (workload_) workload_();
+  }
   if (completion_event_.has_value()) {
     HCTR_LIB_THROW(hipEventRecordWithFlags(
         completion_event_.value(), stream,
@@ -142,6 +177,21 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
   std::string outer_name = debug_name_.empty() ? std::string("graph") : "graph_" + debug_name_;
   tracing::ScopedRange _hctr_graph_roctx_scope(outer_name.c_str());
 
+  // Phase 20.4 deep-trace mode: when HCTR_NATIVE_TRACE_DEEP=1, force
+  // use_graph=false for this GraphScheduleable so its inner scheduleables
+  // run as individual stream-context scheduleables. This lets us record
+  // per-inner-scheduleable GPU phases (fwd/bmlp, fwd/tmlp, fwd/loss,
+  // bwd/tmlp, bwd/bmlp, etc.) which are otherwise hidden inside the
+  // captured-graph black box. Cost: ~30% iter-wall overhead since the
+  // network kernels lose graph-launch fusion benefits.
+  static const bool deep_trace = []() {
+    const char* e = std::getenv("HCTR_NATIVE_TRACE_DEEP");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (deep_trace && tracing::native_trace_enabled()) {
+    use_graph = false;
+  }
+
   auto do_it = [=](hipStream_t) {
     for (auto &scheduleable : scheduleable_list_) {
       scheduleable->run(gpu, use_graph);
@@ -153,6 +203,19 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
   auto [current_stream_name, priority] = first_node->get_stream_name(gpu);
   hipStream_t stream = gpu->get_stream(current_stream_name, priority);
 
+  // Phase 20.4: lazily register a phase for the graph's outer range.
+  // (Gated by HCTR_NATIVE_TRACE_NO_PHASES for bisect.)
+  static const bool no_phases_g = []() {
+    const char* e = std::getenv("HCTR_NATIVE_TRACE_NO_PHASES");
+    return e != nullptr && e[0] == '1';
+  }();
+  if (!no_phases_g && tracing::native_trace_enabled() &&
+      gpu_phase_ == nullptr && !debug_name_.empty()) {
+    CudaDeviceContext _dctx{gpu->get_device_id()};
+    gpu_phase_ = tracing::PerfettoEmitter::instance().register_phase(
+        gpu->get_local_id(), "graph_" + debug_name_);
+  }
+
   // Phase 14n.5: cross-graph wait_event before replay. Captured cross-stream
   // edge ensures bprop graph (on stream 2) waits for fprop graph (on default).
   if (wait_external_event_.has_value()) {
@@ -162,7 +225,10 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
   }
 
   if (!use_graph) {
-    do_it(stream);
+    {
+      tracing::ScopedGpuPhase _hctr_gpu_phase(gpu_phase_, stream, current_stream_name);
+      do_it(stream);
+    }
     if (completion_event_.has_value()) {
       HCTR_LIB_THROW(hipEventRecord(completion_event_.value(), stream));
     }
@@ -176,7 +242,10 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
 #endif
 #pragma omp barrier
   }
-  graph_.exec(stream);
+  {
+    tracing::ScopedGpuPhase _hctr_gpu_phase(gpu_phase_, stream, current_stream_name);
+    graph_.exec(stream);
+  }
   // Phase 14n.5: record completion event AFTER replay so downstream graphs/scheduleables
   // can wait_event on this graph's completion. Note: hipEventRecord on a stream after
   // graph_.exec() gives semantics "this event signals when all prior work on stream is done"

@@ -27,6 +27,10 @@
 
 namespace HugeCTR {
 
+namespace tracing {
+class GpuPhase;  // forward decl; full def in perfetto_emitter.hpp
+}  // namespace tracing
+
 class Scheduleable {
  public:
   virtual ~Scheduleable() = default;
@@ -48,6 +52,10 @@ class StreamContextScheduleable : public Scheduleable {
   // Phase 20 (2026-05-16): optional human-readable name for ROCTX
   // tagging in traces (HCTR_ROCTX=1). Set via set_debug_name().
   std::string debug_name_;
+  // Phase 20.4 (2026-05-17): per-Scheduleable GPU phase for HCTR-native
+  // Perfetto emitter (HCTR_NATIVE_TRACE=1). Lazily created on first run().
+  // Non-owning: lifetime managed by PerfettoEmitter singleton.
+  tracing::GpuPhase* gpu_phase_ = nullptr;
 
   std::function<void()> workload_;
 
@@ -94,6 +102,8 @@ class GraphScheduleable : public Scheduleable {
   // Phase 20 (2026-05-16): optional human-readable name for ROCTX tagging
   // in traces (HCTR_ROCTX=1). Set via set_debug_name().
   std::string debug_name_;
+  // Phase 20.4 (2026-05-17): GPU phase for the entire graph replay.
+  tracing::GpuPhase* gpu_phase_ = nullptr;
 
  public:
   HCTR_DISALLOW_COPY_AND_MOVE(GraphScheduleable);

@@ -18,9 +18,11 @@
 #include <HugeCTR/embedding/common.hpp>
 #include <HugeCTR/include/utils.cuh>
 #include <HugeCTR/include/utils.hpp>
+#include <array>
 #include <hipcub/hipcub.hpp>
 #include <embedding/data_distributor/data_distribution_op.hpp>
 #include <embedding/operators/communication.hpp>
+#include <perfetto_emitter.hpp>
 
 namespace HugeCTR {
 
@@ -62,20 +64,43 @@ SparseDPDataDistributionOp::SparseDPDataDistributionOp(
 void SparseDPDataDistributionOp::distribute(const DataDistributionInput& input,
                                             embedding::EmbeddingInput& output, int batch_size,
                                             hipStream_t stream) {
-  // --- copy DP keys and sparse_forward DP bucket range
-  concat_keys_and_bucket_range_operator_(input, output.keys, output.bucket_range, stream);
+  // Phase 20.8: per-sub-method GpuPhase for sparse_prep DP (3 phases).
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::array<GpuPhase*, 3> dp_subs = {nullptr, nullptr, nullptr};
+  if (HugeCTR::tracing::native_trace_enabled() &&
+      HugeCTR::tracing::native_trace_detail() >= 1 &&
+      dp_subs[0] == nullptr) {
+    int dev = 0;
+    hipGetDevice(&dev);
+    dp_subs[0] = PerfettoEmitter::instance().register_phase(dev, "sp/dp/concat_keys_buckets");
+    dp_subs[1] = PerfettoEmitter::instance().register_phase(dev, "sp/dp/num_keys_d2h_sync");
+    dp_subs[2] = PerfettoEmitter::instance().register_phase(dev, "sp/dp/convert_indices");
+  }
+  {
+    ScopedGpuPhase _p(dp_subs[0], stream, "prefetch");
+    // --- copy DP keys and sparse_forward DP bucket range
+    concat_keys_and_bucket_range_operator_(input, output.keys, output.bucket_range, stream);
+  }
 
-  DISPATCH_INTEGRAL_FUNCTION_CORE23(ebc_param_.offset_type.type(), BucketRangeType, [&] {
-    BucketRangeType num_keys = 0;
-    int num_buckets = output.bucket_range.num_elements();
-    HCTR_LIB_THROW(hipMemcpyAsync(&num_keys,
-                                   output.bucket_range.data<BucketRangeType>() + num_buckets - 1,
-                                   sizeof(BucketRangeType), hipMemcpyDeviceToHost, stream));
-    HCTR_LIB_THROW(hipStreamSynchronize(stream));
-    output.h_num_keys = num_keys;
-  });
+  {
+    ScopedGpuPhase _p(dp_subs[1], stream, "prefetch");
+    DISPATCH_INTEGRAL_FUNCTION_CORE23(ebc_param_.offset_type.type(), BucketRangeType, [&] {
+      BucketRangeType num_keys = 0;
+      int num_buckets = output.bucket_range.num_elements();
+      HCTR_LIB_THROW(hipMemcpyAsync(&num_keys,
+                                     output.bucket_range.data<BucketRangeType>() + num_buckets - 1,
+                                     sizeof(BucketRangeType), hipMemcpyDeviceToHost, stream));
+      HCTR_LIB_THROW(hipStreamSynchronize(stream));
+      output.h_num_keys = num_keys;
+    });
+  }
 
-  convert_indices(output);
+  {
+    ScopedGpuPhase _p(dp_subs[2], stream, "prefetch");
+    convert_indices(output);
+  }
 }
 
 void SparseDPDataDistributionOp::convert_indices(embedding::EmbeddingInput& output) {
@@ -215,11 +240,46 @@ SparseMPDataDistributionOp::SparseMPDataDistributionOp(
 void SparseMPDataDistributionOp::distribute(const DataDistributionInput& input,
                                             embedding::EmbeddingInput& output, int batch_size,
                                             hipStream_t stream) {
-  filter_before_all2all(input, output, stream);
-  all2all_keys_per_bucket(output, stream);
-  all2all_keys(output, stream);
-  filter_after_all2all(output, stream);
-  convert_indices(output);
+  // Phase 20.8 (2026-05-18): per-sub-method GpuPhase tracing inside
+  // sparse_prep MP. NV nsys captures the 43 internal kernels here; we
+  // wrap the 5 top-level method calls to expose phase boundaries
+  // (filter/all2all/convert) without going per-kernel.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::array<GpuPhase*, 5> mp_subs = {nullptr, nullptr, nullptr,
+                                                            nullptr, nullptr};
+  if (HugeCTR::tracing::native_trace_enabled() &&
+      HugeCTR::tracing::native_trace_detail() >= 1 &&
+      mp_subs[0] == nullptr) {
+    int dev = 0;
+    hipGetDevice(&dev);
+    mp_subs[0] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/filter_before_a2a");
+    mp_subs[1] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/a2a_keys_per_bucket");
+    mp_subs[2] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/a2a_keys");
+    mp_subs[3] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/filter_after_a2a");
+    mp_subs[4] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/convert_indices");
+  }
+  {
+    ScopedGpuPhase _p(mp_subs[0], stream, "prefetch");
+    filter_before_all2all(input, output, stream);
+  }
+  {
+    ScopedGpuPhase _p(mp_subs[1], stream, "prefetch");
+    all2all_keys_per_bucket(output, stream);
+  }
+  {
+    ScopedGpuPhase _p(mp_subs[2], stream, "prefetch");
+    all2all_keys(output, stream);
+  }
+  {
+    ScopedGpuPhase _p(mp_subs[3], stream, "prefetch");
+    filter_after_all2all(output, stream);
+  }
+  {
+    ScopedGpuPhase _p(mp_subs[4], stream, "prefetch");
+    convert_indices(output);
+  }
 }
 
 void SparseMPDataDistributionOp::filter_before_all2all(const DataDistributionInput& input,

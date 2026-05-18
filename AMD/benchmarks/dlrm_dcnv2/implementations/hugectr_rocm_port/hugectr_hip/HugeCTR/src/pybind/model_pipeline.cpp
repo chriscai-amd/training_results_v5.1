@@ -16,12 +16,14 @@
 
 #include <HugeCTR/include/data_readers/multi_hot/async_data_reader.hpp>
 #include <algorithm>
+#include <atomic>
 #include <core23/logger.hpp>
 #include <core23_network.hpp>
 #include <fstream>
 #include <hctr_tracing.hpp>
 #include <iomanip>
 #include <iterator>
+#include <perfetto_emitter.hpp>
 #include <pybind/model.hpp>
 #include <resource_managers/resource_manager_core.hpp>
 #include <sstream>
@@ -534,16 +536,38 @@ void Model::train_pipeline_with_ebc() {
 
   const bool use_graph = solver_.use_cuda_graph && !train_data_reader_->current_batch_incomplete();
 
+  // Phase 20.4 (2026-05-17): native Perfetto emitter -- begin_iter
+  // before pipeline.run(), end_iter after, per-rank. Compute the monotonic
+  // iter index from the central counter in Model::train() if available;
+  // here we use a static local counter (good enough for DLRM single train()
+  // loop).
+  static std::atomic<int> hctr_native_iter_counter{0};
+  int iter_idx = -1;
+  if (tracing::native_trace_enabled()) {
+    iter_idx = hctr_native_iter_counter.fetch_add(1);
+  }
+
 #pragma omp parallel num_threads(resource_manager_->get_local_gpu_count())
   {
     int id = omp_get_thread_num();
-    auto device_id = resource_manager_->get_local_gpu(id)->get_device_id();
+    auto gpu = resource_manager_->get_local_gpu(id);
+    auto device_id = gpu->get_device_id();
     CudaCPUDeviceContext context(device_id);
+
+    if (tracing::native_trace_enabled()) {
+      tracing::PerfettoEmitter::instance().begin_iter(
+          static_cast<int>(gpu->get_local_id()), iter_idx, gpu->get_stream());
+    }
 
     if (use_graph) {
       graph_.train_pipeline_[id].run_graph();
     } else {
       graph_.train_pipeline_[id].run();
+    }
+
+    if (tracing::native_trace_enabled()) {
+      tracing::PerfettoEmitter::instance().end_iter(
+          static_cast<int>(gpu->get_local_id()));
     }
   }
 }

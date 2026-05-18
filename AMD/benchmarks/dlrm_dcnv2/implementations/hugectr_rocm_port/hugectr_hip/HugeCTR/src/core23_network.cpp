@@ -24,8 +24,10 @@
 #include <network_helpers.hpp>
 #include <nlohmann/json.hpp>
 #include <parser.hpp>
+#include <perfetto_emitter.hpp>
 #include <regularizer.hpp>
 #include <trainable_layer.hpp>
+#include <unordered_map>
 
 namespace HugeCTR {
 
@@ -385,18 +387,63 @@ void Network::prop_layers(const std::vector<Layer*>& layers, bool fprop, bool tr
   // Free when HCTR_ROCTX=0.
   HugeCTR::tracing::ScopedRange _prop_scope(fprop ? "Network::prop_layers[fwd]"
                                                   : "Network::prop_layers[bwd]");
+  // Phase 20.5 (2026-05-17): per-layer GpuPhase records (mode B only;
+  // capture-mode safe via the hipStreamIsCapturing check in ScopedGpuPhase
+  // -- skipped during graph capture, fired in DEEP mode). One phase
+  // entry per (Layer*, fprop|bprop) pair, lazily registered, reused
+  // across iters. Adds ~2us per layer call when active.
+  static thread_local std::unordered_map<const Layer*, HugeCTR::tracing::GpuPhase*> fwd_phases;
+  static thread_local std::unordered_map<const Layer*, HugeCTR::tracing::GpuPhase*> bwd_phases;
+  // Phase 20.7: per-layer wrappers require DETAIL >= 1.
+  const bool native_on = HugeCTR::tracing::native_trace_enabled() &&
+                         HugeCTR::tracing::native_trace_detail() >= 1;
+  hipStream_t stream = gpu_resource_->get_stream();
+  // Capture-status check: skip per-layer events while inside graph capture
+  // (ROCm 7.2.1 graph-event interaction bug).
+  hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+  if (native_on) hipStreamIsCapturing(stream, &cap_status);
+  const bool in_capture = (cap_status == hipStreamCaptureStatusActive);
+
   if (fprop) {
     for (size_t i = 0; i < layers.size(); ++i) {
-      char rng_name[40];
+      char rng_name[64];
       std::snprintf(rng_name, sizeof(rng_name), "layer[%zu].fprop", i);
       HugeCTR::tracing::ScopedRange _layer_scope(rng_name);
+      HugeCTR::tracing::GpuPhase* p = nullptr;
+      if (native_on && !in_capture) {
+        auto it = fwd_phases.find(layers[i]);
+        if (it == fwd_phases.end()) {
+          char phase_name[80];
+          std::snprintf(phase_name, sizeof(phase_name), "L/L%zu_fprop", i);
+          p = HugeCTR::tracing::PerfettoEmitter::instance().register_phase(
+              gpu_resource_->get_local_id(), phase_name);
+          fwd_phases[layers[i]] = p;
+        } else {
+          p = it->second;
+        }
+      }
+      HugeCTR::tracing::ScopedGpuPhase _gp(p, stream, "default");
       layers[i]->fprop(train);
     }
   } else {
     for (size_t i = layers.size(); i-- > 0;) {
-      char rng_name[40];
+      char rng_name[64];
       std::snprintf(rng_name, sizeof(rng_name), "layer[%zu].bprop", i);
       HugeCTR::tracing::ScopedRange _layer_scope(rng_name);
+      HugeCTR::tracing::GpuPhase* p = nullptr;
+      if (native_on && !in_capture) {
+        auto it = bwd_phases.find(layers[i]);
+        if (it == bwd_phases.end()) {
+          char phase_name[80];
+          std::snprintf(phase_name, sizeof(phase_name), "L/L%zu_bprop", i);
+          p = HugeCTR::tracing::PerfettoEmitter::instance().register_phase(
+              gpu_resource_->get_local_id(), phase_name);
+          bwd_phases[layers[i]] = p;
+        } else {
+          p = it->second;
+        }
+      }
+      HugeCTR::tracing::ScopedGpuPhase _gp(p, stream, "default");
       layers[i]->bprop();
     }
   }

@@ -18,7 +18,9 @@
 #include <embedding/data_distributor/data_compression_operators.cuh>
 #include <embedding/data_distributor/data_distributor.hpp>
 #include <embedding/operators/communication.hpp>
+#include <perfetto_emitter.hpp>
 #include <unordered_set>
+#include <vector>
 
 namespace HugeCTR {
 
@@ -159,27 +161,61 @@ void DataDistributor::distribute(int gpu_id, const std::vector<core23::Tensor>& 
   CudaDeviceContext ctx(core->get_device_id());
   hipStream_t stream = core->get_local_gpu()->get_stream();
 
-  const bool bucket_ranges_outdated = batch_size != gpu_comm_data_[gpu_id].last_batch_size;
-  gpu_comm_data_[gpu_id].last_batch_size = batch_size;
-
-  // sparse_forward new full batch bucket range (to be deprecated)
-  // sparse_forward dp bucket ranges (to be moved to data reader)
-  if (bucket_ranges_outdated) {
-    compute_dp_bucket_range_operators_[gpu_id](fixed_dp_bucket_range_[gpu_id],
-                                               output[0].num_keys_per_bucket, batch_size, stream);
-
-    // Instead of recomputing for each group, copy computed result
-    for (size_t grouped_id = 1; grouped_id < ebc_param_.grouped_lookup_params.size();
-         ++grouped_id) {
-      HCTR_LIB_THROW(hipMemcpyAsync(
-          output[grouped_id].num_keys_per_bucket.data(), output[0].num_keys_per_bucket.data(),
-          output[0].num_keys_per_bucket.num_bytes(), hipMemcpyDeviceToDevice, stream));
+  // Phase 20.5 (2026-05-17): per-sub-op GpuPhase tracing for sparse_prep
+  // path. NV nsys shows ~43 kernels here; we wrap the 4 top-level ops to
+  // give 3-7 events per iter (depending on num grouped lookups). Adds
+  // ~10us overhead per iter when HCTR_NATIVE_TRACE=1.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::native_trace_enabled;
+  static thread_local GpuPhase* p_bucket_range = nullptr;
+  static thread_local GpuPhase* p_memcpy_loop = nullptr;
+  static thread_local GpuPhase* p_copy_input = nullptr;
+  static thread_local std::vector<GpuPhase*> p_grouped;
+  if (native_trace_enabled()) {
+    if (p_bucket_range == nullptr) {
+      int lid = gpu_id;  // local GPU index passed in from caller
+      p_bucket_range = PerfettoEmitter::instance().register_phase(lid, "sp/bucket_range");
+      p_memcpy_loop = PerfettoEmitter::instance().register_phase(lid, "sp/d2d_memcpy_loop");
+      p_copy_input = PerfettoEmitter::instance().register_phase(lid, "sp/copy_input");
+      for (size_t g = 0; g < ebc_param_.grouped_lookup_params.size(); ++g) {
+        char nm[40];
+        std::snprintf(nm, sizeof(nm), "sp/distribute_grp%zu", g);
+        p_grouped.push_back(PerfettoEmitter::instance().register_phase(lid, nm));
+      }
     }
   }
 
-  data_distribution_input_[gpu_id].copy_tensor_vec(dp_keys, fixed_dp_bucket_range_[gpu_id], stream);
+  const bool bucket_ranges_outdated = batch_size != gpu_comm_data_[gpu_id].last_batch_size;
+  gpu_comm_data_[gpu_id].last_batch_size = batch_size;
+
+  if (bucket_ranges_outdated) {
+    {
+      ScopedGpuPhase _p(p_bucket_range, stream, "prefetch");
+      compute_dp_bucket_range_operators_[gpu_id](
+          fixed_dp_bucket_range_[gpu_id], output[0].num_keys_per_bucket, batch_size, stream);
+    }
+    {
+      ScopedGpuPhase _p(p_memcpy_loop, stream, "prefetch");
+      for (size_t grouped_id = 1; grouped_id < ebc_param_.grouped_lookup_params.size();
+           ++grouped_id) {
+        HCTR_LIB_THROW(hipMemcpyAsync(
+            output[grouped_id].num_keys_per_bucket.data(), output[0].num_keys_per_bucket.data(),
+            output[0].num_keys_per_bucket.num_bytes(), hipMemcpyDeviceToDevice, stream));
+      }
+    }
+  }
+
+  {
+    ScopedGpuPhase _p(p_copy_input, stream, "prefetch");
+    data_distribution_input_[gpu_id].copy_tensor_vec(dp_keys, fixed_dp_bucket_range_[gpu_id],
+                                                     stream);
+  }
 
   for (size_t grouped_id = 0; grouped_id < ebc_param_.grouped_lookup_params.size(); grouped_id++) {
+    GpuPhase* p = (grouped_id < p_grouped.size()) ? p_grouped[grouped_id] : nullptr;
+    ScopedGpuPhase _p(p, stream, "prefetch");
     data_distribution_ops_[grouped_id][gpu_id]->distribute(data_distribution_input_[gpu_id],
                                                            output[grouped_id], batch_size, stream);
   }

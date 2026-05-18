@@ -17,7 +17,10 @@
 
 #include <hctr_tracing.hpp>
 #include <layers/mlp_layer.hpp>
+#include <perfetto_emitter.hpp>
 #include <type_traits>
+#include <unordered_map>
+#include <vector>
 // ROCm port Phase 14i.5 (2026-05-13): CK-Tile fused MLP wrapper.
 // Public API in cktile_mlp_kernel.hpp (extern "C", no CK-Tile templates exposed).
 // Implementation in HugeCTR/src/layers/cktile_mlp_kernel.cu compiled SEPARATELY
@@ -127,7 +130,38 @@ void MLPLayer<T>::fprop(bool is_train) {
   HugeCTR::tracing::ScopedRange _scope("MLPLayer::fprop");
   CudaDeviceContext context(this->get_device_id());
   int num_layers = num_outputs_.size();
+  // Phase 20.6 (2026-05-17): per-MLP-sub-layer GpuPhase tracing. One
+  // event per sub-layer (NV-equivalent granularity: mlp_fwd L1, L3, etc.).
+  // Lazily registered, capture-safe (hipStreamIsCapturing check in
+  // ScopedGpuPhase skips during graph capture).
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::unordered_map<const MLPLayer<T>*, std::vector<GpuPhase*>> fwd_subs;
+  const bool nt_on = HugeCTR::tracing::native_trace_enabled();
+  std::vector<GpuPhase*>* subs = nullptr;
+  if (nt_on) {
+    auto it = fwd_subs.find(this);
+    if (it == fwd_subs.end()) {
+      auto& v = fwd_subs[this];
+      v.reserve(num_layers);
+      for (int j = 0; j < num_layers; ++j) {
+        char nm[48];
+        std::snprintf(nm, sizeof(nm), "mlp/sub%d_fprop", j);
+        v.push_back(PerfettoEmitter::instance().register_phase(this->get_gpu().get_local_id(), nm));
+      }
+      subs = &v;
+      // NOTE: MLPLayer is only used when HCTR_USE_FUSED_MLP=1. The default
+      // DLRM-DCNv2 config uses Layer_t.InnerProduct + Layer_t.ReLU, in
+      // which case this branch never fires. Per-FC-layer coverage is
+      // already provided by core23_network.cpp's L/* phases.
+    } else {
+      subs = &it->second;
+    }
+  }
   for (int i = 0; i < num_layers; i++) {
+    GpuPhase* sub_phase = (subs && i < (int)subs->size()) ? (*subs)[i] : nullptr;
+    ScopedGpuPhase _sub(sub_phase, this->get_gpu().get_stream(), "default");
     const T* kernel = kernels_[i].template data<T>();
     const T* bottom =
         i == 0 ? this->input_tensors_[0].template data<T>() : train_tensors_[i - 1].template data<T>();
@@ -225,7 +259,31 @@ void MLPLayer<T>::bprop() {
   CudaDeviceContext context(this->get_device_id());
 
   int num_layers = num_outputs_.size();
+  // Phase 20.6: per-sub-layer bprop GpuPhase.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::unordered_map<const MLPLayer<T>*, std::vector<GpuPhase*>> bwd_subs;
+  const bool nt_on = HugeCTR::tracing::native_trace_enabled();
+  std::vector<GpuPhase*>* subs = nullptr;
+  if (nt_on) {
+    auto it = bwd_subs.find(this);
+    if (it == bwd_subs.end()) {
+      auto& v = bwd_subs[this];
+      v.reserve(num_layers);
+      for (int j = 0; j < num_layers; ++j) {
+        char nm[48];
+        std::snprintf(nm, sizeof(nm), "mlp/sub%d_bprop", j);
+        v.push_back(PerfettoEmitter::instance().register_phase(this->get_gpu().get_local_id(), nm));
+      }
+      subs = &v;
+    } else {
+      subs = &it->second;
+    }
+  }
   for (int i = num_layers - 1; i >= 0; i--) {
+    GpuPhase* sub_phase = (subs && i < (int)subs->size()) ? (*subs)[i] : nullptr;
+    ScopedGpuPhase _sub(sub_phase, this->get_gpu().get_stream(), "default");
     const auto& bottom_tensor_dim =
         i == 0 ? this->input_tensors_[0].shape() : train_tensors_[i - 1].shape();
     int64_t batch_size = bottom_tensor_dim.size(0);

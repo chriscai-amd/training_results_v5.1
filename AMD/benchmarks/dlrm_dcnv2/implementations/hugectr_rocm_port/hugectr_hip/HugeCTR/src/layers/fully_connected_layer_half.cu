@@ -15,7 +15,11 @@
  * limitations under the License.
  */
 
+#include <array>
 #include <layers/fully_connected_layer_half.hpp>
+#include <perfetto_emitter.hpp>
+#include <unordered_map>
+#include <utility>
 #include <utils.cuh>
 #include <utils.hpp>
 
@@ -92,19 +96,70 @@ void FullyConnectedLayer<__half>::fprop(bool is_train) {
     in_batch_size = in_batch_size * bottom_tensor_dim.size(idx);
   }
 
+  // Phase 20.6 + 20.7 (2026-05-17): per-GEMM GpuPhase tracing with
+  // PyTorch-profiler-style M/N/K metadata. NV captures mlp_fwd as
+  // separate kernels (bias GEMM + kernel GEMM). One pair of GpuPhases
+  // per FC layer instance, lazily registered. Each FC layer emits 2
+  // fprop events per iter with GEMM shape inlined into args.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::unordered_map<const FullyConnectedLayer<__half>*,
+                                          std::pair<GpuPhase*, GpuPhase*>> fwd_gemm_phases;
+  GpuPhase* p_bias_gemm = nullptr;
+  GpuPhase* p_kernel_gemm = nullptr;
+  // Phase 20.7: per-GEMM events require DETAIL >= 2 (highest fidelity).
+  if (HugeCTR::tracing::native_trace_enabled() &&
+      HugeCTR::tracing::native_trace_detail() >= 2) {
+    auto it = fwd_gemm_phases.find(this);
+    if (it == fwd_gemm_phases.end()) {
+      int lid = this->get_gpu().get_local_id();
+      // bias GEMM: top = identity[1xM] * bias[1xN] (broadcast)
+      // Hipblas: M=output_size, N=in_batch_size, K=1
+      char bias_args[160], kernel_args[160];
+      std::snprintf(bias_args, sizeof(bias_args),
+                    "\"kernel\":\"hipblasGemmEx(bias)\","
+                    "\"M\":%ld,\"N\":%ld,\"K\":1,"
+                    "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"NN\"",
+                    output_size, in_batch_size);
+      // kernel GEMM: top = kernel[MxK] * bottom[KxN]
+      // Hipblas: M=output_size, N=in_batch_size, K=input_size
+      std::snprintf(kernel_args, sizeof(kernel_args),
+                    "\"kernel\":\"hipblasGemmEx(weight)\","
+                    "\"M\":%ld,\"N\":%ld,\"K\":%ld,"
+                    "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"NN\"",
+                    output_size, in_batch_size, input_size);
+      auto bp = PerfettoEmitter::instance().register_phase(lid, "fc/bias_gemm",
+                                                            std::string(bias_args));
+      auto kp = PerfettoEmitter::instance().register_phase(lid, "fc/kernel_gemm",
+                                                            std::string(kernel_args));
+      fwd_gemm_phases[this] = {bp, kp};
+      p_bias_gemm = bp; p_kernel_gemm = kp;
+    } else {
+      p_bias_gemm = it->second.first;
+      p_kernel_gemm = it->second.second;
+    }
+  }
+
   const float alpha = 1.0f;
   const float beta_b = 0.0f;
   const float beta_k = 1.0f;
 
-  HCTR_LIB_THROW(hipblasGemmEx(get_gpu().get_cublas_handle(), HIPBLAS_OP_N, HIPBLAS_OP_N, output_size,
-                              in_batch_size, 1, &alpha, bias, HIP_R_16F, output_size, identity,
-                              HIP_R_16F, 1, &beta_b, top, HIP_R_16F, output_size, HIPBLAS_COMPUTE_32F,
-                              falgo_b_));
-
-  HCTR_LIB_THROW(hipblasGemmEx(get_gpu().get_cublas_handle(), HIPBLAS_OP_N, HIPBLAS_OP_N, output_size,
-                              in_batch_size, input_size, &alpha, kernel, HIP_R_16F, output_size,
-                              bottom, HIP_R_16F, input_size, &beta_k, top, HIP_R_16F, output_size,
-                              HIPBLAS_COMPUTE_32F, falgo_k_));
+  hipStream_t fc_stream = get_gpu().get_stream();
+  {
+    ScopedGpuPhase _p(p_bias_gemm, fc_stream, "default");
+    HCTR_LIB_THROW(hipblasGemmEx(get_gpu().get_cublas_handle(), HIPBLAS_OP_N, HIPBLAS_OP_N, output_size,
+                                in_batch_size, 1, &alpha, bias, HIP_R_16F, output_size, identity,
+                                HIP_R_16F, 1, &beta_b, top, HIP_R_16F, output_size, HIPBLAS_COMPUTE_32F,
+                                falgo_b_));
+  }
+  {
+    ScopedGpuPhase _p(p_kernel_gemm, fc_stream, "default");
+    HCTR_LIB_THROW(hipblasGemmEx(get_gpu().get_cublas_handle(), HIPBLAS_OP_N, HIPBLAS_OP_N, output_size,
+                                in_batch_size, input_size, &alpha, kernel, HIP_R_16F, output_size,
+                                bottom, HIP_R_16F, input_size, &beta_k, top, HIP_R_16F, output_size,
+                                HIPBLAS_COMPUTE_32F, falgo_k_));
+  }
 }
 
 void FullyConnectedLayer<__half>::bprop() {
@@ -180,19 +235,78 @@ void FullyConnectedLayer<__half>::bprop() {
     // is deeper than per-call stream binding.
   }
 
+  // Phase 20.6 + 20.7 (2026-05-17): per-GEMM bprop GpuPhase tracing
+  // with PyTorch-profiler-style M/N/K metadata.
+  using HugeCTR::tracing::GpuPhase;
+  using HugeCTR::tracing::PerfettoEmitter;
+  using HugeCTR::tracing::ScopedGpuPhase;
+  static thread_local std::unordered_map<const FullyConnectedLayer<__half>*,
+                                          std::array<GpuPhase*, 3>> bwd_gemm_phases;
+  GpuPhase* p_bias_grad = nullptr;
+  GpuPhase* p_kernel_grad = nullptr;
+  GpuPhase* p_dgrad = nullptr;
+  // Phase 20.7: per-GEMM bprop events require DETAIL >= 2.
+  if (HugeCTR::tracing::native_trace_enabled() &&
+      HugeCTR::tracing::native_trace_detail() >= 2) {
+    auto it = bwd_gemm_phases.find(this);
+    if (it == bwd_gemm_phases.end()) {
+      int lid = this->get_gpu().get_local_id();
+      char bg_args[180], kg_args[180], dg_args[180];
+      // bias_grad: GEMM N,N (output_size, 1, in_batch_size) -> bias_grad[N]
+      std::snprintf(bg_args, sizeof(bg_args),
+                    "\"kernel\":\"hipblasGemmEx(bias_grad)\","
+                    "\"M\":%ld,\"N\":1,\"K\":%ld,"
+                    "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"NN\"",
+                    output_size, in_batch_size);
+      // kernel_grad (wgrad): N,T (output_size, input_size, in_batch_size)
+      //   = out[OxB] * bottom[BxI]^T -> wgrad[OxI]
+      std::snprintf(kg_args, sizeof(kg_args),
+                    "\"kernel\":\"hipblasGemmEx(wgrad)\","
+                    "\"M\":%ld,\"N\":%ld,\"K\":%ld,"
+                    "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"NT\"",
+                    output_size, input_size, in_batch_size);
+      // dgrad: T,N (input_size, in_batch_size, output_size)
+      //   = weight[IxO]^T * out[OxB] -> dgrad[IxB]
+      std::snprintf(dg_args, sizeof(dg_args),
+                    "\"kernel\":\"hipblasGemmEx(dgrad)\","
+                    "\"M\":%ld,\"N\":%ld,\"K\":%ld,"
+                    "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"TN\"",
+                    input_size, in_batch_size, output_size);
+      auto bg = PerfettoEmitter::instance().register_phase(lid, "fc/bias_grad",
+                                                            std::string(bg_args));
+      auto kg = PerfettoEmitter::instance().register_phase(lid, "fc/kernel_grad",
+                                                            std::string(kg_args));
+      auto dg = PerfettoEmitter::instance().register_phase(lid, "fc/dgrad",
+                                                            std::string(dg_args));
+      bwd_gemm_phases[this] = {bg, kg, dg};
+      p_bias_grad = bg; p_kernel_grad = kg; p_dgrad = dg;
+    } else {
+      p_bias_grad = it->second[0];
+      p_kernel_grad = it->second[1];
+      p_dgrad = it->second[2];
+    }
+  }
+
   // bias_grad GEMM (on wgrad_handle / computation_stream_2_)
-  HCTR_LIB_THROW(hipblasGemmEx(wgrad_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, output_size,
-                              1, in_batch_size, &alpha, top, HIP_R_16F, output_size, identity,
-                              HIP_R_16F, in_batch_size, &beta_b, bias_grad, HIP_R_16F,
-                              output_size, HIPBLAS_COMPUTE_32F, balgo_b_));
+  {
+    ScopedGpuPhase _p(p_bias_grad, wgrad_stream, "default");
+    HCTR_LIB_THROW(hipblasGemmEx(wgrad_handle, HIPBLAS_OP_N, HIPBLAS_OP_N, output_size,
+                                1, in_batch_size, &alpha, top, HIP_R_16F, output_size, identity,
+                                HIP_R_16F, in_batch_size, &beta_b, bias_grad, HIP_R_16F,
+                                output_size, HIPBLAS_COMPUTE_32F, balgo_b_));
+  }
 
   // kernel_grad GEMM (wgrad, on wgrad_handle / computation_stream_2_)
-  HCTR_LIB_THROW(hipblasGemmEx(wgrad_handle, HIPBLAS_OP_N, HIPBLAS_OP_T, output_size,
-                              input_size, in_batch_size, &alpha, top, HIP_R_16F, output_size,
-                              bottom, HIP_R_16F, input_size, &beta_k, kernel_grad, HIP_R_16F,
-                              output_size, HIPBLAS_COMPUTE_32F, balgo_k_));
+  {
+    ScopedGpuPhase _p(p_kernel_grad, wgrad_stream, "default");
+    HCTR_LIB_THROW(hipblasGemmEx(wgrad_handle, HIPBLAS_OP_N, HIPBLAS_OP_T, output_size,
+                                input_size, in_batch_size, &alpha, top, HIP_R_16F, output_size,
+                                bottom, HIP_R_16F, input_size, &beta_k, kernel_grad, HIP_R_16F,
+                                output_size, HIPBLAS_COMPUTE_32F, balgo_k_));
+  }
 
   // dgrad GEMM (stays on default stream — bottom is consumed by prev layer's bprop)
+  ScopedGpuPhase _p_dgrad(p_dgrad, default_stream, "default");
   HCTR_LIB_THROW(hipblasGemmEx(get_gpu().get_cublas_handle(), HIPBLAS_OP_T, HIPBLAS_OP_N, input_size,
                               in_batch_size, output_size, &alpha, kernel, HIP_R_16F, output_size,
                               top, HIP_R_16F, output_size, &beta_x, bottom, HIP_R_16F, input_size,
