@@ -65,10 +65,12 @@ GpuPhase::GpuPhase(int rank, std::string name)
       start_event_(nullptr),
       end_event_(nullptr),
       recorded_this_iter_(false) {
-  // Timing-enabled events (default flags). The cost is small and we need
-  // hipEventElapsedTime() at harvest time.
-  hipError_t e1 = hipEventCreate(&start_event_);
-  hipError_t e2 = hipEventCreate(&end_event_);
+  // Phase 20.9 (2026-05-18): TESTED hipEventDisableSystemFence (0x4)
+  // for lower per-record host cost -- causes "invalid resource handle"
+  // crash in unrelated kernels on ROCm 7.2.1. Reverted to hipEventDefault.
+  // The flag MAY work on newer ROCm; auto-tests when next version lands.
+  hipError_t e1 = hipEventCreateWithFlags(&start_event_, hipEventDefault);
+  hipError_t e2 = hipEventCreateWithFlags(&end_event_, hipEventDefault);
   if (e1 != hipSuccess || e2 != hipSuccess) {
     std::fprintf(stderr,
                  "[HCTR perfetto] failed to create events for phase '%s' (rank %d): "
@@ -133,9 +135,20 @@ bool GpuPhase::try_harvest(int iter_idx, hipEvent_t iter_base_event,
   ev.rank = rank_;
   ev.stream_name = stream_name_;
   ev.name = name_;
-  // Build category from leading segment of name ("fwd", "bwd", "comm", ...)
-  auto slash = name_.find('/');
-  ev.cat = (slash != std::string::npos) ? name_.substr(0, slash) : "phase";
+  // Phase 20.9: extract category from NV-style "[category] kernel_name"
+  // prefix if present, else fall back to legacy "category/kernel_name"
+  // (first segment), else default to "phase".
+  if (!name_.empty() && name_[0] == '[') {
+    auto close = name_.find(']');
+    if (close != std::string::npos) {
+      ev.cat = name_.substr(1, close - 1);
+    } else {
+      ev.cat = "phase";
+    }
+  } else {
+    auto slash = name_.find('/');
+    ev.cat = (slash != std::string::npos) ? name_.substr(0, slash) : "phase";
+  }
   ev.iter_idx = iter_idx;
   // Phase 20.7: copy static phase metadata into this event (zero-cost
   // beyond the string copy; metadata is set once at register_phase).
@@ -212,6 +225,28 @@ void PerfettoEmitter::register_graph_event_chain(
   chain.events = events;
   chain.names = names;
   rank_state_[rank].graph_chains.push_back(std::move(chain));
+}
+
+void PerfettoEmitter::register_graph_clock_chain(
+    int rank, const std::string& stream_name,
+    unsigned long long* buf_device, unsigned long long* buf_host,
+    size_t num_slots, const std::vector<std::string>& names) {
+  if (!native_trace_enabled()) return;
+  if (rank >= static_cast<int>(rank_state_.size())) return;
+  std::lock_guard<std::mutex> lk(mu_);
+  GraphClockChain chain;
+  chain.rank = rank;
+  chain.stream_name = stream_name;
+  chain.buf_device = buf_device;
+  chain.buf_host = buf_host;
+  chain.num_slots = num_slots;
+  chain.names = names;
+  // Read the wall-clock rate once. hipDeviceAttributeWallClockRate returns
+  // KHz (ticks per millisecond). On gfx9x0 this is typically 100000 (100 MHz).
+  int rate_khz = 100000;
+  hipDeviceGetAttribute(&rate_khz, hipDeviceAttributeWallClockRate, rank);
+  chain.clock_rate_khz = static_cast<double>(rate_khz);
+  rank_state_[rank].graph_clock_chains.push_back(std::move(chain));
 }
 
 // Iter range for tracing. Defaults: skip first 2 iters (warmup), then trace
@@ -334,6 +369,49 @@ void PerfettoEmitter::end_iter(int rank) {
       ev.iter_idx = rs.iter_idx;
       cumulative_off_ms += dur_ms;
       prev = chain.events[i];
+      emit_event(std::move(ev));
+    }
+  }
+  // Phase 20.9: clock-writer chain harvest (in-graph kernel-based timing).
+  // After replay completes, hipMemcpy the device clock buffer to host and
+  // compute per-kernel durations from tick deltas.
+  for (const auto& cchain : rs.graph_clock_chains) {
+    if (cchain.num_slots < 2 || cchain.buf_device == nullptr) continue;
+    size_t bytes = cchain.num_slots * sizeof(unsigned long long);
+    hipError_t e = hipMemcpy(cchain.buf_host, cchain.buf_device, bytes,
+                              hipMemcpyDeviceToHost);
+    if (e != hipSuccess) continue;
+    // First slot is graph start; subsequent N slots are after each kernel.
+    unsigned long long t0 = cchain.buf_host[0];
+    // Convert tick delta to microseconds: us = ticks / (clock_rate_khz)
+    // because clock_rate_khz = ticks per millisecond -> us per tick = 1/khz.
+    double us_per_tick = 1000.0 / cchain.clock_rate_khz;
+    double cumulative_off_us = 0.0;
+    unsigned long long prev_tick = t0;
+    for (size_t i = 1; i < cchain.num_slots; ++i) {
+      unsigned long long t = cchain.buf_host[i];
+      // Guard against unwritten or wrap-around values.
+      if (t < prev_tick) { prev_tick = t; continue; }
+      double dur_us = static_cast<double>(t - prev_tick) * us_per_tick;
+      PerfettoEvent ev;
+      ev.ts_us = (rs.iter_start_ns / 1000) +
+                  static_cast<int64_t>(cumulative_off_us);
+      ev.dur_us = dur_us;
+      ev.rank = cchain.rank;
+      ev.stream_name = cchain.stream_name;
+      ev.name = (i - 1 < cchain.names.size()) ? cchain.names[i - 1]
+                                              : std::string("[graph] kernel_?");
+      // Category from "[bracket]" prefix
+      if (!ev.name.empty() && ev.name[0] == '[') {
+        auto close = ev.name.find(']');
+        if (close != std::string::npos) ev.cat = ev.name.substr(1, close - 1);
+        else ev.cat = "graph";
+      } else {
+        ev.cat = "graph";
+      }
+      ev.iter_idx = rs.iter_idx;
+      cumulative_off_us += dur_us;
+      prev_tick = t;
       emit_event(std::move(ev));
     }
   }

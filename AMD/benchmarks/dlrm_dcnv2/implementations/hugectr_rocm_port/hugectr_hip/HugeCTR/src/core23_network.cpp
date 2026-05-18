@@ -413,8 +413,10 @@ void Network::prop_layers(const std::vector<Layer*>& layers, bool fprop, bool tr
       if (native_on && !in_capture) {
         auto it = fwd_phases.find(layers[i]);
         if (it == fwd_phases.end()) {
+          // Phase 20.9: NV-style "[mlp_fwd] layer_<idx>_fprop" naming.
           char phase_name[80];
-          std::snprintf(phase_name, sizeof(phase_name), "L/L%zu_fprop", i);
+          std::snprintf(phase_name, sizeof(phase_name),
+                        "[mlp_fwd] layer_%zu_fprop", i);
           p = HugeCTR::tracing::PerfettoEmitter::instance().register_phase(
               gpu_resource_->get_local_id(), phase_name);
           fwd_phases[layers[i]] = p;
@@ -434,8 +436,10 @@ void Network::prop_layers(const std::vector<Layer*>& layers, bool fprop, bool tr
       if (native_on && !in_capture) {
         auto it = bwd_phases.find(layers[i]);
         if (it == bwd_phases.end()) {
+          // Phase 20.9: NV-style "[mlp_bwd] layer_<idx>_bprop" naming.
           char phase_name[80];
-          std::snprintf(phase_name, sizeof(phase_name), "L/L%zu_bprop", i);
+          std::snprintf(phase_name, sizeof(phase_name),
+                        "[mlp_bwd] layer_%zu_bprop", i);
           p = HugeCTR::tracing::PerfettoEmitter::instance().register_phase(
               gpu_resource_->get_local_id(), phase_name);
           bwd_phases[layers[i]] = p;

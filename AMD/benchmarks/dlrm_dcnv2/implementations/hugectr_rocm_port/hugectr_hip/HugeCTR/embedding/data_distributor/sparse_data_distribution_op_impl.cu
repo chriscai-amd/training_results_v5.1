@@ -74,9 +74,12 @@ void SparseDPDataDistributionOp::distribute(const DataDistributionInput& input,
       dp_subs[0] == nullptr) {
     int dev = 0;
     hipGetDevice(&dev);
-    dp_subs[0] = PerfettoEmitter::instance().register_phase(dev, "sp/dp/concat_keys_buckets");
-    dp_subs[1] = PerfettoEmitter::instance().register_phase(dev, "sp/dp/num_keys_d2h_sync");
-    dp_subs[2] = PerfettoEmitter::instance().register_phase(dev, "sp/dp/convert_indices");
+    dp_subs[0] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] DP_concat_keys_buckets");
+    dp_subs[1] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] DP_num_keys_d2h_sync");
+    dp_subs[2] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] DP_convert_indices");
   }
   {
     ScopedGpuPhase _p(dp_subs[0], stream, "prefetch");
@@ -254,11 +257,17 @@ void SparseMPDataDistributionOp::distribute(const DataDistributionInput& input,
       mp_subs[0] == nullptr) {
     int dev = 0;
     hipGetDevice(&dev);
-    mp_subs[0] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/filter_before_a2a");
-    mp_subs[1] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/a2a_keys_per_bucket");
-    mp_subs[2] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/a2a_keys");
-    mp_subs[3] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/filter_after_a2a");
-    mp_subs[4] = PerfettoEmitter::instance().register_phase(dev, "sp/mp/convert_indices");
+    // Phase 20.9: NV-style names. [sparse_prep] cat matches NV nsys.
+    mp_subs[0] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] MP_filter_before_a2a");
+    mp_subs[1] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] MP_a2a_keys_per_bucket");
+    mp_subs[2] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] MP_a2a_keys");
+    mp_subs[3] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] MP_filter_after_a2a");
+    mp_subs[4] = PerfettoEmitter::instance().register_phase(dev,
+        "[sparse_prep] MP_convert_indices");
   }
   {
     ScopedGpuPhase _p(mp_subs[0], stream, "prefetch");

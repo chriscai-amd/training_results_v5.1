@@ -129,10 +129,12 @@ void FullyConnectedLayer<__half>::fprop(bool is_train) {
                     "\"M\":%ld,\"N\":%ld,\"K\":%ld,"
                     "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"NN\"",
                     output_size, in_batch_size, input_size);
-      auto bp = PerfettoEmitter::instance().register_phase(lid, "fc/bias_gemm",
-                                                            std::string(bias_args));
-      auto kp = PerfettoEmitter::instance().register_phase(lid, "fc/kernel_gemm",
-                                                            std::string(kernel_args));
+      // Phase 20.9: NV-style names "[category] kernel_name". Match NV nsys
+      // categories: mlp_fwd for fwd GEMMs.
+      auto bp = PerfettoEmitter::instance().register_phase(lid,
+          "[mlp_fwd] hipblasGemmEx_bias", std::string(bias_args));
+      auto kp = PerfettoEmitter::instance().register_phase(lid,
+          "[mlp_fwd] hipblasGemmEx_weight", std::string(kernel_args));
       fwd_gemm_phases[this] = {bp, kp};
       p_bias_gemm = bp; p_kernel_gemm = kp;
     } else {
@@ -272,12 +274,14 @@ void FullyConnectedLayer<__half>::bprop() {
                     "\"M\":%ld,\"N\":%ld,\"K\":%ld,"
                     "\"dtype\":\"fp16\",\"compute\":\"fp32\",\"op\":\"TN\"",
                     input_size, in_batch_size, output_size);
-      auto bg = PerfettoEmitter::instance().register_phase(lid, "fc/bias_grad",
-                                                            std::string(bg_args));
-      auto kg = PerfettoEmitter::instance().register_phase(lid, "fc/kernel_grad",
-                                                            std::string(kg_args));
-      auto dg = PerfettoEmitter::instance().register_phase(lid, "fc/dgrad",
-                                                            std::string(dg_args));
+      // Phase 20.9: NV-style names. bias_grad + kernel_grad are wgrad,
+      // dgrad is dgrad -- matches NV's mlp_bwd_wgrad / mlp_bwd_dgrad cats.
+      auto bg = PerfettoEmitter::instance().register_phase(lid,
+          "[mlp_bwd_wgrad] hipblasGemmEx_bias_grad", std::string(bg_args));
+      auto kg = PerfettoEmitter::instance().register_phase(lid,
+          "[mlp_bwd_wgrad] hipblasGemmEx_wgrad", std::string(kg_args));
+      auto dg = PerfettoEmitter::instance().register_phase(lid,
+          "[mlp_bwd_dgrad] hipblasGemmEx_dgrad", std::string(dg_args));
       bwd_gemm_phases[this] = {bg, kg, dg};
       p_bias_grad = bg; p_kernel_grad = kg; p_dgrad = dg;
     } else {

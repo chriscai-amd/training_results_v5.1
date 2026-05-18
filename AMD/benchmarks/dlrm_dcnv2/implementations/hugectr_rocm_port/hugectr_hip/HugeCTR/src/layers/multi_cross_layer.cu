@@ -789,8 +789,10 @@ void MultiCrossForwardFunctorv2<T>::operator()(
       int dev = 0;
       hipGetDevice(&dev);  // approximation: rank == device_id (true for DLRM 8-GPU)
       for (int j = 0; j < num_layers; ++j) {
-        char nm[48], args[200];
-        std::snprintf(nm, sizeof(nm), "cross/L%d_fprop", j);
+        char nm[80], args[200];
+        // Phase 20.9: NV-style names. NV uses "[interaction]" cat for
+        // cross/concat/interaction network kernels.
+        std::snprintf(nm, sizeof(nm), "[interaction] DCNv2_cross_L%d_fprop", j);
         // Cross-layer fprop: 2 GEMMs (X*U, X*U*V+b) + 1 fused FMA kernel.
         std::snprintf(args, sizeof(args),
                       "\"kernel\":\"DCNv2_cross_fprop(X*U->X*U*V+b->FMA)\","
@@ -963,8 +965,9 @@ void MultiCrossBackwardFunctorv2<T>::operator()(
       int dev = 0;
       hipGetDevice(&dev);
       for (int j = 0; j < num_layers; ++j) {
-        char nm[48], args[220];
-        std::snprintf(nm, sizeof(nm), "cross/L%d_bprop", j);
+        char nm[80], args[220];
+        // Phase 20.9: NV-style names. Use [interaction] cat (same as fwd).
+        std::snprintf(nm, sizeof(nm), "[interaction] DCNv2_cross_L%d_bprop", j);
         // Cross-layer bprop: 1 fused FMA + 4 GEMMs (dH, dV, dU, dY_prev).
         std::snprintf(args, sizeof(args),
                       "\"kernel\":\"DCNv2_cross_bprop(FMA->4xGEMM)\","

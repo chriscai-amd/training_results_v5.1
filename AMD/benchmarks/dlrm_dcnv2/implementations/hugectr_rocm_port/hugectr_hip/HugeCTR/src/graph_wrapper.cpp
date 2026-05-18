@@ -18,6 +18,7 @@
 #include <common.hpp>
 #include <cstdio>
 #include <cstdlib>
+#include <graph_clock_writer.hpp>
 #include <graph_wrapper.hpp>
 #include <map>
 #include <mutex>
@@ -125,6 +126,114 @@ inline bool graph_nodes_trace_enabled() {
   return on;
 }
 
+inline bool graph_clock_trace_enabled() {
+  static const bool on = []() {
+    const char* e = std::getenv("HCTR_NATIVE_TRACE_GRAPH_CLOCK");
+    return e != nullptr && e[0] == '1';
+  }();
+  return on;
+}
+
+// Phase 20.9: insert clock-writer KERNEL nodes after every kernel node
+// in the captured graph (plus one root marker for iter-start). Returns
+// the count of slots inserted (N+1). 0 on failure.
+//
+// Kernel nodes work reliably in HIP graphs (unlike event-record nodes
+// which return 0us elapsedTime on ROCm 7.2.1). The writer kernel does
+// a single 64-bit global store of wall_clock64(), executes in ~1us.
+static size_t insert_per_kernel_clock_nodes(
+    hipGraph_t graph,
+    unsigned long long*& clock_buf_device,
+    unsigned long long*& clock_buf_host,
+    size_t& clock_buf_slots,
+    std::vector<std::string>& names_out) {
+  size_t num_nodes = 0;
+  if (hipGraphGetNodes(graph, nullptr, &num_nodes) != hipSuccess) return 0;
+  std::vector<hipGraphNode_t> nodes(num_nodes);
+  if (hipGraphGetNodes(graph, nodes.data(), &num_nodes) != hipSuccess) return 0;
+
+  std::vector<hipGraphNode_t> kernel_nodes;
+  for (auto& n : nodes) {
+    hipGraphNodeType t;
+    if (hipGraphNodeGetType(n, &t) == hipSuccess && t == hipGraphNodeTypeKernel) {
+      kernel_nodes.push_back(n);
+    }
+  }
+  if (kernel_nodes.empty()) return 0;
+
+  // Allocate device + pinned host buffer for N+1 u64 slots.
+  size_t slots = kernel_nodes.size() + 1;  // +1 for graph-start marker
+  size_t bytes = slots * sizeof(unsigned long long);
+  hipError_t e = hipMalloc(&clock_buf_device, bytes);
+  if (e != hipSuccess) {
+    std::fprintf(stderr, "[HCTR perfetto/clock] hipMalloc failed: %s\n",
+                 hipGetErrorString(e));
+    return 0;
+  }
+  hipMemset(clock_buf_device, 0, bytes);
+  e = hipHostMalloc(reinterpret_cast<void**>(&clock_buf_host), bytes,
+                    hipHostMallocDefault);
+  if (e != hipSuccess) {
+    std::fprintf(stderr, "[HCTR perfetto/clock] hipHostMalloc failed: %s\n",
+                 hipGetErrorString(e));
+    hipFree(clock_buf_device);
+    clock_buf_device = nullptr;
+    return 0;
+  }
+  clock_buf_slots = slots;
+
+  // Add 1 clock-writer node at the start (no deps, becomes a root).
+  // Then N writer nodes, each depending on the corresponding kernel.
+  auto add_writer = [&](int slot, hipGraphNode_t* dep, size_t ndep,
+                        hipGraphNode_t* out_node) -> hipError_t {
+    // hipKernelNodeParams: func, gridDim, blockDim, sharedMem, kernelParams
+    hipKernelNodeParams p = {};
+    p.func = (void*)tracing::graph_clock_writer_kernel;
+    p.gridDim = dim3(1, 1, 1);
+    p.blockDim = dim3(1, 1, 1);
+    p.sharedMemBytes = 0;
+    static thread_local unsigned long long* arg0;
+    static thread_local int arg1;
+    arg0 = clock_buf_device;
+    arg1 = slot;
+    void* kp[2] = {(void*)&arg0, (void*)&arg1};
+    p.kernelParams = kp;
+    p.extra = nullptr;
+    return hipGraphAddKernelNode(out_node, graph, dep, ndep, &p);
+  };
+
+  hipGraphNode_t start_node;
+  e = add_writer(0, nullptr, 0, &start_node);
+  if (e != hipSuccess) {
+    std::fprintf(stderr,
+                 "[HCTR perfetto/clock] add start writer failed: %s -- "
+                 "ROCm 7.2.1 may not support hipGraphAddKernelNode "
+                 "post-capture insertion either; falling back.\n",
+                 hipGetErrorString(e));
+    hipFree(clock_buf_device);
+    hipHostFree(clock_buf_host);
+    clock_buf_device = nullptr;
+    clock_buf_host = nullptr;
+    clock_buf_slots = 0;
+    return 0;
+  }
+  names_out.reserve(kernel_nodes.size());
+  for (size_t i = 0; i < kernel_nodes.size(); ++i) {
+    hipGraphNode_t writer_node;
+    e = add_writer(static_cast<int>(i + 1), &kernel_nodes[i], 1, &writer_node);
+    if (e != hipSuccess) {
+      std::fprintf(stderr,
+                   "[HCTR perfetto/clock] add writer %zu failed: %s\n",
+                   i, hipGetErrorString(e));
+      break;
+    }
+    char nm[40];
+    std::snprintf(nm, sizeof(nm), "[graph] kernel_%zu", i);
+    names_out.emplace_back(nm);
+  }
+  return names_out.size() + 1;  // +1 for the start marker
+}
+
 }  // namespace
 
 void GraphWrapper::capture(std::function<void(hipStream_t)> workload, hipStream_t stream) {
@@ -153,11 +262,31 @@ void GraphWrapper::capture(std::function<void(hipStream_t)> workload, hipStream_
                    "event-record nodes into captured graph (no per-replay "
                    "host overhead)\n",
                    dev, inserted);
-      // Register the chain with the emitter for harvest. Stream name is
-      // "default" -- captured graphs typically replay on the compute stream.
       tracing::PerfettoEmitter::instance().register_graph_event_chain(
           dev, "default", graph_start_event_, per_kernel_events_,
           per_kernel_names_);
+    }
+  }
+
+  // Phase 20.9: clock-writer kernel approach -- workaround for the ROCm
+  // event-in-graph bug. Inserts kernel nodes (which DO work in graphs)
+  // that each write wall_clock64() to a buffer slot. Harvested on host
+  // post-replay; durations come from clock-tick deltas.
+  if (graph_clock_trace_enabled()) {
+    int dev = 0;
+    hipGetDevice(&dev);
+    per_kernel_rank_ = dev;
+    size_t slots = insert_per_kernel_clock_nodes(
+        graph, clock_buf_device_, clock_buf_host_, clock_buf_slots_,
+        per_kernel_clock_names_);
+    if (slots > 0) {
+      std::fprintf(stderr,
+                   "[HCTR perfetto/clock] rank %d: inserted %zu clock-writer "
+                   "kernel nodes (~1us per node, zero per-replay host cost)\n",
+                   dev, slots);
+      tracing::PerfettoEmitter::instance().register_graph_clock_chain(
+          dev, "default", clock_buf_device_, clock_buf_host_, clock_buf_slots_,
+          per_kernel_clock_names_);
     }
   }
 

@@ -184,6 +184,20 @@ class PerfettoEmitter {
                                    const std::vector<hipEvent_t>& events,
                                    const std::vector<std::string>& names);
 
+  // Phase 20.9: register a clock-writer chain for a captured HIP graph.
+  // Each slot in buf_device contains the wall_clock64() value at the
+  // moment the corresponding clock-writer kernel node fired. Slot 0 is
+  // the graph-start marker; slots 1..N are after kernel 0..N-1.
+  // Per-kernel duration = (buf[i+1] - buf[i]) / clock_rate_khz * 1000 ns.
+  //
+  // Workaround for ROCm event-in-graph bug (rocm-systems#2380): kernel
+  // nodes work reliably in graphs while event-record nodes do not.
+  void register_graph_clock_chain(int rank, const std::string& stream_name,
+                                   unsigned long long* buf_device,
+                                   unsigned long long* buf_host,
+                                   size_t num_slots,
+                                   const std::vector<std::string>& names);
+
   // Record an iter-base event on the given stream and start a host-side
   // iter timer. Called from Model::train() at the start of each iter.
   void begin_iter(int rank, int iter_idx, hipStream_t base_stream);
@@ -219,6 +233,19 @@ class PerfettoEmitter {
     std::vector<std::string> names;
   };
 
+  // Phase 20.9: graph clock-writer chain (workaround for the ROCm
+  // event-in-graph bug). buf[0] = graph-start tick; buf[i+1] = tick
+  // after kernel i. clock_rate_khz used to convert ticks to ns.
+  struct GraphClockChain {
+    int rank;
+    std::string stream_name;
+    unsigned long long* buf_device;
+    unsigned long long* buf_host;  // pinned mirror
+    size_t num_slots;              // num_kernels + 1
+    std::vector<std::string> names;  // num_kernels entries (after kernel 0..N-1)
+    double clock_rate_khz;
+  };
+
   struct RankState {
     int iter_idx = -1;
     int64_t iter_start_ns = 0;
@@ -229,6 +256,8 @@ class PerfettoEmitter {
     std::vector<GpuPhase*> registered_phases;
     // Phase 20.8: chained graph event sequences for this rank.
     std::vector<GraphEventChain> graph_chains;
+    // Phase 20.9: clock-writer chains for this rank.
+    std::vector<GraphClockChain> graph_clock_chains;
   };
 
   std::mutex mu_;

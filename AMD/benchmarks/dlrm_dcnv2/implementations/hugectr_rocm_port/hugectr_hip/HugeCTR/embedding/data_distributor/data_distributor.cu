@@ -176,12 +176,16 @@ void DataDistributor::distribute(int gpu_id, const std::vector<core23::Tensor>& 
   if (native_trace_enabled()) {
     if (p_bucket_range == nullptr) {
       int lid = gpu_id;  // local GPU index passed in from caller
-      p_bucket_range = PerfettoEmitter::instance().register_phase(lid, "sp/bucket_range");
-      p_memcpy_loop = PerfettoEmitter::instance().register_phase(lid, "sp/d2d_memcpy_loop");
-      p_copy_input = PerfettoEmitter::instance().register_phase(lid, "sp/copy_input");
+      // Phase 20.9: NV-style "[sparse_prep] kernel_name" naming.
+      p_bucket_range = PerfettoEmitter::instance().register_phase(lid,
+          "[sparse_prep] bucket_range");
+      p_memcpy_loop = PerfettoEmitter::instance().register_phase(lid,
+          "[memcpy] sparse_prep_d2d_loop");  // NV puts memcpy in [memcpy] cat
+      p_copy_input = PerfettoEmitter::instance().register_phase(lid,
+          "[sparse_prep] copy_input");
       for (size_t g = 0; g < ebc_param_.grouped_lookup_params.size(); ++g) {
-        char nm[40];
-        std::snprintf(nm, sizeof(nm), "sp/distribute_grp%zu", g);
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "[sparse_prep] distribute_grp%zu", g);
         p_grouped.push_back(PerfettoEmitter::instance().register_phase(lid, nm));
       }
     }

@@ -34,14 +34,27 @@ struct GraphWrapper {
   // graph. Per-kernel duration = elapsedTime(events_[i-1], events_[i])
   // (or elapsedTime(graph_start_event_, events_[0]) for the first).
   //
-  // This approach gives per-kernel timing INSIDE captured graphs at
-  // ZERO per-replay host overhead (event-record is a graph node, not
-  // a runtime call). The same trick NV CUPTI uses for CUDA Graphs.
-  // Gated by HCTR_NATIVE_TRACE_GRAPH_NODES=1 (default OFF).
+  // BLOCKED ON ROCM 7.2.1: hipEventElapsedTime returns 0us for events
+  // inserted via hipGraphAddEventRecordNode (ROCm/rocm-systems#2380).
+  // Code stays env-gated OFF -- auto-tests when next ROCm lands.
   std::vector<hipEvent_t> per_kernel_events_;
   std::vector<std::string> per_kernel_names_;
   hipEvent_t graph_start_event_ = nullptr;
   int per_kernel_rank_ = -1;  // local rank for emit attribution
+
+  // Phase 20.9 (2026-05-18): Workaround for the ROCm event-in-graph bug
+  // using KERNEL nodes (which work reliably in graphs) that each write
+  // the GPU wall_clock64() to a device buffer slot. On host harvest,
+  // we read the buffer and compute per-kernel durations from clock
+  // tick deltas.
+  //
+  // Per-replay overhead: ~1us per writer kernel (single-thread store).
+  // Gated by HCTR_NATIVE_TRACE_GRAPH_CLOCK=1 (default OFF, opt-in until
+  // validated).
+  unsigned long long* clock_buf_device_ = nullptr;  // device buffer N+1 u64
+  unsigned long long* clock_buf_host_ = nullptr;    // host pinned mirror
+  size_t clock_buf_slots_ = 0;
+  std::vector<std::string> per_kernel_clock_names_;
 
   void capture(std::function<void(hipStream_t)> workload, hipStream_t stream);
   void exec(hipStream_t stream);
