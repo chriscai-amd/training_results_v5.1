@@ -138,15 +138,25 @@ inline bool graph_clock_trace_enabled() {
 // in the captured graph (plus one root marker for iter-start). Returns
 // the count of slots inserted (N+1). 0 on failure.
 //
+// IMPORTANT (multi-rank fix): the device buffer MUST be pre-allocated
+// by the caller BEFORE hipStreamBeginCapture, because hipMalloc during
+// a concurrent rank's capture disrupts the global HIP runtime and
+// causes hipBLASLt kernel-launch failures inside those captures.
+//
 // Kernel nodes work reliably in HIP graphs (unlike event-record nodes
 // which return 0us elapsedTime on ROCm 7.2.1). The writer kernel does
 // a single 64-bit global store of wall_clock64(), executes in ~1us.
+//
+// `clock_buf_device` must already point to a buffer of at least
+// (num_kernels + 1) u64 slots. clock_buf_slots is set to the actual
+// number of slots used.
 static size_t insert_per_kernel_clock_nodes(
     hipGraph_t graph,
-    unsigned long long*& clock_buf_device,
-    unsigned long long*& clock_buf_host,
+    unsigned long long* clock_buf_device,
+    size_t clock_buf_capacity_slots,
     size_t& clock_buf_slots,
     std::vector<std::string>& names_out) {
+  if (clock_buf_device == nullptr || clock_buf_capacity_slots < 2) return 0;
   size_t num_nodes = 0;
   if (hipGraphGetNodes(graph, nullptr, &num_nodes) != hipSuccess) return 0;
   std::vector<hipGraphNode_t> nodes(num_nodes);
@@ -161,24 +171,14 @@ static size_t insert_per_kernel_clock_nodes(
   }
   if (kernel_nodes.empty()) return 0;
 
-  // Allocate device + pinned host buffer for N+1 u64 slots.
   size_t slots = kernel_nodes.size() + 1;  // +1 for graph-start marker
-  size_t bytes = slots * sizeof(unsigned long long);
-  hipError_t e = hipMalloc(&clock_buf_device, bytes);
-  if (e != hipSuccess) {
-    std::fprintf(stderr, "[HCTR perfetto/clock] hipMalloc failed: %s\n",
-                 hipGetErrorString(e));
-    return 0;
-  }
-  hipMemset(clock_buf_device, 0, bytes);
-  e = hipHostMalloc(reinterpret_cast<void**>(&clock_buf_host), bytes,
-                    hipHostMallocDefault);
-  if (e != hipSuccess) {
-    std::fprintf(stderr, "[HCTR perfetto/clock] hipHostMalloc failed: %s\n",
-                 hipGetErrorString(e));
-    hipFree(clock_buf_device);
-    clock_buf_device = nullptr;
-    return 0;
+  if (slots > clock_buf_capacity_slots) {
+    std::fprintf(stderr,
+                 "[HCTR perfetto/clock] graph has %zu kernels but buffer is %zu slots;"
+                 " truncating. Increase clock_buf_capacity_slots and rebuild.\n",
+                 kernel_nodes.size(), clock_buf_capacity_slots);
+    slots = clock_buf_capacity_slots;
+    kernel_nodes.resize(slots - 1);
   }
   clock_buf_slots = slots;
 
@@ -203,28 +203,26 @@ static size_t insert_per_kernel_clock_nodes(
   };
 
   hipGraphNode_t start_node;
-  e = add_writer(0, nullptr, 0, &start_node);
+  hipError_t e = add_writer(0, nullptr, 0, &start_node);
   if (e != hipSuccess) {
     std::fprintf(stderr,
                  "[HCTR perfetto/clock] add start writer failed: %s -- "
                  "ROCm 7.2.1 may not support hipGraphAddKernelNode "
                  "post-capture insertion either; falling back.\n",
                  hipGetErrorString(e));
-    hipFree(clock_buf_device);
-    hipHostFree(clock_buf_host);
-    clock_buf_device = nullptr;
-    clock_buf_host = nullptr;
+    // Buffer is owned by the caller (GraphWrapper members) -- don't free here.
     clock_buf_slots = 0;
     return 0;
   }
   names_out.reserve(kernel_nodes.size());
   for (size_t i = 0; i < kernel_nodes.size(); ++i) {
     hipGraphNode_t writer_node;
-    e = add_writer(static_cast<int>(i + 1), &kernel_nodes[i], 1, &writer_node);
-    if (e != hipSuccess) {
+    hipError_t e2 = add_writer(static_cast<int>(i + 1), &kernel_nodes[i], 1,
+                                &writer_node);
+    if (e2 != hipSuccess) {
       std::fprintf(stderr,
                    "[HCTR perfetto/clock] add writer %zu failed: %s\n",
-                   i, hipGetErrorString(e));
+                   i, hipGetErrorString(e2));
       break;
     }
     char nm[40];
@@ -239,6 +237,31 @@ static size_t insert_per_kernel_clock_nodes(
 void GraphWrapper::capture(std::function<void(hipStream_t)> workload, hipStream_t stream) {
   if (initialized) {
     return;
+  }
+
+  // Phase 20.9 multi-rank fix: pre-allocate clock-writer buffers BEFORE
+  // hipStreamBeginCapture. hipMalloc during a concurrent rank's active
+  // capture disrupts the shared HIP runtime and causes hipBLASLt kernel
+  // launches inside those captures to fail with "operation failed due to
+  // a previous error during capture". Allocate a generous static buffer
+  // (512 slots = 4 KB device + 4 KB pinned host) so post-capture only
+  // does pure graph editing.
+  constexpr size_t kClockBufCapacity = 512;
+  if (graph_clock_trace_enabled() && clock_buf_device_ == nullptr) {
+    size_t bytes = kClockBufCapacity * sizeof(unsigned long long);
+    hipError_t e1 = hipMalloc(&clock_buf_device_, bytes);
+    hipError_t e2 = hipHostMalloc(reinterpret_cast<void**>(&clock_buf_host_),
+                                    bytes, hipHostMallocDefault);
+    if (e1 == hipSuccess && e2 == hipSuccess) {
+      hipMemset(clock_buf_device_, 0, bytes);
+    } else {
+      std::fprintf(stderr,
+                   "[HCTR perfetto/clock] pre-alloc failed: dev=%s host=%s; "
+                   "graph-clock tracing disabled for this rank\n",
+                   hipGetErrorString(e1), hipGetErrorString(e2));
+      if (clock_buf_device_) { hipFree(clock_buf_device_); clock_buf_device_ = nullptr; }
+      if (clock_buf_host_) { hipHostFree(clock_buf_host_); clock_buf_host_ = nullptr; }
+    }
   }
 
   HCTR_LIB_THROW(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal));
@@ -272,13 +295,15 @@ void GraphWrapper::capture(std::function<void(hipStream_t)> workload, hipStream_
   // event-in-graph bug. Inserts kernel nodes (which DO work in graphs)
   // that each write wall_clock64() to a buffer slot. Harvested on host
   // post-replay; durations come from clock-tick deltas.
-  if (graph_clock_trace_enabled()) {
+  // Buffer pre-allocated above (before BeginCapture) so post-capture
+  // only does pure graph editing -- no hipMalloc to disrupt other ranks.
+  if (graph_clock_trace_enabled() && clock_buf_device_ != nullptr) {
     int dev = 0;
     hipGetDevice(&dev);
     per_kernel_rank_ = dev;
     size_t slots = insert_per_kernel_clock_nodes(
-        graph, clock_buf_device_, clock_buf_host_, clock_buf_slots_,
-        per_kernel_clock_names_);
+        graph, clock_buf_device_, kClockBufCapacity,
+        clock_buf_slots_, per_kernel_clock_names_);
     if (slots > 0) {
       std::fprintf(stderr,
                    "[HCTR perfetto/clock] rank %d: inserted %zu clock-writer "
