@@ -205,6 +205,8 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
 
   // Phase 20.4: lazily register a phase for the graph's outer range.
   // (Gated by HCTR_NATIVE_TRACE_NO_PHASES for bisect.)
+  // Phase 20.9c: use NV-style "[graph] name" prefix so Perfetto buckets
+  // this in a "graph" cat (was unprefixed "graph_<name>" -> "phase" cat).
   static const bool no_phases_g = []() {
     const char* e = std::getenv("HCTR_NATIVE_TRACE_NO_PHASES");
     return e != nullptr && e[0] == '1';
@@ -213,7 +215,7 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
       gpu_phase_ == nullptr && !debug_name_.empty()) {
     CudaDeviceContext _dctx{gpu->get_device_id()};
     gpu_phase_ = tracing::PerfettoEmitter::instance().register_phase(
-        gpu->get_local_id(), "graph_" + debug_name_);
+        gpu->get_local_id(), "[graph] " + debug_name_);
   }
 
   // Phase 14n.5: cross-graph wait_event before replay. Captured cross-stream

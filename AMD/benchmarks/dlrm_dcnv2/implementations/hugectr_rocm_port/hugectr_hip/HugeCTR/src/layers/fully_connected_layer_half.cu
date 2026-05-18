@@ -109,8 +109,20 @@ void FullyConnectedLayer<__half>::fprop(bool is_train) {
   GpuPhase* p_bias_gemm = nullptr;
   GpuPhase* p_kernel_gemm = nullptr;
   // Phase 20.7: per-GEMM events require DETAIL >= 2 (highest fidelity).
+  // Phase 20.9c: also gate on capture-status -- recording hipEvents
+  // INSIDE an active hipStreamBeginCapture context triggers the
+  // ROCm 7.2.1 type-confusion bug (Phase 20.4). When in capture mode,
+  // skip per-GEMM events (the outer GraphScheduleable still records
+  // the graph_<name> wrapper outside capture). When NOT in capture mode
+  // (DEEP=1 or standalone FC layer), the events fire normally.
+  hipStream_t fc_stream_check = get_gpu().get_stream();
+  hipStreamCaptureStatus cap_status = hipStreamCaptureStatusNone;
+  if (HugeCTR::tracing::native_trace_enabled()) {
+    hipStreamIsCapturing(fc_stream_check, &cap_status);
+  }
+  const bool in_capture = (cap_status == hipStreamCaptureStatusActive);
   if (HugeCTR::tracing::native_trace_enabled() &&
-      HugeCTR::tracing::native_trace_detail() >= 2) {
+      HugeCTR::tracing::native_trace_detail() >= 2 && !in_capture) {
     auto it = fwd_gemm_phases.find(this);
     if (it == fwd_gemm_phases.end()) {
       int lid = this->get_gpu().get_local_id();
@@ -248,8 +260,14 @@ void FullyConnectedLayer<__half>::bprop() {
   GpuPhase* p_kernel_grad = nullptr;
   GpuPhase* p_dgrad = nullptr;
   // Phase 20.7: per-GEMM bprop events require DETAIL >= 2.
+  // Phase 20.9c: capture-status gate (see fprop above for rationale).
+  hipStreamCaptureStatus cap_status_b = hipStreamCaptureStatusNone;
+  if (HugeCTR::tracing::native_trace_enabled()) {
+    hipStreamIsCapturing(get_gpu().get_stream(), &cap_status_b);
+  }
+  const bool in_capture_b = (cap_status_b == hipStreamCaptureStatusActive);
   if (HugeCTR::tracing::native_trace_enabled() &&
-      HugeCTR::tracing::native_trace_detail() >= 2) {
+      HugeCTR::tracing::native_trace_detail() >= 2 && !in_capture_b) {
     auto it = bwd_gemm_phases.find(this);
     if (it == bwd_gemm_phases.end()) {
       int lid = this->get_gpu().get_local_id();

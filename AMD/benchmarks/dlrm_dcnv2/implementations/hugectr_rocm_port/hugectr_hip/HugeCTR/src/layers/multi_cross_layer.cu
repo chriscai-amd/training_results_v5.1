@@ -780,8 +780,16 @@ void MultiCrossForwardFunctorv2<T>::operator()(
   auto projection_dim = kernel_tensors[0].shape().size(1);
   auto vec_length = input_tensor.shape().size(1);
   // Phase 20.7: per-cross-layer events require DETAIL >= 2.
+  // Phase 20.9c: capture-status gate -- skip during graph capture
+  // (recording hipEvents inside hipStreamBeginCapture triggers the
+  // ROCm 7.2.1 type-confusion bug, Phase 20.4).
+  hipStreamCaptureStatus cap_status_cf = hipStreamCaptureStatusNone;
+  if (HugeCTR::tracing::native_trace_enabled()) {
+    hipStreamIsCapturing(stream, &cap_status_cf);
+  }
+  const bool in_capture_cf = (cap_status_cf == hipStreamCaptureStatusActive);
   if (HugeCTR::tracing::native_trace_enabled() &&
-      HugeCTR::tracing::native_trace_detail() >= 2) {
+      HugeCTR::tracing::native_trace_detail() >= 2 && !in_capture_cf) {
     auto it = cross_fwd_phases.find(this);
     if (it == cross_fwd_phases.end()) {
       auto& v = cross_fwd_phases[this];
@@ -956,8 +964,14 @@ void MultiCrossBackwardFunctorv2<T>::operator()(
   static thread_local std::unordered_map<const void*, std::vector<GpuPhase*>> cross_bwd_phases;
   std::vector<GpuPhase*>* cb_phases = nullptr;
   // Phase 20.7: per-cross-layer bprop events require DETAIL >= 2.
+  // Phase 20.9c: capture-status gate (see fprop above).
+  hipStreamCaptureStatus cap_status_cb = hipStreamCaptureStatusNone;
+  if (HugeCTR::tracing::native_trace_enabled()) {
+    hipStreamIsCapturing(dgrad_stream, &cap_status_cb);
+  }
+  const bool in_capture_cb = (cap_status_cb == hipStreamCaptureStatusActive);
   if (HugeCTR::tracing::native_trace_enabled() &&
-      HugeCTR::tracing::native_trace_detail() >= 2) {
+      HugeCTR::tracing::native_trace_detail() >= 2 && !in_capture_cb) {
     auto it = cross_bwd_phases.find(this);
     if (it == cross_bwd_phases.end()) {
       auto& v = cross_bwd_phases[this];
