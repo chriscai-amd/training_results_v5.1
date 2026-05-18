@@ -480,69 +480,117 @@ COLOR = {
 }
 
 def classify_stream(cat_hist, kernel_names, n_memcpy):
-    """Assign a semantic role name to a CUDA stream based on the mix of
-    kernels that run on it. Mirrors the architecture in
-    HugeCTR/include/gpu_resource.hpp + the EBC scheduler's side-stream pool.
+    """Assign each CUDA stream the canonical HCTR source-code name it was
+    created with. Returned strings are exactly the literal name passed to
+    stream_event_manager_.get_stream(name, ...) inside HCTR.
 
-    Returns a string label like 'computation_stream', 'wgrad_stream',
-    'embedding_mp', 'embedding_dp', 'sparse_prep', 'memcpy_stream', or
-    'cublaslt_internal' (caller numbers the latter when there are several).
+    Source-code references (HugeCTR/src/):
+      gpu_resource.cpp:29-43 --
+        stream_name_("default") -> "default"            (computation_stream_)
+        get_stream("memcpy_stream_", ...) -> "memcpy_stream_"
+        get_stream("computation_stream_2_") -> "computation_stream_2_"
+        get_stream("p2p_stream_", ...) -> "p2p_stream_"
+      pybind/model_pipeline.cpp:300-312 --
+        std::string mp_stream = "mp";  ebc_mp_*->set_stream(mp_stream)
+        std::string dp_stream = "dp";  ebc_dp_*->set_stream(dp_stream)
+        # set_stream is RELATIVE, so the actual key in
+        # StreamEventManager is current_stream_name() + suffix
+        # = "default" + "mp" = "defaultmp"  (and "defaultdp")
+        (StreamContextScheduleable::get_stream_name, pipeline.cpp:53-55)
+      pybind/model_pipeline.cpp:412 --
+        distribute_data->set_absolute_stream("prefetch")  -> "prefetch"
+      layers/multi_cross_layer.cu:839 --
+        gpu_resource->get_stream("cross_layer_wgrad")     -> "cross_layer_wgrad"
+
+    cuBLAS-Lt is a separate case: its private split-K reduction lanes are
+    not HCTR-owned (cuBLAS-Lt creates them internally), so we keep the
+    descriptive label "cublaslt_internal" (numbered by caller).
     """
     n = sum(cat_hist.values())
 
-    # Pure-memcpy lane (no kernels at all -- e.g. the dedicated
-    # AsyncDataReader H2D stream).
+    # Pure-memcpy lane (no kernels at all). HCTR's AsyncDataReader uses
+    # placement_streams_[] high-prio cudaStreamNonBlocking streams for
+    # H2D batches (data_readers/multi_hot/detail/data_reader_impl.cpp).
+    # The legacy single-stream H2D path uses GPUResource::memcpy_stream_
+    # (gpu_resource.cpp:41). Both look identical from the trace -- a
+    # stream that only ever sees memcpy events -- so we label them with
+    # the canonical name "memcpy_stream_".
     if n == 0:
-        return "memcpy_stream" if n_memcpy > 0 else "idle"
+        return "memcpy_stream_" if n_memcpy > 0 else "idle"
 
     def pct(cat):
         return cat_hist.get(cat, 0) / n
 
-    # --- Embedding "mp" lane: carries the embedding all-to-all (ncclSendRecv)
-    # together with embedding fwd lookups. In MI350X's table this is the
-    # "Embedding 'mp'" stream (emb_fwd + emb_a2a + opt_emb + emb_reduce).
+    # --- "defaultmp" (= default + "mp" suffix from set_stream("mp")):
+    # carries the embedding all-to-all (ncclSendRecv via ebc_mp_network_*)
+    # and embedding fwd lookups (ebc_mp_model_forward / network_forward /
+    # backward / local_reduce / update). Matches HCTR's "ebc_mp" stream
+    # role used by EmbeddingCollectionMPManager.
     if pct("emb_a2a") > 0.10 and pct("emb_fwd") > 0.05:
-        return "embedding_mp"
+        return "defaultmp"
 
-    # --- Sparse-prep / embedding-dp lanes: dominated by sparse-prep kernels.
-    # In our trace HCTR's EBC scheduler splits these across two side-streams:
-    #   * "_a" (sparse_prep): radix-sort + get_unique_key dominant
-    #   * "_b" (embedding_dp): scan + keys_to_indices + sometimes secondary
-    #     ncclSendRecv -- matches MI350X's "Embedding 'dp'" stream.
+    # --- "prefetch" (set_absolute_stream("prefetch") at
+    # pybind/model_pipeline.cpp:412): hosts distribute_data, the next-iter
+    # data-prep step. Dominated by sparse_prep kernels (radixsort,
+    # get_unique_key_*, etc).
+    #
+    # --- "defaultdp" (= default + "dp" suffix): ebc_dp_forward /
+    # _backward_index_calculation / _local_reduce / _update. Also dominated
+    # by sparse-prep-like kernels (scan / keys_to_indices / compress_offset),
+    # plus sometimes a secondary ncclSendRecv during dp_allreduce.
+    #
+    # Both lanes look like "sparse_prep heavy" from the kernel-name
+    # perspective; we disambiguate using:
+    #   - presence of secondary nccl traffic -> defaultdp (dp_allreduce
+    #     runs here in the inter-iter-overlap path)
+    #   - kernel-name flavor (radix-sort heavy -> prefetch, scan heavy ->
+    #     defaultdp). This matches what we observed empirically on B200.
     if pct("sparse_prep") > 0.6:
         names_l = " ".join(n.lower() for n in kernel_names)
         radix_score = (names_l.count("radixsort") + names_l.count("radix_sort")
                        + names_l.count("get_unique_key") + names_l.count("get_keys_flag"))
         scan_score  = (names_l.count("devicescan") + names_l.count("scaninit")
                        + names_l.count("keys_to_indices") + names_l.count("compress_offset"))
-        # Secondary ncclSendRecv presence means it's the "dp" stream
         if pct("emb_a2a") > 0.0 or scan_score > radix_score:
-            return "embedding_dp"
-        return "sparse_prep"
+            return "defaultdp"
+        return "prefetch"
 
-    # --- Wgrad lane (computation_stream_2_): identified by the presence of
-    # HCTR's Concat-layer BACKWARD kernel WITHOUT the FORWARD counterpart.
-    # When async_wgrad=True, HCTR splits the Concat layer such that
-    # concat_fwd_kernel runs on computation_stream_ and concat_bwd_kernel
-    # runs on computation_stream_2_; that's the unique signature.
-    # When async_wgrad=False, both run on computation_stream_ together,
-    # which we'll catch in the main-computation rule below.
+    # --- "computation_stream_2_" (gpu_resource.cpp:42): wgrad cublas
+    # handle binds here (cublas_handle_wgrad_ at gpu_resource.cpp:56).
+    # Async-wgrad MLP/Cross wgrad GEMMs use this stream; identified by
+    # presence of HCTR's Concat-layer BACKWARD kernel WITHOUT the
+    # FORWARD counterpart (when async_wgrad=True, HCTR splits the Concat
+    # layer such that concat_fwd_kernel runs on "default" and
+    # concat_bwd_kernel runs on "computation_stream_2_"). When
+    # async_wgrad=False both run on "default", which the main-computation
+    # rule below catches.
     names_lower_blob = " ".join(kn.lower() for kn in kernel_names)
     has_concat_fwd = "concat_fwd" in names_lower_blob
     has_concat_bwd = "concat_bwd" in names_lower_blob
     if (has_concat_bwd and not has_concat_fwd
             and pct("emb_a2a") == 0
             and pct("allreduce") == 0):
-        return "wgrad_stream"
+        return "computation_stream_2_"
 
-    # --- Main computation_stream_: large kernel count, broad MLP mix
+    # --- "default" (gpu_resource.cpp:29,39): the primary computation
+    # stream. cublas_handle_, cudnn_handle_, and curand bind here
+    # (gpu_resource.cpp:50-57). Carries the bulk of MLP fwd/bwd_dgrad/
+    # bwd_wgrad GEMMs, cross-net Interaction kernels, loss BCE, and the
+    # main exchange_wgrad AllReduce + MLP update_params (adagrad).
     mlp_share = (pct("mlp_fwd") + pct("mlp_bwd_dgrad") + pct("mlp_bwd_wgrad")
                  + pct("fused_fma") + pct("interaction"))
     if n >= 100 and mlp_share > 0.30:
-        return "computation_stream"
+        return "default"
 
-    # --- Otherwise: a cuBLASLt-managed helper stream (split-K reduction lane,
-    # batched-GEMM tail, etc.). Caller adds an ordinal suffix.
+    # --- "cross_layer_wgrad" (multi_cross_layer.cu:839): MultiCrossLayer's
+    # private wgrad stream. Only created when async_wgrad=True for cross
+    # nets. Currently we don't have a strong empirical signature to detect
+    # it separately from computation_stream_2_, so it falls through to
+    # cublaslt_internal_N. (TODO: detect via "expand_wgrad" kernel names.)
+    #
+    # --- cuBLAS-Lt private split-K helper streams: cuBLAS-Lt creates
+    # these internally for tail kernels (splitKreduce_kernel etc.); they
+    # are NOT HCTR-owned and have no source-code name.
     return "cublaslt_internal"
 
 # In multi-GPU mode, give each GPU its own process and its host its own
@@ -1174,9 +1222,15 @@ for GPU in GPU_LIST:
         role = sid_to_role.get(sid, f"stream_{sid}")
         role_kernel_idxs[role].append(ix)
 
-    # role priority order (only roles present get a lane)
-    ROLE_PRIORITY = ["computation_stream", "wgrad_stream",
-                     "embedding_mp", "embedding_dp", "sparse_prep"]
+    # role priority order (only roles present get a lane). Names match
+    # the canonical HCTR source-code stream names from gpu_resource.cpp +
+    # pybind/model_pipeline.cpp -- see classify_stream() for full source
+    # references.
+    ROLE_PRIORITY = ["default",                # computation_stream_
+                     "computation_stream_2_",   # cublas_handle_wgrad_
+                     "defaultmp",               # ebc_mp_*
+                     "defaultdp",               # ebc_dp_*
+                     "prefetch"]                # distribute_data
 
     synth_events = []
     n_iter_slices = 0
@@ -1397,10 +1451,20 @@ for GPU in GPU_LIST:
           f"iter={n_iter_slices} phase={n_phase_slices} "
           f"layer={n_layer_slices} kernel={n_kernel_inner_slices}",
           file=sys.stderr)
+    SYNTH_HINT = {
+        "default":               "computation_stream_",
+        "computation_stream_2_": "cublas_handle_wgrad_",
+        "defaultmp":             "ebc_mp_*",
+        "defaultdp":             "ebc_dp_*",
+        "prefetch":              "distribute_data",
+        "cross_layer_wgrad":     "MultiCrossLayer wgrad",
+    }
     for role, tid in SYNTH_LANES.items():
+        hint = SYNTH_HINT.get(role, "")
+        suffix = f" -- {hint}" if hint else ""
         events.append({"name": "thread_name", "ph": "M",
                        "pid": PID_HOST, "tid": tid,
-                       "args": {"name": f"synth_call_stack [{role}]"}})
+                       "args": {"name": f"synth_call_stack [{role}]{suffix}"}})
         sort_key = (ROLE_PRIORITY.index(role) if role in ROLE_PRIORITY
                     else 50 + len(ROLE_PRIORITY))
         events.append({"name": "thread_sort_index", "ph": "M",
@@ -1486,19 +1550,40 @@ for GPU in GPU_LIST:
         role_summary[stream_label[sid]] += 1
     print(f"  stream roles: {dict(role_summary)}", file=sys.stderr)
 
+    # Friendly hint shown next to the canonical source-code stream name
+    # in thread_name (just to remind reader what each name maps to). The
+    # canonical name itself is always shown.
+    STREAM_HINT = {
+        "default":               "computation_stream_",
+        "computation_stream_2_": "cublas_handle_wgrad_",
+        "defaultmp":             "ebc_mp_* (mp_stream)",
+        "defaultdp":             "ebc_dp_* (dp_stream)",
+        "prefetch":              "distribute_data (next-iter sparse prep)",
+        "memcpy_stream_":        "AsyncDataReader H2D",
+        "p2p_stream_":           "P2P transfers",
+        "cross_layer_wgrad":     "MultiCrossLayer async wgrad",
+        "idle":                  "(no kernels, no memcpys)",
+    }
     for sid in sorted(set(unique_streams) | set(memcpy_only_streams)):
         label = stream_label.get(sid, "unknown")
+        hint = STREAM_HINT.get(label, "")
+        # cuBLAS-Lt private split-K helper streams aren't HCTR-owned; flag them.
+        if label.startswith("cublaslt_internal"):
+            hint = "cuBLAS-Lt private split-K (not HCTR-owned)"
+        suffix = f" -- {hint}" if hint else ""
         events.append({"name": "thread_name", "ph": "M", "pid": PID_GPU, "tid": sid,
-                       "args": {"name": f"stream {sid} ({label})"}})
+                       "args": {"name": f"stream {sid}  [{label}]{suffix}"}})
         # also a sort_index so Perfetto orders lanes by role rather than tid
         ROLE_ORDER = {
-            "computation_stream":   10,
-            "wgrad_stream":         20,
-            "embedding_mp":         30,
-            "embedding_dp":         40,
-            "sparse_prep":          50,
-            "memcpy_stream":        60,
-            "idle":                 70,
+            "default":               10,   # computation_stream_
+            "computation_stream_2_": 20,   # cublas_handle_wgrad_
+            "cross_layer_wgrad":     25,
+            "defaultmp":             30,   # ebc_mp_*
+            "defaultdp":             40,   # ebc_dp_*
+            "prefetch":              50,   # distribute_data
+            "memcpy_stream_":        60,
+            "p2p_stream_":           65,
+            "idle":                  70,
         }
         # cublaslt_internal_* slots after the named roles, in busy-time order
         if label.startswith("cublaslt_internal_"):
