@@ -215,13 +215,20 @@ class AUCStorage {
   // Workspace for CUB functions
   std::vector<ReallocBuffer<int8_t, ReallocType_t::NO_COPY>> workspace_;
 
+  // Phase TTT.2 (2026-05-19): switched MMAP -> DEFAULT to avoid the
+  // hipMemSetAccess "invalid argument" crash in metrics.cu:2123 on
+  // ROCm 7.2.1 gfx950. The MMAP path uses HIP virtual-memory APIs
+  // (hipMemMap / hipMemSetAccess) which fail at first eval. DEFAULT
+  // uses hipMalloc + hipMemcpyAsync on grow -- slower per realloc
+  // but reliable. AUC finalize only runs once per eval (not per iter)
+  // so the extra memcpy cost is negligible.
   struct FinalizeStorage {
-    ReallocBuffer<float, ReallocType_t::MMAP> preds_1_;
-    ReallocBuffer<float, ReallocType_t::MMAP> labels_1_;
-    ReallocBuffer<float, ReallocType_t::MMAP> preds_2_;
-    ReallocBuffer<float, ReallocType_t::MMAP> labels_2_;
-    ReallocBuffer<CountType, ReallocType_t::MMAP> identical_pred_starts_;
-    ReallocBuffer<CountType, ReallocType_t::MMAP> identical_pred_lengths_;
+    ReallocBuffer<float, ReallocType_t::DEFAULT> preds_1_;
+    ReallocBuffer<float, ReallocType_t::DEFAULT> labels_1_;
+    ReallocBuffer<float, ReallocType_t::DEFAULT> preds_2_;
+    ReallocBuffer<float, ReallocType_t::DEFAULT> labels_2_;
+    ReallocBuffer<CountType, ReallocType_t::DEFAULT> identical_pred_starts_;
+    ReallocBuffer<CountType, ReallocType_t::DEFAULT> identical_pred_lengths_;
 
     core23::Tensor local_bins_;
     core23::Tensor global_bins_;
