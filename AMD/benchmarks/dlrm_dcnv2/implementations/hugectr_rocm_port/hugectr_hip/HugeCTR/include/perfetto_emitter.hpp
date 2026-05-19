@@ -209,6 +209,15 @@ class PerfettoEmitter {
   // Append a raw event (used for host-side ranges like "iter_N" itself).
   void emit_event(PerfettoEvent e);
 
+  // Phase 20.9d: emit a HOST-SIDE event measured with std::chrono. No GPU
+  // events involved -- pure host wall time. Used to measure host API call
+  // durations like hipGraphLaunch, hipLaunchKernel, hipStreamSynchronize.
+  // Lane name appears as a Perfetto "thread" within the rank's process.
+  void emit_host_event(int rank, const std::string& lane_name,
+                        const std::string& event_name,
+                        int64_t ts_ns, int64_t dur_ns,
+                        const std::string& args_extra = "");
+
   // Flush buffer to per-rank JSON file. Called from main thread at exit
   // or periodically. Thread-safe.
   void flush(int rank);
@@ -268,6 +277,34 @@ class PerfettoEmitter {
 
   // Friend access for harvest plumbing.
   friend class GpuPhase;
+};
+
+// Phase 20.9d: RAII helper to measure HOST-side wall time of a code block
+// and emit it as a Perfetto event. Use to time HIP API calls like
+// hipGraphLaunch directly, bypassing rocprofv3's instrumentation
+// overhead (which itself is 5-10x of the real host call).
+//
+//   void GraphScheduleable::run(...) {
+//     {
+//       ScopedHostTimer _t(rank, "host_api", "[host_api] hipGraphLaunch");
+//       graph_.exec(stream);
+//     }
+//   }
+class ScopedHostTimer {
+ public:
+  ScopedHostTimer(int rank, std::string lane, std::string name,
+                  std::string args_extra = "");
+  ~ScopedHostTimer();
+  ScopedHostTimer(const ScopedHostTimer&) = delete;
+  ScopedHostTimer& operator=(const ScopedHostTimer&) = delete;
+
+ private:
+  bool active_;
+  int rank_;
+  std::string lane_;
+  std::string name_;
+  std::string args_extra_;
+  int64_t t0_ns_;
 };
 
 // RAII helper: record start in ctor, end in dtor. Use inside run() bodies.

@@ -462,6 +462,57 @@ void PerfettoEmitter::emit_event(PerfettoEvent e) {
   events_.push_back(std::move(e));
 }
 
+void PerfettoEmitter::emit_host_event(int rank, const std::string& lane_name,
+                                       const std::string& event_name,
+                                       int64_t ts_ns, int64_t dur_ns,
+                                       const std::string& args_extra) {
+  if (!native_trace_enabled()) return;
+  // Phase 20.9e: only emit if we're inside the active trace iter window.
+  // iter_start_ns is set by begin_iter ONLY for in-window iters (out-of-
+  // window begin_iter resets it to 0). Without this check, host timers
+  // fire for ALL iters including iters 10..24 which are post-window --
+  // creating phantom events that stretch the visible trace span by ~500ms.
+  if (rank < 0 || rank >= static_cast<int>(rank_state_.size())) return;
+  if (rank_state_[rank].iter_start_ns == 0) return;
+  int iter_idx = rank_state_[rank].iter_idx;
+  PerfettoEvent ev;
+  ev.ts_us = ts_ns / 1000;
+  ev.dur_us = static_cast<double>(dur_ns) / 1000.0;
+  ev.rank = rank;
+  ev.stream_name = lane_name;
+  ev.name = event_name;
+  // Extract NV-style [bracket] cat or default to "host_api".
+  if (!event_name.empty() && event_name[0] == '[') {
+    auto close = event_name.find(']');
+    if (close != std::string::npos) ev.cat = event_name.substr(1, close - 1);
+    else ev.cat = "host_api";
+  } else {
+    ev.cat = "host_api";
+  }
+  ev.iter_idx = iter_idx;
+  ev.args_extra = args_extra;
+  emit_event(std::move(ev));
+}
+
+ScopedHostTimer::ScopedHostTimer(int rank, std::string lane, std::string name,
+                                   std::string args_extra)
+    : active_(native_trace_enabled()),
+      rank_(rank),
+      lane_(std::move(lane)),
+      name_(std::move(name)),
+      args_extra_(std::move(args_extra)),
+      t0_ns_(0) {
+  if (active_) t0_ns_ = now_ns();
+}
+
+ScopedHostTimer::~ScopedHostTimer() {
+  if (!active_) return;
+  int64_t t1 = now_ns();
+  PerfettoEmitter::instance().emit_host_event(rank_, lane_, name_,
+                                                t0_ns_, t1 - t0_ns_,
+                                                args_extra_);
+}
+
 void PerfettoEmitter::flush(int rank) {
   // Non-destructive: every flush writes the FULL per-rank history to file.
   // This makes the JSON file always reflect the latest snapshot.

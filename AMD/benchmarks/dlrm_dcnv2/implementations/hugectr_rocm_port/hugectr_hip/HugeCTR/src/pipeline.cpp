@@ -229,6 +229,14 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
   if (!use_graph) {
     {
       tracing::ScopedGpuPhase _hctr_gpu_phase(gpu_phase_, stream, current_stream_name);
+      // Phase 20.9d: also time HOST-side wall of the do_it() call. In
+      // non-graph mode this is the sum of all hipLaunchKernel host
+      // dispatch times for the network. Compare with hipGraphLaunch
+      // timing in the graph-on branch below to validate which dispatch
+      // path has lower host overhead. Cheap (~ns), purely host-side.
+      tracing::ScopedHostTimer _host_t(
+          gpu->get_local_id(), "host_api",
+          "[host_api] direct_dispatch (" + debug_name_ + ")");
       do_it(stream);
     }
     if (completion_event_.has_value()) {
@@ -246,6 +254,11 @@ void GraphScheduleable::run(std::shared_ptr<GPUResource> gpu, bool use_graph) {
   }
   {
     tracing::ScopedGpuPhase _hctr_gpu_phase(gpu_phase_, stream, current_stream_name);
+    // Phase 20.9d: measure host-side hipGraphLaunch wall time directly
+    // (bypassing rocprofv3 overhead which inflates this by 5-10x).
+    tracing::ScopedHostTimer _host_t(
+        gpu->get_local_id(), "host_api",
+        "[host_api] hipGraphLaunch (" + debug_name_ + ")");
     graph_.exec(stream);
   }
   // Phase 14n.5: record completion event AFTER replay so downstream graphs/scheduleables
