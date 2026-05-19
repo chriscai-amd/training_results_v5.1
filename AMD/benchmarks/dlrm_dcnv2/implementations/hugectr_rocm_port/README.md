@@ -177,14 +177,14 @@ only and are no longer maintained.
 | 3  | 2026-05-09 | HIP graph + intra/inter-iter overlap re-enabled (handle pre-warm `std::call_once`) | [`eb4fa60`](https://github.com/chriscai-amd/training_results_v5.1/commit/eb4fa60) | 5.85 → **6.26** | **+7.0 %** |
 | 4  | 2026-05-10 | Multi-hot data path (912 B/row, 214 keys/row — apples-to-apples with NV submission) | [`5e12007`](https://github.com/chriscai-amd/training_results_v5.1/commit/5e12007) | 6.26 → **5.73** | -8.5 % (5× more embedding work; intentional regression for apples-to-apples) |
 | 5  | 2026-05-10 | Fused MLP epilogue emulation (RELU_AUX / DRELU / DRELU_BGRAD via `hipblasGemmEx` fallback) | [`2ee57e7`](https://github.com/chriscai-amd/training_results_v5.1/commit/2ee57e7), [`0d9a35e`](https://github.com/chriscai-amd/training_results_v5.1/commit/0d9a35e), [`61ce55b`](https://github.com/chriscai-amd/training_results_v5.1/commit/61ce55b) | n/a (correctness only; fused path slower than InnerProduct on AMD) | (correctness) |
-| 6  | 2026-05-10 | **V5 2D-tile bgrad/bgrada kernels** replace V1 cooperative scan (49 % of single-GPU time → sub-1 %) | [`56bc046`](https://github.com/chriscai-amd/training_results_v5.1/commit/56bc046), [`63a9c54`](https://github.com/chriscai-amd/training_results_v5.1/commit/63a9c54), [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a) | 5.73 → **11.24** | **+96 %** ← single biggest win |
+| 6  | 2026-05-10 | **V5 2D-tile bgrad/bgrada kernels** replace V1 cooperative scan (49 % of single-GPU time → sub-1 %). **[corrected 2026-05-18 — see §2.2 Phase 6 sub-table for revised attribution]** | [`56bc046`](https://github.com/chriscai-amd/training_results_v5.1/commit/56bc046), [`63a9c54`](https://github.com/chriscai-amd/training_results_v5.1/commit/63a9c54), [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a) | 5.73 → 11.24 *(headline, not reproducible)*; kernel-only: **22–457× per call** | **+96 %** *originally claimed*; **~+1 %** isolated re-A/B at 8-GPU bs=1× — most of the headline jump came from concurrent landings/config flips, not V5 alone |
 | 7  | 2026-05-11 | FP16 NaN/inf clamp folded into `vector_fma{3,4}_align8` store path | [`93aad5c`](https://github.com/chriscai-amd/training_results_v5.1/commit/93aad5c) | 11.24 → **11.57** | +2.9 % @ bs1x; **+15 %** @ sweet-spot batch |
 | 8  | 2026-05-11 | Re-enable intra/inter-iteration overlap (earlier scripts had set both to 0) | [`68e560e`](https://github.com/chriscai-amd/training_results_v5.1/commit/68e560e) | 11.57 → **12.55** | **+8.5 %** |
 | 9  | 2026-05-11 | V5-style `add_bias_per_row_v5_kernel` (BLOCK_M=64 × N_TILE=128, coalesced, shared-mem broadcast) | [`3b984e4`](https://github.com/chriscai-amd/training_results_v5.1/commit/3b984e4) | 12.55 → **12.72** | +1.4 % @ bs1x; +2.6 % @ sweet-spot |
 | 10 | 2026-05-11 | V5 BGRADA scratch zeroing folded into finalize kernel (3 hipMemsetAsync/iter eliminated) | [`b898899`](https://github.com/chriscai-amd/training_results_v5.1/commit/b898899) | 12.72 → **12.74** | +0.2 % (within noise) |
 |    | 2026-05-12 | NFS-bound → `/dev/shm` fix (AsyncReader uses `O_DIRECT`, bypasses page cache) | [`bf88560`](https://github.com/chriscai-amd/training_results_v5.1/commit/bf88560) | 5.21 (NFS) → **11.76** sustained @ bs1x | +127 % vs NFS-bound run |
 |    | 2026-05-12 | NV-submission audit (>120 env-knob configs swept) — bake `NCCL_PROTO=LL128`, `HIP_FORCE_DEV_KERNARG=1` | [`1ef02aa`](https://github.com/chriscai-amd/training_results_v5.1/commit/1ef02aa), [`fd1f4d2`](https://github.com/chriscai-amd/training_results_v5.1/commit/fd1f4d2), [`2c4670a`](https://github.com/chriscai-amd/training_results_v5.1/commit/2c4670a), [`a923ef1`](https://github.com/chriscai-amd/training_results_v5.1/commit/a923ef1) | 11.76 → **11.88** sustained | +1.0 % |
-| 11 | 2026-05-12 | **`DEBUG_HIP_DYNAMIC_QUEUES=1`** (on-demand HW queue allocation; the 4-stream pipeline now overlaps properly) | [`3860967`](https://github.com/chriscai-amd/training_results_v5.1/commit/3860967) | 11.88 → **12.92** @ bs1x; 15.17 → **16.42** @ bs8x peak | **+8.9 % @ bs1x; +8.2 % @ bs8x** |
+| 11 | 2026-05-12 | **`DEBUG_HIP_DYNAMIC_QUEUES=1`** (on-demand HW queue allocation; the 4-stream pipeline now overlaps properly). **[re-validated 2026-05-18 — see §2.2 Phase 11 sub-table]** | [`3860967`](https://github.com/chriscai-amd/training_results_v5.1/commit/3860967) | 11.88 → 12.92 @ bs1x (May-12); on HEAD: DYNQ=0 13.80 → DYNQ=1 **14.43** @ bs1x (May-18, 3-trial steady) | **+8.9 %** (orig); **+4.5 %** (HEAD re-A/B) — decayed but still load-bearing |
 |    | 2026-05-12 | **Configuration: peak measurement at bs8x (442,368) instead of bs1x (55,296)** (amortizes 1.29 ms/iter host overhead — see linear-fit in Part 3) | (configuration only) | bs1x **12.92** → bs8x **16.42** M sps (same binary, 8× larger global batch, ~7 % per-GPU memory increase) | **+27 %** (**+5.3 ms saved per 8× samples**; relaxes MLPerf-spec batch constraint) |
 | 12 | 2026-05-12 | int4-vectorized `__half` elementwise: `concat_fwd/bwd_kernel_vec8` + `binaryOp_kernel_vec8_half` (used by MultiCross matrix_add) | [`4fb17c3`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fb17c3), [`e3e64a2`](https://github.com/chriscai-amd/training_results_v5.1/commit/e3e64a2) | 16.42 → **16.67** @ bs8x | **+1.5 %** at peak |
 | 13 | 2026-05-13 | **`HCTR_DROP_TABLE_SIZE_CLAMP=1` on real-data path** — removes stale `max(real_size, 65536)` clamp that broke `auto`-planner's DP-replication of the 13 small embedding tables (≤ 7,424 elems). Reduces embedding all-to-all volume by ~80 %. (NV's May-13 hot-fix per b200/README §7.5.) | [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6) | bs8x 16.67 → **16.98**; bs2x 15.04 → **15.31** | **+2.0 % @ bs8x; +1.8 % @ bs2x; flat @ bs1x** (RCCL is CU-bound on AMD, not volume-bound) |
@@ -204,58 +204,222 @@ only and are no longer maintained.
 
 ## 2.2 Selected sub-tables (key wins in detail)
 
-### Phase 6 — V5 2D-tile bgrad/bgrada kernels (+96 %, single biggest win) — [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a)
+### Phase 6 — V5 2D-tile bgrad/bgrada kernels — [`56bc046`](https://github.com/chriscai-amd/training_results_v5.1/commit/56bc046), [`63a9c54`](https://github.com/chriscai-amd/training_results_v5.1/commit/63a9c54), [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a)
 
-`rocprof --stats` showed `reduce_sum_columns_kernel` (V1 BGRADA post-pass)
-was **49 %** of all GPU time on a single-GPU run (~289 ms / 590 ms). V1
-design (one block per row, 256-thread cooperative scan, uncoalesced reads
-at stride-`m`) hit ~1 % CU utilisation at small `m`. Replaced with a V5
-2D tile (BLOCK_M=64 rows × N_TILE=1024 cols/block), wave-aligned coalesced
-reads, atomicAdd into per-device pre-allocated FP32 scratch (pre-warmed
-via `std::call_once` so HIP graph capture sees the alloc done), finalize
-kernel divides + clamps + casts.
+**What these kernels do in DLRM-DCNv2.** Every fully-connected layer
+in DLRM-DCNv2's **bottom MLP** (3-4 FC layers on the dense feature
+inputs), **top MLP** (4-5 FC layers above the cross-network producing
+the click prediction), and the **MultiCross / DCNv2 layers** has the
+form `y = W @ x + b` followed optionally by ReLU. Their **backward
+pass** requires the bias gradient `db = sum over the batch dimension
+of dy`, which is exactly a per-row column-sum of the upstream gradient
+matrix — i.e. a "reduce-sum-columns" reduction. With ~7-18 FC
+sub-layers per iter and a per-GPU batch of 6,912 at bs=1×, that's
+hundreds of column-sums per iter:
 
-Applied to both `bprop_drelu_bgrad_v5_kernel` (dgrad GEMM's DRELU+BGRAD
-epilogue) and `bgrada_v5_kernel` (wgrad GEMM's BGRADA epilogue, used by
-MultiCross).
+  * `reduce_sum_columns_kernel` (V1) → `bgrada_v5_kernel` (V5) — the
+    wgrad-GEMM's BGRADA epilogue (`db += sum_batch(dy)`).
+  * `bprop_drelu_bgrad_v5_kernel` (V5) — the dgrad-GEMM's
+    **fused** DRELU+BGRAD epilogue (`dy *= relu_mask; db += sum_batch(dy)`),
+    fusing what's otherwise two separate passes.
+  * `add_bias_per_row_v5_kernel` (V5) — the forward bias broadcast
+    after each FC layer's GEMM (`y += b`).
+  * `bgrad_finalize_v5_kernel` — divides the FP32 accumulator by 256
+    for FP16 ncclSum headroom, clamps to ±65 504, casts to FP16.
 
-| Configuration | Throughput | Δ |
-|---|---:|---:|
-| pre-V5 (legacy `reduce_sum_columns`) | 5.73 M sps | baseline |
-| V5 in source but stale build (commit [`4fc896a`](https://github.com/chriscai-amd/training_results_v5.1/commit/4fc896a)) | 5.73 M sps | (V5 not actually engaged) |
-| **V5 actually engaged** (clean rebuild) | **11.24 M sps** | **+96 %** |
+**Technical change — confirmed sound.** V1's `reduce_sum_columns_kernel`
+launches one block per output row with a 256-thread cooperative scan
+over the contracted dim, using stride-`m` uncoalesced FP16 loads — at
+small `m` (e.g. the bot-MLP first layer with `m=128`) only one
+wavefront's worth of work survives, ~1 % CU utilisation. Replaced with
+a V5 2D tile (BLOCK_M=64 rows × N_TILE=1024 cols/block), wave-aligned
+coalesced 128-byte loads, atomicAdd into per-device pre-allocated FP32
+scratch (pre-warmed via `std::call_once` so HIP graph capture sees the
+alloc done), followed by the finalize kernel above.
 
-Side-finding: the build I'd been benchmarking against had been stale —
-the V5 kernels were in the binary but the routing code wasn't, so V5
-was never running. Verified post-fix by adding a one-shot
-`[HCTR-V5] ... path=V5` diag print on the first BGRADA call.
+**Kernel-level microbenchmark (added 2026-05-18 to validate).** A
+standalone HIP microbench (`scripts/bgrada_microbench.cu`) running V1
+and V5 directly on the production DLRM-DCNv2 BGRADA shapes (col-major
+__half input, m∈{128,256,512,1024}, k∈{6912, 55296} = per-GPU batch
+at 8-GPU bs=1× and full single-GPU bs=1× respectively) measures
+V5 = **22 – 457× faster per call** than V1, scaling with k:
 
-### Phase 11 — `DEBUG_HIP_DYNAMIC_QUEUES=1` (+6-9 % across all batches) — [`3860967`](https://github.com/chriscai-amd/training_results_v5.1/commit/3860967)
+| M | K | context | V1 µs/call | V5 µs/call | **V5 speedup** | V5 GB/s |
+|---|---|---|---:|---:|---:|---:|
+| 128  | 6,912  | 8-GPU bs=1× | 697.8  | 31.0 | **22.5×** | 57   |
+| 128  | 55,296 | 1-GPU bs=1× | 12,628.7 | 31.2 | **404×**  | 453  |
+| 256  | 55,296 | 1-GPU bs=1× | 13,987.2 | 30.6 | **457×**  | 924  |
+| 512  | 6,912  | 8-GPU bs=1× | 708.4  | 30.6 | **23.2×** | 231  |
+| 1024 | 55,296 | 1-GPU bs=1× | 14,405.1 | 76.7 | **188×**  | **1,477** |
+
+V5 hits **28 % of MI350X HBM3 peak** (~5,300 GB/s) on the largest
+shape; V1 strands the GPU at 0.1–0.4 % of peak with its stride-`m`
+uncoalesced loads. **The kernel speedup is real and not in dispute.**
+
+**Production-level reproducibility — partial, with caveats.** A
+controlled re-A/B at 8-GPU bs=1× on **HEAD as of 2026-05-18** with
+the V5 path forced off (`HCTR_DRELU_KERNEL=v1
+HCTR_ADD_BIAS_KERNEL=v1`) versus default-V5 measures:
+
+| Configuration | Per-iter | Throughput | Δ |
+|---|---:|---:|---:|
+| V5 default-on (HEAD)         | 4.29 ms | 12.879 M sps | baseline |
+| V1 forced (env-knob off-V5)  | 4.34 ms | 12.737 M sps | **−1.1 %** |
+
+**Why the e2e gain is so small even when the kernel is 22-457× faster.**
+`rocprofv3 --kernel-trace --stats` on the 8-GPU bs=1× run
+(`HCTR_FUSE_TOP_MLP=1 HCTR_ASYNC_WGRAD=0`, BGRADA on the critical
+stream) shows the V5-replaced kernels (`bgrada_v5_kernel`,
+`bprop_drelu_bgrad_v5_kernel`, `add_bias_per_row_v5_kernel`,
+`bgrad_finalize_v5_kernel`) consume only **6.5 ms / 321 ms = 2.0 %
+of total GPU kernel time**. That's the hard upper bound on the
+iter-wall improvement Phase 6 can deliver: even an infinite kernel
+speedup cannot reduce GPU kernel time by more than 2 %, and because
+BGRADA runs on the wgrad stream overlapped with the longer dgrad
+critical path, the actual visible iter-time delta is even smaller.
+
+At single-GPU the same ratio is much larger (V1 takes 12-15 ms per
+BGRADA call at `k=55,296` per the microbench, and there are ~18
+calls per iter, so V1 alone would dominate iter time). Going from
+single-GPU to 8-GPU shrinks the per-GPU batch ~8× (the V1 → V5
+absolute speedup at small `k` shrinks correspondingly) and adds
+embedding + RCCL + 18 other GEMMs to the critical path, so Phase 6's
+footprint drops to ~2 % of total kernel time and the per-kernel
+speedup correspondingly drops from a 1:1 wall-time win to invisible.
+
+The 5.73 → 11.24 headline was a measurement-methodology change
+(`HCTR_INTRA_OVERLAP` + `HCTR_INTER_OVERLAP` flipped on at runtime,
+worth ~10 % per a separate 4-corner A/B) plus the cumulative effect
+of phases 7-18 that landed shortly after `4fc896a`, not the kernel
+rewrite itself.
+
+**Bottom line.** V5 is a genuine, large per-kernel improvement
+(measurable on the kernel microbench, 22-457×) and is worth keeping
+default-on as insurance for any future workload where BGRADA hits the
+critical path (smaller-batch, fewer-GPU, single-GPU). On the current
+production 8-GPU bs=1× config it contributes ~+1-2 % to iter time, not
+the originally headlined +96 %.
+
+
+### Phase 11 — `DEBUG_HIP_DYNAMIC_QUEUES=1` (decayed from +8.9 % → +4.5 % at bs1x, still load-bearing) — [`3860967`](https://github.com/chriscai-amd/training_results_v5.1/commit/3860967)
 
 After exhausting >120 env-knob configurations, found that AMD's HIP
-runtime debug knob enables on-demand HW-queue allocation instead of the
-default fixed pool. On HCTR's 4-stream pipeline (compute / RCCL / copy /
-embedding) this gives the largest single env-knob win in the entire
-campaign.
+runtime debug knob `DEBUG_HIP_DYNAMIC_QUEUES=1` changes **how logical
+streams are mapped onto the GPU's hardware queues**.
 
-Per-stream effect at bs4x rocprofv3 trace (with vs without DYN_QUEUES):
+**The hard limits on gfx950 (MI350X)** — independent of `DYN_QUEUES`:
 
-| Metric | DYN_QUEUES off | DYN_QUEUES on | Δ |
+- `GPU_MAX_HW_QUEUES = 4` (`clr/rocclr/utils/flags.hpp:140`): only **4
+  HSA HW queues per priority level per device** can be allocated.
+- `numHwPipes_ = 4` (`rocdevice.cpp:140`): the GPU has **4 physical
+  compute pipes**. HW queues round-robin onto pipes via `queue_id %
+  numHwPipes_`. There are only 4 pipes regardless of how many queues
+  you allocate.
+
+
+**What `DEBUG_HIP_DYNAMIC_QUEUES=1` actually changes** (per
+`rocdevice.cpp::getQueueFromPool` lines 3000-3034): when multiple streams
+must squeeze onto 4 hardware queues, the runtime picks which queue a
+new launch goes to using a different metric.
+
+- **mode 0**: picks the queue **with the fewest streams ever bound
+  to it** — a static count that ignores what's currently running.
+- **mode 1** (default): picks the queue **whose dispatch ring has
+  the least pending work right now** — a live measurement of how
+  busy each queue is at this moment.
+
+**Worked example — why the compute stream ends up waiting for the
+embedding stream** (the exact pattern we observed in the trace):
+
+At the start of an iteration, HCTR launches in roughly this order
+(see the trace decomposition below):
+
+```
+t = 0.00 ms   defaultmp  [emb_fwd] ebc_mp_model       ←  big embedding kernel
+t = 0.05 ms   defaultmp  (kernel still running)
+t = 0.10 ms   default    [graph] network              ←  about to launch
+```
+
+When `default` is about to launch `[graph] network`, the runtime
+needs to decide which HW queue to use. Both modes have the same 4
+queues to pick from; suppose at this moment:
+
+| queue | streams ever attached | pending kernels right now |
+|---|---|---|
+| Q0 | defaultmp (1) | **1** (the embedding kernel still executing) |
+| Q1 | defaultdp (1) | 0 |
+| Q2 | prefetch (1) | 0 |
+| Q3 | rccl_emb_ar (1) | 0 |
+
+- **mode 0** (refCount only) — all four queues have the same
+  attachment count (1 each); ties are broken by queue ID, so it
+  picks **Q0**. The graph-network launch is now queued *behind*
+  the embedding kernel that's still executing on Q0. The default
+  stream waits.
+- **mode 1** (depth-aware) — Q0 has pending depth 1, the others
+  have depth 0. Picker prefers Q1/Q2/Q3 (depth 0). Graph network
+  launches immediately, in parallel with embedding.
+
+This isn't hypothetical — the trace shows exactly this pattern:
+under DYN_QUEUES=0, `[graph] network` launches 0.31 ms *later* than
+under DYN_QUEUES=1, after 6 unrelated kernels have already entered
+the queue ahead of it.
+
+A second, separate failure mode appears when you try to side-step
+this by raising `GPU_MAX_HW_QUEUES`: with `MAXQ=8 DYNQ=0`, two
+streams that should be on different physical pipes end up on the
+same pipe (mode 0 doesn't know about pipes), and they fight for
+CUs *during execution* — making the graph kernel itself run 1.86 ms
+slower, not just delayed. Both failure modes are quantified below.
+
+**Re-validation on HEAD (2026-05-18, 3-trial × 120-iter, bs=1×,
+steady-state iter 50-110 window):**
+
+| config | per-iter | sps (steady) | Δ |
 |---|---:|---:|---:|
-| iter cycle mean | 13.36 ms | **12.03 ms** | **-10 %** |
-| GPU busy / iter (union of all streams) | 12.10 ms | 10.64 ms | -12 % (more overlap) |
-| `hipGraphLaunch` p50 (host call) | 5.97 ms | 6.01 ms | flat (win is in scheduling, not launch) |
-| **"other"-stream p90 inter-kernel gap** | **15.3 ms** | **0.27 ms** | **-98 %** |
-| Embedding-stream p50 inter-kernel gap | 62.1 µs | 19.4 µs | -69 % |
+| **DYN_QUEUES=1** (default-on) | **3.83 ms** (σ ≈ 0.02) | **14.43 M** | baseline |
+| DYN_QUEUES=0 | 4.01 ms (σ ≈ 0.01) | 13.80 M | **−4.5 %** |
 
-5-trial throughput averages, real MLPerf data, `/dev/shm`:
+This is roughly half the originally claimed +8.9 %. The mechanism is
+still real — Phases 13-18 + 20.x simply reduced the absolute amount
+of work *available* to overlap (RCCL on dedicated streams, fewer
+hipMemsetAsync calls, async_wgrad off), so the wall-clock benefit
+from queue-isolation shrinks proportionally.
 
-| Batch | Pre-Phase-11 | + DEBUG_HIP_DYNAMIC_QUEUES=1 | Δ |
-|---:|---:|---:|---:|
-| 55,296 (1×) | 11.86 M sps | **12.92 M sps** | **+8.9 %** |
-| 110,592 (2×) | 13.89 M sps | 15.04 M sps | +8.3 % |
-| 221,184 (4×) | 15.21 M sps | 16.15 M sps | +6.0 % |
-| 442,368 (8×) | 15.17 M sps | 16.42 M sps | +8.2 % |
+**Trace-level decomposition (native HCTR Perfetto trace, 5 in-window
+iters, rank 0, single-trial):**
+
+The penalty surfaces almost entirely as a **delayed start for
+`[graph] network` on the `default` compute stream**:
+
+| event sequence (relative to iter start) | DYN_QUEUES=1 | DYN_QUEUES=0 |
+|---|---:|---:|
+| `[emb_fwd] ebc_mp_model` first kernel ready (defaultmp) | 0.05 ms | 0.04 ms |
+| **`[graph] network` starts (default)** | **0.14 ms** | **0.45 ms** |
+| Kernels launched on defaultmp / defaultdp / prefetch *before* default-stream graph starts | 1 | 6 |
+| `[graph] network` duration | 3.49 ms | 3.12 ms |
+| **iter wall** | **4.33 ms** | **4.57 ms (+0.24 ms)** |
+
+With DYN_QUEUES=0 the network-graph kernel on `default` waits in the
+HSA dispatch queue **0.31 ms longer**, behind 6 unrelated launches on
+the embedding & prefetch streams that happened to land first. The
+graph kernel itself then runs 0.37 ms *shorter* (it's effectively been
+"pre-warmed" by waiting), so the net iter penalty is +0.24 ms ≈ the
++147 µs / +4.5 % we measured at the wall.
+
+**Aggregate stream-overlap factor** (sum of all leaf-event times across
+streams ÷ iter wall − 1):
+
+| config | leaf-event sum | iter wall | overlap factor |
+|---|---:|---:|---:|
+| DYN_QUEUES=1 | 5.13 ms | 4.43 ms | **+16 %** (good cross-stream concurrency) |
+| DYN_QUEUES=0 | 4.81 ms | 4.58 ms | +5 % (mostly serialised) |
+
+The visual signature in the Perfetto trace is unambiguous: under
+DYN_QUEUES=0, the long blue `[graph] network` block on the `default`
+lane appears strictly *after* the embedding kernels on `defaultmp` /
+`defaultdp` finish, instead of running in parallel as it does with
+DYN_QUEUES=1. Keep default-on.
 
 ## 2.3 Negative results (notable knobs that did NOT help)
 
