@@ -29,14 +29,50 @@ def merge(src_dir: str, out_name: str = "hctr_native_trace_all8gpus.json") -> st
             if "ts" in e and isinstance(e["ts"], (int, float)) and e["ts"] > 0:
                 e["ts"] = e["ts"] - base_ts
 
-    # Add process_name metadata so each rank is labeled "Rank N (GPU N)".
+    # Phase 20.9f: Perfetto auto-hashes string tids into numeric ids and the
+    # `thread_sort_index` metadata doesn't always stick. Translate string tids
+    # into small fixed numeric tids based on the desired display order, then
+    # add `thread_name` metadata to keep the human-readable lane label.
+    # Numeric tids sort naturally low->high in Perfetto's lane list.
+    tid_order = {
+        "iter":       0,  # top
+        "host_api":   1,
+        "default":    2,  # main compute
+        "defaultmp":  3,
+        "defaultdp":  4,
+        "comm":       5,
+        "prefetch":   9,  # bottom
+    }
+    DEFAULT_TID = 50
+    for e in all_evs:
+        t = e.get("tid")
+        if isinstance(t, str):
+            e["tid"] = tid_order.get(t, DEFAULT_TID + (hash(t) % 50))
+            # stash original name for the metadata pass below
+            e.setdefault("_orig_tid", t)
+
     ranks = sorted(set(e.get("pid", 0) for e in all_evs))
     for r in ranks:
-        # Use ts=0 (or omit) for metadata; Perfetto ignores ts for ph=M.
-        all_evs.append({"name": "process_name", "ph": "M", "pid": r, "tid": "iter",
+        all_evs.append({"name": "process_name", "ph": "M", "pid": r, "tid": 0,
                          "args": {"name": f"Rank {r} (GPU {r})"}})
-        all_evs.append({"name": "process_sort_index", "ph": "M", "pid": r, "tid": "iter",
+        all_evs.append({"name": "process_sort_index", "ph": "M", "pid": r, "tid": 0,
                          "args": {"sort_index": r}})
+        # Per-thread name metadata. Collect (numeric_tid -> original name).
+        rank_tid_names = {}
+        for e in all_evs:
+            if e.get("pid") == r and "_orig_tid" in e:
+                rank_tid_names.setdefault(e["tid"], e["_orig_tid"])
+        for ntid, name in sorted(rank_tid_names.items()):
+            all_evs.append({"name": "thread_name", "ph": "M",
+                            "pid": r, "tid": ntid,
+                            "args": {"name": name}})
+            all_evs.append({"name": "thread_sort_index", "ph": "M",
+                            "pid": r, "tid": ntid,
+                            "args": {"sort_index": ntid}})
+
+    # Strip the bookkeeping field before writing.
+    for e in all_evs:
+        e.pop("_orig_tid", None)
 
     # Sort by ts for nicer rendering.
     all_evs.sort(key=lambda e: (e.get("ts", 0), e.get("pid", 0)))

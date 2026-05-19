@@ -110,6 +110,9 @@ class GpuPhase {
   // captured-graph phases re-record events on every replay without
   // calling record_start).
   void mark_active() { recorded_this_iter_ = true; }
+  // Phase 20.9g: called by PerfettoEmitter::begin_iter to clear stale
+  // record flags from warmup iters. See begin_iter for full rationale.
+  void mark_unrecorded() { recorded_this_iter_ = false; }
 
   const std::string& name() const { return name_; }
 

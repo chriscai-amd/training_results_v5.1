@@ -277,6 +277,16 @@ static int trace_end_iter() {
 void PerfettoEmitter::begin_iter(int rank, int iter_idx, hipStream_t base_stream) {
   if (!native_trace_enabled()) return;
   if (rank >= static_cast<int>(rank_state_.size())) return;
+  RankState& rs_clear = rank_state_[rank];
+  // Phase 20.9g: ALWAYS clear recorded_this_iter_ flags on every begin_iter,
+  // including warmup iters. Otherwise a phase that ran once during warmup
+  // (e.g. sp/bucket_range -- only runs when batch size changes, on iter 0)
+  // leaves its flag set; when the trace window opens, try_harvest fires on
+  // stale start_/end_events from iter 0 and computes a multi-ms elapsed
+  // that visually swallows the prefetch lane.
+  for (GpuPhase* p : rs_clear.registered_phases) {
+    p->mark_unrecorded();
+  }
   // Mark this iter as out-of-window by clearing the host-side timer; end_iter
   // will see iter_start_ns==0 and skip harvest. Prevents stale state from
   // a prior in-window iter being re-harvested.
