@@ -156,6 +156,22 @@ struct PerfettoEvent {
   std::string args_extra;
 };
 
+// Phase 20.10 (Path D, 2026-05-20): resolve a kernel function pointer
+// to its demangled C++ symbol name. Caches results in a process-local
+// hash table so repeated calls for the same pointer are O(1) lookups.
+//
+// Safe to call before HIP init (returns "" if hipKernelNameRefByPtr
+// fails). Safe to call when HCTR_NATIVE_TRACE is OFF (returns ""
+// without touching HIP). Demangling uses abi::__cxa_demangle.
+//
+// Implementation lives in perfetto_emitter.cpp.
+std::string kernel_name_from_ptr(const void* func_ptr);
+
+// JSON-escape helper exposed for callers that build their own
+// args_json fragments. Identical to the internal helper used by
+// PerfettoEmitter::flush(). Escapes backslash, quote, newline, tab.
+std::string escape_for_args_json(const std::string& s);
+
 // Singleton: owns all registered phases + the event buffer.
 // Created on first call to instance(); destructor flushes to disk.
 class PerfettoEmitter {
@@ -172,6 +188,27 @@ class PerfettoEmitter {
   // Perfetto event emitted for this phase.
   GpuPhase* register_phase(int rank, const std::string& name,
                             const std::string& args_json);
+
+  // Phase 20.10 (Path D, 2026-05-20): register a phase whose underlying
+  // GPU kernel is a known C++ function pointer. The kernel symbol is
+  // resolved ONCE via hipKernelNameRefByPtr at registration time,
+  // demangled, and stamped into the phase's args_json as
+  //   "kernel":"<demangled_name>"
+  // This lets the Perfetto trace show the actual kernel name (matching
+  // what rocprofv3 would report) for HCTR-owned kernels, at zero
+  // per-launch cost. For library kernels (hipBLASLt / RCCL) where the
+  // function pointer is not exposed, fall back to Path A (cold-pass
+  // overlay) via scripts/native_trace_overlay.py.
+  //
+  // Returns the same kind of GpuPhase* as register_phase(); use with
+  // ScopedGpuPhase or place into a GraphScheduleable chain as usual.
+  //
+  // Example:
+  //   auto* p = emitter.register_phase_for_kernel(
+  //       rank, "[mlp_fwd] add_bias_per_row",
+  //       reinterpret_cast<const void*>(&HugeCTR::add_bias_per_row));
+  GpuPhase* register_phase_for_kernel(int rank, const std::string& name,
+                                       const void* func_ptr);
 
   // Phase 20.8: register a chained event-record sequence for a captured
   // HIP graph. Each event is recorded AFTER its corresponding kernel by
@@ -315,21 +352,33 @@ class ScopedHostTimer {
 //     ScopedGpuPhase _p(gpu_phase_, stream, stream_name);
 //     workload_();
 //   }
+//
+// Phase 20.10 (Path A, 2026-05-20): when HCTR_ROCTX=1 AND the phase is
+// non-null, also push a ROCTX range using the phase name. This makes
+// every native-tracer phase automatically visible to rocprofv3
+// --marker-trace, so a single cold-pass capture can attribute kernels
+// to every phase the native emitter knows about (eliminating overlay
+// misses caused by missing ROCTX coverage at fine-grained phase
+// sub-sites like sparse_prep MP_*/DP_*).
+//
+// Defined inline here because ScopedRange's roctx push/pop is fully
+// inlined and zero-cost when HCTR_ROCTX is off. We forward-declare
+// ScopedRange and use it via composition.
 class ScopedGpuPhase {
  public:
-  ScopedGpuPhase(GpuPhase* phase, hipStream_t stream, const std::string& stream_name)
-      : phase_(phase), stream_(stream) {
-    if (phase_) phase_->record_start(stream_, stream_name);
-  }
-  ~ScopedGpuPhase() {
-    if (phase_) phase_->record_end(stream_);
-  }
+  ScopedGpuPhase(GpuPhase* phase, hipStream_t stream, const std::string& stream_name);
+  ~ScopedGpuPhase();
   ScopedGpuPhase(const ScopedGpuPhase&) = delete;
   ScopedGpuPhase& operator=(const ScopedGpuPhase&) = delete;
 
  private:
   GpuPhase* phase_;
   hipStream_t stream_;
+  // Phase 20.10: when phase_ is non-null, push a ROCTX range with
+  // phase_->name() so the cold pass also sees the phase boundary.
+  // Heap-stored to avoid pulling hctr_tracing.hpp into this header.
+  // null when HCTR_ROCTX is off or phase_ is null.
+  void* roctx_range_;
 };
 
 }  // namespace tracing

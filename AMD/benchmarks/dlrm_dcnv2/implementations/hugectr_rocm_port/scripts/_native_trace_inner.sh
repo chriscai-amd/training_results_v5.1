@@ -13,9 +13,24 @@ apt-get install -y -qq libaio-dev libnuma-dev libtbb-dev 2>/dev/null \
 # Stage data into ramdata
 echo "=== stage data ==="
 mkdir -p /ramdata/mlperf
-cp /nfs_data/train_data.bin /ramdata/mlperf/ &
-cp /nfs_data/val_data.bin /ramdata/mlperf/ &
+# Optional partial staging (see _trace_and_convert_inner.sh for full
+# rationale). Honors HCTR_STAGE_TRAIN_GB / HCTR_STAGE_VAL_GB; unset =
+# stage whole file (preserves previous behaviour).
+stage_partial() {
+    local src=$1 dst=$2 gb=$3
+    if [ -n "$gb" ] && [ "$gb" -gt 0 ]; then
+        echo "  partial stage: head -c ${gb}G $src -> $dst"
+        dd if="$src" of="$dst" bs=1M count=$((gb * 1024)) status=none
+    else
+        cp "$src" "$dst"
+    fi
+}
+stage_partial /nfs_data/train_data.bin /ramdata/mlperf/train_data.bin \
+    "${HCTR_STAGE_TRAIN_GB:-}" &
+stage_partial /nfs_data/val_data.bin /ramdata/mlperf/val_data.bin \
+    "${HCTR_STAGE_VAL_GB:-}" &
 wait
+ls -lh /ramdata/mlperf/
 ln -sf /ramdata /criteo
 
 OUTDIR=/rps_out/native_trace_test
@@ -38,11 +53,15 @@ echo "  HCTR_NATIVE_TRACE_DEEP=${HCTR_NATIVE_TRACE_DEEP:-0}"
 export NCCL_SOCKET_IFNAME=lo
 export HCTR_USE_MULTI_HOT=1 HCTR_USE_MLPERF_CRITEO=1
 export HCTR_USE_CUDA_GRAPH="${HCTR_USE_CUDA_GRAPH:-1}"  # honor inbound env
+# Tracing default: RCCL on default stream (no rccl_emb_ar / rccl_mlp_wgrad
+# lanes). Set HCTR_DEDICATED_RCCL_STREAM=1 to match production (+3% perf).
+export HCTR_DEDICATED_RCCL_STREAM="${HCTR_DEDICATED_RCCL_STREAM:-0}"
 export HCTR_USE_SUBSAMPLED_CRITEO=1 HCTR_USE_REAL_TABLE_SIZES=1
 export HCTR_DP_SHARD_THRESH=0.008 HCTR_MEM_COMM_WORK_RATIO=9 HCTR_READER_THREADS=1
 export HCTR_ASYNC_WGRAD=0 HCTR_NGPU=8 HCTR_BATCH=55296 HCTR_EVAL_BATCH=131072
 export HCTR_EV_SIZE=128 HCTR_LR=0.004 HCTR_MEM_CAP=200
-export HCTR_PRECISION_FLAGS='--use_mixed_precision --scaler 16348'
+# scaler 1024: stable on AMD post-numerics_fix (see docs/ttt.md); 16348 NaNs.
+export HCTR_PRECISION_FLAGS='--use_mixed_precision --scaler 1024'
 export HCTR_SHARDING_PLAN=auto OMP_NUM_THREADS=8
 export HCTR_ROCTX=0  # native emitter is independent of ROCTX
 

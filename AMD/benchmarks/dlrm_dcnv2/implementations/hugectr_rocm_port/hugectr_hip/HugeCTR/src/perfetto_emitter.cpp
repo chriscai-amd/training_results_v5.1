@@ -4,14 +4,20 @@
  */
 #include <perfetto_emitter.hpp>
 
+#include <hctr_tracing.hpp>
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <cxxabi.h>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <unordered_map>
 
 namespace HugeCTR {
 namespace tracing {
@@ -46,6 +52,63 @@ std::string json_escape(const std::string& s) {
   }
   return out;
 }
+
+// Phase 20.10 (Path D, 2026-05-20): demangle a C++ ABI symbol with
+// abi::__cxa_demangle. Returns the original mangled name on failure.
+std::string demangle_symbol(const char* mangled) {
+  if (mangled == nullptr || mangled[0] == '\0') return {};
+  int status = 0;
+  char* dem = abi::__cxa_demangle(mangled, nullptr, nullptr, &status);
+  std::string out;
+  if (status == 0 && dem != nullptr) {
+    out.assign(dem);
+  } else {
+    out.assign(mangled);
+  }
+  std::free(dem);
+  return out;
+}
+
+}  // namespace
+
+// Public: exposed in the header for callers that need to build their own
+// args_json fragments with strings that may contain quotes / backslashes.
+std::string escape_for_args_json(const std::string& s) {
+  return json_escape(s);
+}
+
+// Public: resolve and cache a kernel function pointer to its demangled
+// symbol name. See header for full contract.
+std::string kernel_name_from_ptr(const void* func_ptr) {
+  if (func_ptr == nullptr) return {};
+
+  // Process-local cache: pointer-identity is stable for the lifetime of
+  // the program (kernel symbols live in the loaded image), and the same
+  // function pointer is reused across all dispatches of a given kernel.
+  static std::mutex cache_mu;
+  static std::unordered_map<const void*, std::string> cache;
+  {
+    std::lock_guard<std::mutex> lk(cache_mu);
+    auto it = cache.find(func_ptr);
+    if (it != cache.end()) return it->second;
+  }
+
+  // hipKernelNameRefByPtr is available in ROCm 5.4+. The second arg is
+  // the stream from which to derive the device context for kernel
+  // symbol resolution; nullptr means "use the current device", which
+  // is what we want for cache-on-first-launch semantics.
+  const char* raw = nullptr;
+#if defined(__HIP_PLATFORM_AMD__) || defined(HIP_VERSION)
+  raw = hipKernelNameRefByPtr(func_ptr, /*stream=*/nullptr);
+#endif
+  std::string demangled = demangle_symbol(raw);
+
+  std::lock_guard<std::mutex> lk(cache_mu);
+  cache.emplace(func_ptr, demangled);
+  return demangled;
+}
+
+namespace {
 
 // Resolve the trace output directory. Defaults to /tmp.
 std::string trace_dir() {
@@ -210,6 +273,22 @@ GpuPhase* PerfettoEmitter::register_phase(int rank, const std::string& name,
   GpuPhase* p = register_phase(rank, name);
   if (p) p->set_args_json(args_json);
   return p;
+}
+
+GpuPhase* PerfettoEmitter::register_phase_for_kernel(
+    int rank, const std::string& name, const void* func_ptr) {
+  // Resolve kernel symbol once at registration. kernel_name_from_ptr()
+  // is safe when native tracing is OFF (returns "" without touching HIP)
+  // and is internally cached, so registering many phases that share one
+  // kernel is O(1) after first lookup.
+  std::string kn = kernel_name_from_ptr(func_ptr);
+  std::string args_json;
+  if (!kn.empty()) {
+    // Build a JSON fragment WITHOUT outer braces (the format expected
+    // by GpuPhase::args_json_ / PerfettoEmitter::flush()).
+    args_json = "\"kernel\":\"" + escape_for_args_json(kn) + "\"";
+  }
+  return register_phase(rank, name, args_json);
 }
 
 void PerfettoEmitter::register_graph_event_chain(
@@ -502,6 +581,31 @@ void PerfettoEmitter::emit_host_event(int rank, const std::string& lane_name,
   ev.iter_idx = iter_idx;
   ev.args_extra = args_extra;
   emit_event(std::move(ev));
+}
+
+// Phase 20.10 (Path A, 2026-05-20): ScopedGpuPhase impl. When the phase
+// is non-null AND HCTR_ROCTX=1, also push a ROCTX range with the phase
+// name so the cold-pass rocprofv3 --marker-trace captures every native
+// phase boundary. The ScopedRange is heap-allocated to avoid pulling
+// rocprofiler-sdk-roctx headers into perfetto_emitter.hpp.
+ScopedGpuPhase::ScopedGpuPhase(GpuPhase* phase, hipStream_t stream,
+                                 const std::string& stream_name)
+    : phase_(phase), stream_(stream), roctx_range_(nullptr) {
+  if (phase_) {
+    phase_->record_start(stream_, stream_name);
+    if (roctx_enabled()) {
+      roctx_range_ = new ScopedRange(phase_->name().c_str());
+    }
+  }
+}
+
+ScopedGpuPhase::~ScopedGpuPhase() {
+  if (phase_) {
+    if (roctx_range_) {
+      delete static_cast<ScopedRange*>(roctx_range_);
+    }
+    phase_->record_end(stream_);
+  }
 }
 
 ScopedHostTimer::ScopedHostTimer(int rank, std::string lane, std::string name,

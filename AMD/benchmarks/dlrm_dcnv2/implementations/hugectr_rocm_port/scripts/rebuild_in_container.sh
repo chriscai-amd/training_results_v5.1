@@ -6,12 +6,19 @@
 #   - All ROCm libs in their newer versions
 set -eu
 
-# Install libaio if missing (needed by multi_hot async data reader).
-if ! ls /usr/include/libaio.h /usr/include/x86_64-linux-gnu/libaio.h 2>/dev/null | head -1 > /dev/null; then
-    echo "[..] installing libaio-dev"
-    apt-get update -qq 2>&1 | tail -3
-    apt-get install -y -qq libaio-dev 2>&1 | tail -3
-fi
+# Always install libaio-dev (needed by multi_hot async data reader at
+# both compile and link time). Ubuntu Noble renamed the dev package
+# to libaio1t64 in some images, so try both names. Unconditional and
+# idempotent -- apt-get is a no-op when the packages are already
+# present, and the noble container's libaio1t64 sometimes ships
+# headers but not the libaio.so symlink the linker expects.
+echo "[..] ensuring libaio-dev / libaio1t64 is installed"
+apt-get update -qq 2>&1 | tail -3
+apt-get install -y -qq libaio-dev libnuma-dev libtbb-dev 2>/dev/null \
+    || apt-get install -y -qq libaio1t64 libnuma-dev libtbb12 2>&1 | tail -1 \
+    || true
+# Sanity: linker needs either libaio.so or libaio.so.1 in the search path.
+ldconfig -p 2>/dev/null | grep -E "libaio" | head -3 || echo "(no libaio in ldconfig cache yet)"
 
 cd /workspace/hugectr_hip
 

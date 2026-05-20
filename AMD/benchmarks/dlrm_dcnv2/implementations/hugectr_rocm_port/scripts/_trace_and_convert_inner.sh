@@ -30,11 +30,30 @@ apt-get install -y -qq libaio-dev libnuma-dev libtbb-dev 2>/dev/null \
 echo "=== stage data (NFS -> tmpfs /ramdata) ==="
 mkdir -p /ramdata/mlperf
 T0=$(date +%s)
-cp /nfs_data/train_data.bin /ramdata/mlperf/ &
-cp /nfs_data/val_data.bin /ramdata/mlperf/ &
+# Optional partial staging. The training data file has grown beyond
+# what fits in tmpfs (932 GB > 512 GB tmpfs default). For a short
+# trace run we only consume ~15 iters * 55296 samples * 912 B/row
+# ~ 760 MB, so staging the full file is wasteful. Set
+#   HCTR_STAGE_TRAIN_GB=N  -- copy first N GiB of train_data.bin only
+#   HCTR_STAGE_VAL_GB=N    -- copy first N GiB of val_data.bin only
+# Unset (default): copy whole files (preserves existing behaviour).
+stage_partial() {
+    local src=$1 dst=$2 gb=$3
+    if [ -n "$gb" ] && [ "$gb" -gt 0 ]; then
+        echo "  partial stage: head -c ${gb}G $src -> $dst"
+        dd if="$src" of="$dst" bs=1M count=$((gb * 1024)) status=none
+    else
+        cp "$src" "$dst"
+    fi
+}
+stage_partial /nfs_data/train_data.bin /ramdata/mlperf/train_data.bin \
+    "${HCTR_STAGE_TRAIN_GB:-}" &
+stage_partial /nfs_data/val_data.bin /ramdata/mlperf/val_data.bin \
+    "${HCTR_STAGE_VAL_GB:-}" &
 wait
 T1=$(date +%s)
 echo "=== staging done in $((T1-T0))s ==="
+ls -lh /ramdata/mlperf/
 ln -sf /ramdata /criteo
 
 TRACE_DIR=/rps_out/$TRACE_SUBDIR
@@ -84,6 +103,20 @@ export TENSILE_DB=0xff
 # Scheduleable run, plus an "iter_N" range around the whole iter in
 # model.cpp::train. Free if rocprofv3 is not attached.
 export HCTR_ROCTX=${HCTR_ROCTX:-1}
+
+# Phase 20.10 (Path A, 2026-05-20): also enable the native tracer so
+# every GpuPhase registered by HCTR scheduleables / data_distributor /
+# sparse_data_distribution_op fires its ScopedGpuPhase, which (since
+# Phase 20.10) automatically pushes a matching ROCTX range visible to
+# rocprofv3 --marker-trace. This closes the cold-pass overlay coverage
+# gap (previously: sparse_prep MP_*/DP_* phases lacked ROCTX coverage
+# because no ScopedRange was added at those C++ sites; now they all
+# inherit ROCTX via ScopedGpuPhase). The native JSON written to /tmp
+# inside the container is unused -- only the rocprofv3 CSV outputs
+# matter for the cold pass.
+export HCTR_NATIVE_TRACE=${HCTR_NATIVE_TRACE:-1}
+export HCTR_NATIVE_TRACE_DETAIL=${HCTR_NATIVE_TRACE_DETAIL:-2}
+export HCTR_NATIVE_TRACE_DIR=${HCTR_NATIVE_TRACE_DIR:-/tmp}
 
 HCTR_PROFILE_PREFIX="rocprofv3 \
     --kernel-trace \
