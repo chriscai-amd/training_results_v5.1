@@ -994,6 +994,20 @@ void GemmFunctor<T>::operator()(const float alpha, const T* mat_a, const T* mat_
     // because hipblasCreate is illegal during HIP graph capture.
     hipblasHandle_t blas_handle = get_or_create_blas_handle_for_current_device();
     HCTR_LIB_THROW(hipblasSetStream(blas_handle, stream));
+    // Phase TTT.cvg (2026-05-19): hipblasGemmEx is in-place: D = alpha*A*B
+    // + beta*D. It uses mat_d as BOTH the input C and the output D. When
+    // mat_c != mat_d (out-of-place GEMM, e.g. MC v2 dY_prev GEMM has
+    // mat_c=grad_tensors[i+1] and mat_d=grad_tensors[i]), we must copy
+    // mat_c -> mat_d BEFORE the GEMM so the beta*C term sees the right
+    // accumulator. Without this, the prior junk in mat_d gets used as the
+    // C input and the gradient chain is corrupted -- root cause of the
+    // training plateau (loss 0.28, AUC 0.5) on AMD vs NV.
+    if (mat_c != mat_d && beta != 0.0f) {
+      size_t copy_bytes = sizeof(T) * static_cast<size_t>(cublas_desc.saved_ldc) *
+                          static_cast<size_t>(cublas_desc.saved_n);
+      HCTR_LIB_THROW(hipMemcpyAsync(mat_d, mat_c, copy_bytes,
+                                    hipMemcpyDeviceToDevice, stream));
+    }
     // Use hipblasGemmEx so the FP16 path also gets FP32 accumulation
     // (hipblasHgemm accumulates in FP16 -> overflow/NaN at non-trivial scale).
     if constexpr (std::is_same<T, float>::value) {

@@ -488,7 +488,16 @@ model.add(
 )
 # Real MultiCross v2 (DCN-v2 cross network). Set HCTR_USE_INNERPRODUCT_INSTEAD
 # to fall back to the InnerProduct substitute for diagnostic A/B testing.
-if os.environ.get("HCTR_USE_INNERPRODUCT_INSTEAD", "0") == "1":
+# Set HCTR_SKIP_MC=1 to feed concat1 directly to top MLP (bypass MC).
+if os.environ.get("HCTR_SKIP_MC", "0") == "1":
+    # Identity reshape to alias concat1 as interaction1 with same dim.
+    _concat_dim = 26 * args.ev_size + 128
+    model.add(hugectr.DenseLayer(
+        layer_type=hugectr.Layer_t.Reshape,
+        bottom_names=["concat1"], top_names=["interaction1"],
+        leading_dim=_concat_dim,
+    ))
+elif os.environ.get("HCTR_USE_INNERPRODUCT_INSTEAD", "0") == "1":
     _concat_dim = 26 * args.ev_size + 128
     model.add(hugectr.DenseLayer(
         layer_type=hugectr.Layer_t.InnerProduct,
