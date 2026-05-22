@@ -38,7 +38,14 @@ rm -rf "$OUTDIR"; mkdir -p "$OUTDIR"; chmod 777 "$OUTDIR"
 
 cd /workspace/runtime_test/nvidia_frontend
 export HCTR_MAX_ITER=25
-export HCTR_DISPLAY=5
+# Phase 21.0 (2026-05-21): HCTR_DISPLAY must NOT land on any iter inside
+# the trace window. Each display point forces a d2h loss-tensor copy and
+# host-side print, which adds ~0.5 ms to that iter and distorts the
+# steady-state comparison. Default to a value larger than MAX_ITER so
+# no display fires in the captured window (loss is still recorded; just
+# not printed mid-run). Override via env if you actually need per-iter
+# prints (e.g. for loss debugging).
+export HCTR_DISPLAY="${HCTR_DISPLAY:-999}"
 # Phase 20.7 fix: flush auto-fires at the LAST traced iter (no mid-trace
 # blocking I/O). FLUSH_EVERY is now off-by-default; leave unset.
 # Default: trace iters 5..10 (5-iter window after warmup)
@@ -50,6 +57,9 @@ export HCTR_NATIVE_TRACE_END="${HCTR_NATIVE_TRACE_END:-10}"
 echo "  HCTR_NATIVE_TRACE_BEGIN=$HCTR_NATIVE_TRACE_BEGIN"
 echo "  HCTR_NATIVE_TRACE_END=$HCTR_NATIVE_TRACE_END"
 echo "  HCTR_NATIVE_TRACE_DEEP=${HCTR_NATIVE_TRACE_DEEP:-0}"
+echo "  HCTR_NATIVE_TRACE_DETAIL=${HCTR_NATIVE_TRACE_DETAIL:-2}"
+echo "  HCTR_NATIVE_TRACE_GRAPH_NODES=${HCTR_NATIVE_TRACE_GRAPH_NODES:-0}"
+echo "  HCTR_NATIVE_TRACE_GRAPH_CLOCK=${HCTR_NATIVE_TRACE_GRAPH_CLOCK:-0}"
 export NCCL_SOCKET_IFNAME=lo
 export HCTR_USE_MULTI_HOT=1 HCTR_USE_MLPERF_CRITEO=1
 export HCTR_USE_CUDA_GRAPH="${HCTR_USE_CUDA_GRAPH:-1}"  # honor inbound env

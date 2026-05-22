@@ -17,12 +17,45 @@
 #   HCTR_STAGE_TRAIN_GB / HCTR_STAGE_VAL_GB  partial-stage knobs
 #   HCTR_USE_CUDA_GRAPH  (default 1)
 #   HCTR_DEDICATED_RCCL_STREAM  (default 0 for tracing; 1 in production)
+#   EXHAUSTIVE=1  one-shot deep capture (DEEP=1, DETAIL=2, GRAPH_NODES=1,
+#                 GRAPH_CLOCK=1, CUDA_GRAPH off). Use to harvest a
+#                 phase->kernel map for later light traces. NOT a perf
+#                 measurement -- iter wall inflates ~30-40%. Output dir is
+#                 suffixed _exhaustive; the saved phase_kernel_map.json
+#                 inside is the artifact to reuse via --load-map.
 set -e
 
 JOBID=${1:?"usage: $0 <jobid> <begin_iter> <end_iter> [tag]"}
 BEGIN_ITER=${2:?"begin_iter (0-based, where to start tracing) required"}
 END_ITER=${3:?"end_iter (exclusive) required"}
 TAG=${4:-native_iter${BEGIN_ITER}_${END_ITER}}
+
+# EXHAUSTIVE=1: maximum-detail capture. Forces DEEP=1 (no hipGraph capture
+# -> per-phase ROCTX ranges visible on the network), DETAIL=2 (every
+# event), GRAPH_NODES=1 (per-graph-node events for any remaining
+# hipGraph), GRAPH_CLOCK=1 (in-graph clock-writer kernels for per-kernel
+# timing). Tag is suffixed _exhaustive so the dir is distinguishable.
+EXHAUSTIVE=${EXHAUSTIVE:-0}
+if [ "$EXHAUSTIVE" = "1" ]; then
+    case "$TAG" in
+        *exhaustive*) ;;  # already labelled
+        *) TAG="${TAG}_exhaustive" ;;
+    esac
+    export HCTR_NATIVE_TRACE_DEEP=1
+    export HCTR_NATIVE_TRACE_DETAIL=2
+    export HCTR_NATIVE_TRACE_GRAPH_NODES=1
+    export HCTR_NATIVE_TRACE_GRAPH_CLOCK=1
+    # DEEP=1 forces use_graph=false in pipeline.cpp; mirror it on the env
+    # so any downstream check sees the same state.
+    export HCTR_USE_CUDA_GRAPH=0
+    echo "##########################################################"
+    echo "# EXHAUSTIVE TRACE MODE -- not a perf measurement.       #"
+    echo "#   DEEP=1, DETAIL=2, GRAPH_NODES=1, GRAPH_CLOCK=1.      #"
+    echo "#   hipGraph disabled. Expect ~30-40% iter-wall inflation.#"
+    echo "#   Output dir tagged _exhaustive. Reuse the resulting   #"
+    echo "#   phase_kernel_map.json on light traces via --load-map.#"
+    echo "##########################################################"
+fi
 
 N_ITERS=$((END_ITER - BEGIN_ITER))
 if [ "$N_ITERS" -le 0 ]; then
@@ -65,6 +98,9 @@ docker run --rm --network=host \
     -e HCTR_NATIVE_TRACE_BEGIN='$BEGIN_ITER' \
     -e HCTR_NATIVE_TRACE_END='$END_ITER' \
     -e HCTR_NATIVE_TRACE_DETAIL='${HCTR_NATIVE_TRACE_DETAIL:-2}' \
+    -e HCTR_NATIVE_TRACE_DEEP='${HCTR_NATIVE_TRACE_DEEP:-0}' \
+    -e HCTR_NATIVE_TRACE_GRAPH_NODES='${HCTR_NATIVE_TRACE_GRAPH_NODES:-0}' \
+    -e HCTR_NATIVE_TRACE_GRAPH_CLOCK='${HCTR_NATIVE_TRACE_GRAPH_CLOCK:-0}' \
     -e HCTR_USE_CUDA_GRAPH='${HCTR_USE_CUDA_GRAPH:-1}' \
     -e HCTR_DEDICATED_RCCL_STREAM='${HCTR_DEDICATED_RCCL_STREAM:-0}' \
     -e HCTR_STAGE_TRAIN_GB='${HCTR_STAGE_TRAIN_GB:-}' \
@@ -89,9 +125,20 @@ echo
 echo "--- per-rank JSONs in $OUTDIR_HOST ---"
 ls -lh "$OUTDIR_HOST"/hctr_native_trace_*.json 2>/dev/null
 echo
-echo "Next step: overlay rocprofv3 metadata onto these traces:"
+echo "Next step: overlay rocprofv3 metadata + auto-merge into one 8-GPU trace"
+echo "(the overlay script now calls merge_perfetto_traces.py and drops the"
+echo " first and last iter to avoid hipEvent staleness / end-of-window):"
 echo "  bash scripts/native_overlay_all_ranks.sh \\"
 echo "      $OUTDIR_HOST \\"
-echo "      /home/chcai/rps_out/trace_5iter_short/iter5_10 \\"
+echo "      /home/chcai/rps_out/trace_cold_v2/iter5_10 \\"
 echo "      $BEGIN_ITER"
+echo "Output: $OUTDIR_HOST/overlay_all8gpus_trimmed.json"
+if [ "$EXHAUSTIVE" = "1" ]; then
+    echo
+    echo "EXHAUSTIVE mode hint: after overlay the saved map lives at"
+    echo "  $OUTDIR_HOST/phase_kernel_map.json"
+    echo "Reuse it on subsequent light traces by setting LOAD_MAP, e.g.:"
+    echo "  LOAD_MAP=$OUTDIR_HOST/phase_kernel_map.json \\"
+    echo "    bash scripts/native_overlay_all_ranks.sh <light_dir> - $BEGIN_ITER"
+fi
 exit $EXIT

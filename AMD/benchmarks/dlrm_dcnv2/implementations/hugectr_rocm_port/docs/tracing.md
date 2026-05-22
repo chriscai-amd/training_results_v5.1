@@ -161,6 +161,8 @@ The first in-window iter (default `iter_5`) often shows **inflated** phase durat
 | `HCTR_STAGE_TRAIN_GB` / `HCTR_STAGE_VAL_GB` | full copy | Partial staging for short runs |
 | `HCTR_DEDICATED_RCCL_STREAM` | `0` in `_native_trace_inner.sh` | `1` in production |
 | `HCTR_USE_CUDA_GRAPH` | `1` | HIP graph capture for network |
+| `EXHAUSTIVE` | `0` | `1` in `native_trace.sh` forces DEEP/DETAIL=2/GRAPH_NODES/GRAPH_CLOCK on and tags output dir `_exhaustive`; saved map is reusable via `LOAD_MAP` |
+| `LOAD_MAP` | unset | Path to a previously saved `phase_kernel_map.json`; bypasses cold-pass scan in `native_overlay_all_ranks.sh` |
 
 ## Troubleshooting
 
@@ -176,6 +178,42 @@ The first in-window iter (default `iter_5`) often shows **inflated** phase durat
 | `Loss cannot converge` on native trace | Use `scaler 1024` not `16348` (see `docs/ttt.md`) |
 | Iter 5 looks ~5× longer than iter 6+ | Warmup hipEvent staleness; use `HCTR_NATIVE_TRACE_BEGIN=6` or skip iter 5 in analysis |
 | `102 kernels (top: …)` still showing | Re-run overlay (explosion on by default) or old JSON |
+
+## EXHAUSTIVE mode → light reuse
+
+For deep one-shot capture (kernel-level inside the captured graph,
+per-phase ROCTX ranges), set `EXHAUSTIVE=1` on `native_trace.sh`:
+
+```sh
+EXHAUSTIVE=1 bash scripts/native_trace.sh <jobid> 5 11 deep_baseline
+# auto-tags output dir _exhaustive; sets DEEP=1, DETAIL=2,
+# GRAPH_NODES=1, GRAPH_CLOCK=1; disables hipGraph
+# (~30-40 % iter-wall inflation -- do NOT compare wall to production).
+```
+
+Then overlay as usual; the joiner writes
+`<outdir>/phase_kernel_map.json` (rich shape) plus
+`phase_kernel_map.legacy.json` (flat shape, back-compat).
+
+Reuse the saved map on a subsequent **light** native trace -- no
+cold-pass rerun needed:
+
+```sh
+LOAD_MAP=/home/chcai/rps_out/native_deep_baseline_exhaustive/phase_kernel_map.json \
+    bash scripts/native_overlay_all_ranks.sh \
+        /home/chcai/rps_out/native_light_trial \
+        - 5
+```
+
+`COLD_PREFIX` is passed as `-` (ignored when `LOAD_MAP` is set). The same
+phase→kernel mapping is applied to the light trace, so its [graph]
+network blob explodes into per-kernel slices with names harvested from
+the exhaustive run. This gives B200-comparable kernel-level slices on a
+~+3 % light trace without paying the rocprofv3 tax every time.
+
+The mapping is keyed by HCTR phase name (stable across runs of the same
+build), so re-harvest after rebuilding the C++ tracer or changing the
+network topology / sharding plan.
 
 ## See also
 

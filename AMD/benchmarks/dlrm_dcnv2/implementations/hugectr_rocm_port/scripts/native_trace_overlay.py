@@ -858,8 +858,10 @@ def main():
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--native-json", required=True,
                     help="Path to HCTR native trace JSON for ONE rank")
-    ap.add_argument("--cold-prefix", required=True,
-                    help="rocprofv3 cold-pass output prefix (no _kernel_trace.csv)")
+    ap.add_argument("--cold-prefix", default=None,
+                    help="rocprofv3 cold-pass output prefix "
+                         "(no _kernel_trace.csv). Required unless --load-map "
+                         "is given.")
     ap.add_argument("--gpu", type=int, default=0,
                     help="GPU index inside the cold-pass run (default 0)")
     ap.add_argument("--cold-iter", type=int, default=5,
@@ -868,8 +870,21 @@ def main():
     ap.add_argument("--out", default=None,
                     help="Output JSON path (default: <native-json>.overlay.json)")
     ap.add_argument("--dump-map", default=None,
-                    help="Also write the phase->kernel mapping as JSON "
-                         "(useful for caching / cross-run reuse)")
+                    help="Also write the phase->kernel mapping as JSON. "
+                         "Output is the rich shape "
+                         "{mapping:{...}, phase_kernel_lists:{...}} so it can "
+                         "be replayed via --load-map. (A sibling "
+                         "<dump-map>.legacy.json is also written in the old "
+                         "flat shape for backward compatibility.)")
+    ap.add_argument("--load-map", default=None,
+                    help="Skip the cold-pass scan entirely and load a "
+                         "previously saved map from JSON. Use this on light "
+                         "traces to reuse the phase/kernel mapping captured "
+                         "by an earlier EXHAUSTIVE run (see "
+                         "native_trace.sh EXHAUSTIVE=1). Accepts either the "
+                         "rich shape written by --dump-map or the legacy "
+                         "flat mapping shape (graph explosion is disabled "
+                         "in the flat case).")
     ap.add_argument("--no-explode-graph", action="store_true",
                     help="Keep a single [graph] network aggregate slice")
     ap.add_argument("--no-explode-prefetch", action="store_true",
@@ -889,16 +904,49 @@ def main():
         else:
             out_path = args.native_json + ".overlay.json"
 
-    sys.stderr.write(
-        f"[overlay] cold-pass: {args.cold_prefix}_*.csv (gpu {args.gpu}, "
-        f"iter {args.cold_iter})\n")
-    mapping, phase_kernel_lists = load_cold_pass(
-        args.cold_prefix, args.gpu, args.cold_iter)
+    if args.load_map:
+        if args.cold_prefix:
+            sys.stderr.write(
+                "[overlay] both --load-map and --cold-prefix given; "
+                "using --load-map (cold pass skipped)\n")
+        sys.stderr.write(f"[overlay] loading saved map: {args.load_map}\n")
+        raw = json.load(open(args.load_map))
+        if isinstance(raw, dict) and "mapping" in raw and \
+                "phase_kernel_lists" in raw:
+            mapping = raw["mapping"]
+            phase_kernel_lists = raw["phase_kernel_lists"]
+        else:
+            # Legacy flat shape: just {phase_name -> kernel_info}. We can
+            # still tag slices, but multi-kernel phase explosion will be
+            # a no-op (no per-kernel list).
+            sys.stderr.write(
+                "  legacy flat map -- per-kernel phase explosion disabled\n")
+            mapping = raw
+            phase_kernel_lists = {}
+    else:
+        if not args.cold_prefix:
+            sys.exit("ERROR: --cold-prefix is required unless --load-map is "
+                     "given")
+        sys.stderr.write(
+            f"[overlay] cold-pass: {args.cold_prefix}_*.csv (gpu {args.gpu}, "
+            f"iter {args.cold_iter})\n")
+        mapping, phase_kernel_lists = load_cold_pass(
+            args.cold_prefix, args.gpu, args.cold_iter)
 
     if args.dump_map:
         with open(args.dump_map, "w") as f:
+            json.dump({"mapping": mapping,
+                       "phase_kernel_lists": phase_kernel_lists},
+                      f, indent=2)
+        sys.stderr.write(f"  dumped rich map to {args.dump_map}\n")
+        legacy_path = args.dump_map
+        if legacy_path.endswith(".json"):
+            legacy_path = legacy_path[:-5] + ".legacy.json"
+        else:
+            legacy_path = legacy_path + ".legacy.json"
+        with open(legacy_path, "w") as f:
             json.dump(mapping, f, indent=2)
-        sys.stderr.write(f"  dumped mapping to {args.dump_map}\n")
+        sys.stderr.write(f"  dumped flat map to {legacy_path}\n")
 
     sys.stderr.write(f"[overlay] applying to {args.native_json}\n")
     no_explode = args.no_explode_phases
