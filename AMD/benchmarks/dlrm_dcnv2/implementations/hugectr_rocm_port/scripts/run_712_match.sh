@@ -9,8 +9,8 @@
 set -eu
 
 
-export LD_LIBRARY_PATH=/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/apps/chcai/build_rocm712/lib
-export PYTHONPATH=/apps/chcai/build_rocm712/lib:${PYTHONPATH:-}
+export LD_LIBRARY_PATH=${LOCAL_LIB:+$LOCAL_LIB:}/opt/rocm/lib:/opt/rocm/lib/llvm/lib:/apps/chcai/build_rocm712/lib
+export PYTHONPATH=${LOCAL_LIB:+$LOCAL_LIB:}/apps/chcai/build_rocm712/lib:${PYTHONPATH:-}
 
 # ROCm port: RCCL tunings that bumped sustained perf from 11.76 -> 11.88 M sps
 # at NV's batch (55,296) on /dev/shm. AMD's RCCL default is Simple proto, which

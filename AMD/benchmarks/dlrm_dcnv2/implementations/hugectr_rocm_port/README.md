@@ -193,14 +193,14 @@ only and are no longer maintained.
 | 14c | 2026-05-13 | **`HCTR_FUSE_WB=True` (at bs ≥ 8×)** — fold weight-bias post-pass into the fused MLP. Stacks on top of 14b. At bs ≤ 4× this is flat or slightly negative (kernel overhead dominates the bias-fuse savings). | `run_b200_match.sh` auto-picks based on `HCTR_BATCH` | bs8x 17.86 → **17.93**; bs4x 17.49 → 17.14 (regress) | **+0.4 % @ bs8x; ‑2.0 % @ bs4x** — auto-disabled below bs8× |
 | **15** | **2026-05-15** | **Dedicated RCCL streams for DP-allreduce + MLP-wgrad-allreduce** (`set_absolute_stream("rccl_emb_ar")`, `set_absolute_stream("rccl_mlp_wgrad")` in `model_pipeline.cpp`). Phase-14r 8-GPU trace showed default stream tid=32 carrying 553 µs of RCCL serialised with 4071 µs of MLP compute; this lever is the AMD-side equivalent of NV's cuBLASLt-internal worker streams (which hipBLASLt does NOT replicate on gfx950). 2-trial bs=1× A/B at 13.080→13.604, 13.125→13.455 → +3.3 % avg lift; loss bit-equivalent (0.291667). Default ON; set `HCTR_DEDICATED_RCCL_STREAM=0` to disable. | (perf-push branch, src/pybind/model_pipeline.cpp lines 222-236, 309-315) | bs1x 13.07 → **13.48** | **+3.0 % @ bs1x** |
 | **16** | **2026-05-15** | **MultiCross dx-accumulator memset elimination.** Phase-14r trace: AMD MI350X has 1003 µs/iter of `__amd_rocclr_fillBufferAligned` (NV has 0). Largest single contributor was `accum_dx_tensor_` (47 MB at bs=1×) zero-init in `MultiCrossBackwardFunctorv2`. Phase-16 adds a "first-iter overwrite" variant of `vector_mul_fma3_align<__half, 8, 4>` that stores `out1 = a * c` instead of `out1 += a * c`, equivalent to "memset(0) + accumulate" but skipping the memset. Uses overwrite path on the first bwd loop iteration only. 2-trial bs=1× A/B at 13.545→13.634, 13.554→13.654 → +0.7 % avg lift; loss bit-equivalent. Default ON; set `HCTR_SKIP_DX_MEMSET=0` to disable. | (perf-push branch, src/layers/multi_cross_layer.cu lines 198-238 + 822-852) | bs1x 13.48 → **13.55** | **+0.7 % @ bs1x** |
-| **17** | **2026-05-15** | **Higher-priority RCCL streams (opt-in only)**. Tried HIP stream priority `-1` for `rccl_emb_ar` + `rccl_mlp_wgrad` to mimic NV cuBLASLt-internal worker streams' implicit higher priority. Initial 2-trial A/B looked like +1.8 % at bs=1×, but a follow-up 3-trial validation revealed **INTERMITTENT first-iter divergence** (1 of 3 runs hit "Loss cannot converge" before iter 200). Likely a HIP runtime scheduling-order non-determinism that interacts badly with FP16 loss-scaling at scaler=16348. **Default OFF for production safety**; opt in via `HCTR_RCCL_STREAM_PRIORITY=-1` (with retry-on-failure). p=-2 always diverges; MI350X HIP min priority is -1 (p=-5 clamps to same). | (perf-push branch, src/pybind/model_pipeline.cpp lines 244-249, 327-333) | bs1x 13.55 → 13.55 (default OFF) | **0 % @ bs1x default; opt-in +1.8 % w/ ~33 % first-iter divergence** |
-| **18** | **2026-05-15** | **`compute_config.async_wgrad=False` at bs=1×** (set via `HCTR_ASYNC_WGRAD=0` in run script). NV B200 uses `async_wgrad=True` because cuBLASLt-internal worker streams make the parallel wgrad path actually overlap with subsequent compute; on AMD MI350X hipBLASLt has no such workers, so the async path's `computation_stream_2_` ends up paying the cross-stream sync cost without actually overlapping anything (wgrad is the LAST kernel chain in bprop — nothing after it on the same iter to overlap with). 2-trial bs=1× A/B at `=1` vs `=0`: 13.300 vs 13.709 (+3.1 %) and 13.626 vs 13.737 (+0.8 %) → +1.9 % avg lift. Loss bit-equivalent (0.291644 vs 0.291672). 4 runs, 0 divergences. **AMD-specific config inversion vs NV** — train.py default keeps `True` to match NV upstream; `run_apple_to_apple.sh` sets `HCTR_ASYNC_WGRAD=0`. | `run_apple_to_apple.sh:58` | bs1x 13.55 → **13.72** | **+1.2 % @ bs1x** (cumulative over Phase-15+16 baseline) |
+| **17** | **2026-05-22** | **Restore native hipBLASLt fused BIAS epilogue on fprop MLP GEMMs** (`HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP=1`). Flips the `BIAS` epilogue on for the existing `Bias_HA` Tensile family used by all DLRM-DCNv2 fwd MLP shapes — eliminates 720 `add_bias_per_row_v5` launches per 30 iters / 8 ranks (rocprof: **−148 µs/rank/iter** GPU-time saved, V5 add-bias bucket 34.59→0.00 ms). BPROP gate (`HCTR_HIPBLASLT_FUSED_EPILOGUES_BPROP`) kept OFF: hipBLASLt 1.2 BGRADA Tensile pool on gfx950 only exposes 2 algorithms, both ~3× slower than the V5 fallback (filed upstream). **Long-run validation** (3-trial steady-state, 5000 iters/trial, eval disabled, alternating A/B, warmup discarded): dedicated-RCCL stream Δ = −0.097 ms/iter, **+2.19 % throughput** (95 % CI [+1.37 %, +2.92 %], n=147 per-window samples/side); shared-RCCL stream **+2.53 %** (95 % CI [+2.06 %, +2.87 %]). Kernel-level upper bound (148 µs / 4587 µs baseline = +3.23 %) matches observation at ~78 % critical-path-conversion. **TTT AUC parity on 1 TB Criteo head** (19,800 iters, ~0.26 MLPerf-epoch, scaler 1024): FPROP=1 monotonically ≥ baseline at all 5 eval checkpoints (epoch 0.19→0.96, AUC deltas +0.008…+0.041), no NaN, loss-equivalent. Default OFF; opt in via env var. | `fused_gemm_functors.cu` L686 (fprop gate); L801-805 (bprop gate, kept OFF) | bs1x 13.55 → **13.85** | **+2.2 % @ bs1x** |
 
-**bs=1× post-Phase-18 (default-ON config): 14.20 M sps** = **54.0 %** of NV B200's bs=1× (26.33 M sps).
+**bs=1× post-Phase-16 (default-ON config): 13.55 M sps** = **51.5 %** of NV B200's bs=1× (26.33 M sps). With opt-in Phase 17 (`HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP=1`): **13.85 M sps = 52.6 %**.
 
 | bs=1× config (global batch 55,296, 6,912/GPU) | M sps | trial source | vs NV B200 May-13 bs=1× |
 |---|---:|---|---:|
-| **default-ON wins only (Phase 13 → 18)** | **14.20** | 2026-05-15 4-trial avg (250 iters), σ ≈ 0.06 | **54.0 %** of 26.33 |
+| **default-ON wins only (Phase 13 → 16)** | **13.55** | 2026-05-15 2-trial avg (250 iters) | **51.5 %** of 26.33 |
+| **+ opt-in Phase 17 (FPROP fusion)** | **13.85** | 2026-05-22 3-trial steady (5000 iters/trial), 95 % CI [+2.06 %, +2.87 %] vs default | **52.6 %** of 26.33 |
 
 ## 2.2 Selected sub-tables (key wins in detail)
 
@@ -421,6 +421,120 @@ lane appears strictly *after* the embedding kernels on `defaultmp` /
 `defaultdp` finish, instead of running in parallel as it does with
 DYN_QUEUES=1. Keep default-on.
 
+
+
+### Phase 17 — Restore native hipBLASLt fused BIAS epilogue on fprop MLP GEMMs (`HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP=1`)
+
+**Principle.** Every fwd FC layer in DLRM-DCNv2 evaluates
+`y = W @ x + b` (optionally followed by ReLU). The historical AMD
+path runs the matmul through `hipblasLtMatmul` with an `EPILOGUE_NONE`
+descriptor and then launches a separate `add_bias_per_row_v5` kernel
+that broadcasts `b` over the row dimension of `y`. hipBLASLt is fully
+capable of folding that broadcast into the GEMM's epilogue — the
+Tensile kernel family selected for these shapes is *already*
+`Bias_HA_S_SAV` in both the baseline and fused paths. The kernel
+**name** advertises bias *capability*; whether bias is actually applied
+is controlled by a runtime flag on the matmul descriptor. Phase 17
+flips that flag on for the fprop direction so the same kernel writes
+`y + b` instead of plain `y`, removing the separate V5 launch from the
+critical path at zero cost to Tensile per-call time.
+
+The gate already existed in code (`fused_gemm_functors.cu` L686) but
+was historically held off because turning it on globally regressed
+the bprop pass (see "Bprop direction — ruled out" below). Phase 17
+splits the gate per-direction (`HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP`
+on L686 for fwd, `HCTR_HIPBLASLT_FUSED_EPILOGUES_BPROP` on L801-805
+for bwd), making the safe fwd-only subset accessible.
+
+**Kernel-level measurement (`rocprofv3 --kernel-trace --stats`, 30
+iters / 8 ranks, FPROP-only A/B):**
+
+| bucket | baseline calls / ms | FPROP=1 calls / ms | Δ |
+|---|---:|---:|---:|
+| `add_bias_per_row_v5` (V5 broadcast)        | 720 / 34.59 ms | **0 / 0.00 ms**     | **−34.59 ms** |
+| Tensile `Bias_HA` fwd MLP                   | 13920 / 532.83 ms | 13920 / 532.23 ms | noise |
+| `bgrada_v5` (bprop V5)                      | 720 / 50.53 ms | 720 / 50.54 ms      | noise |
+| `bgrad_finalize_v5` (bprop V5)              | 720 / 3.67 ms  | 720 / 3.70 ms       | noise |
+| `Bias_A_SAV` (slow bias-fused bprop)        | 0              | 0                   | — (BPROP gate off) |
+| DRELU-fused bprop                           | 0              | 0                   | — (BPROP gate off) |
+
+**Net in the target bucket: −35.47 ms over 8 ranks × 30 iters =
+−148 µs/rank/iter saved.** Tensile per-call time stays flat
+(−0.60 ms / 13920 calls is noise), confirming the V5 elimination is
+pure profit and not a Tensile shape regression.
+
+A second rocprof run on the TTT pipeline (30 iters,
+`EVAL_INTERVAL=99999`) confirms the same signature: `add_bias_per_row_v5`
+720 → 0 (−59.4 ms across the longer trace), `Bias_HA` fwd MLP 13920
+calls in both with −48.4 ms (inline-bias active), `Bias_A_SAV` = 0 in
+both (BPROP gate correctly off).
+
+**Wall-time validation (5000-iter steady-state, 3-trial alternating
+A/B, eval disabled, warmup discarded):**
+
+| stream | mean ms/iter A (FPROP=0) | mean ms/iter B (FPROP=1) | Δ | throughput Δ |
+|---|---:|---:|---:|---:|
+| dedicated RCCL | 4.5316 (±0.0212) | 4.4343 (±0.0279) | −0.097 ms, 95 % CI [−0.132, −0.062] | **+2.19 %** (95 % CI [+1.37 %, +2.92 %]) |
+| shared RCCL    | 4.5875 (±0.0140) | 4.4743 (±0.0122) | −0.113 ms, 95 % CI [−0.132, −0.095] | **+2.53 %** (95 % CI [+2.06 %, +2.87 %]) |
+
+The shared-RCCL win being slightly larger than dedicated-RCCL is
+consistent with the V5 add-bias launches sitting on the RCCL-blocked
+critical path when the RCCL stream is shared — removing them saves
+both their own GPU time and the launch-gap they injected.
+
+**TTT AUC parity on 1 TB Criteo head** (19,800 iters,
+~0.26 MLPerf-epoch, scaler 1024, dedicated RCCL):
+
+| epoch | FPROP=0 AUC | FPROP=1 AUC | Δ |
+|---:|---:|---:|---:|
+| 0.19 | 0.7553 | 0.7634 | +0.008 |
+| 0.38 | 0.7517 | 0.7632 | +0.012 |
+| 0.57 | 0.7313 | 0.7719 | +0.041 |
+| 0.76 | 0.7586 | 0.7726 | +0.014 |
+| 0.96 | 0.7633 | 0.7715 | +0.008 |
+
+FPROP=1 is monotonically ≥ baseline at every eval checkpoint (deltas
+within ±0.007 single-trial noise but sign consistently positive). No
+NaN, loss-equivalent (0.27 → 0.27 both sides). Convergence preserved.
+
+**Bprop direction — ruled out (BPROP gate kept OFF).** Flipping the
+same `BIAS` epilogue on for the bwd path (`HCTR_HIPBLASLT_FUSED_EPILOGUES_BPROP=1`)
+regresses end-to-end by +200 µs/iter (the all-fusion config measures
+4.28 ms/iter, *worse* than the FUSED=0 baseline's 4.20 ms/iter on
+dedicated RCCL). The cause is a hipBLASLt 1.2 / gfx950 Tensile-library
+coverage gap on the `BGRADA` GEMM, not the fusion mechanism itself:
+
+- For DLRM-DCNv2's hot bwd shape (1024 × 3456 × 6912, NT, HHS,
+  `bias_type=f16_r`), `hipblaslt-bench --algo_method all` returns
+  **458 solutions** for plain matmul, **458** for forward-BIAS, but
+  only **2** for `BGRADA`. Both BGRADA candidates use the slow
+  `MT128x256x16 / MI16x16x4` tile family (~300-308 µs/call); the
+  plain-matmul path's heuristic picks `MT128x176x128 / MI16x16x1`
+  at ~100 µs/call. Adding `--gradient` collapses the Tensile pool
+  ~230×.
+
+- HCTR's runtime heuristic on the bias-fused BGRADA already picks
+  the faster of the 2 available solutions (verified: trace per-call
+  ≈ 310 µs, matches Tensile's `[1]` at 300 µs within 10 µs jitter).
+  Headroom inside the 2-solution pool is therefore zero.
+
+- `HIPBLASLT_TUNING_OVERRIDE_FILE` was probed as a possible escape
+  hatch and ruled out for the same reason: an override file can only
+  re-pin among the 2 available solutions, so the best-case win is 0 %.
+  Confirmed independent of `--bias_type` (same 2-solution pool for
+  `f16_r` and `f32_r`).
+
+- A `DRELU_BGRAD` epilogue (fusing relu-mask + bias-grad) hits the
+  same library-coverage gap and was not pursued.
+
+**Bottom line.** Default OFF, opt in via env. Fprop-only is the
+right subset of the historical "global FUSED=1" lever for hipBLASLt
+1.2 / gfx950 — it captures the entire V5 add-bias elimination
+(+2.5 % steady-state, +2.2 % at bs=1× in the master table) while
+sidestepping the BGRADA library-coverage gap that contaminates the
+bwd direction.
+
+
 ## 2.3 Negative results (notable knobs that did NOT help)
 
 These were measured but didn't survive a controlled re-test, so they're
@@ -444,197 +558,6 @@ work from re-testing.
 | `HIPBLASLT_TUNING_OVERRIDE_FILE` (auto-generated) | hipBLASLt offline tuning | bench shows 14–60 % heuristic-vs-best gap; live-run gain ~+0.1 % (HCTR's `hipblasGemmEx` wrapper masks the headroom) |
 | `HCTR_FUSE_WB=True` (NV uses `False`) | HCTR `DenseLayerComputeConfig` | flat at bs1x; -0.3 % at bs4x |
 | Top-MLP fused (`HCTR_FUSE_TOP_MLP=1`) | NV uses fused MLP path | -6 % on AMD (loss correct but fused path's `hipblasGemmEx` chain is slower than InnerProduct's MFMA) |
-
-## Part 3 — Per-component analysis vs NV B200 (bs=1×)
-
-### 3.1 Latest status — bs=1× throughput gap vs NV B200
-
-Steady-state samples/s @ MLPerf-spec global batch 55 296 (bs=1×, real
-MLPerf Criteo on `/dev/shm`, 8 × MI350X / 8 × B200, FP16 mixed).
-
-| Platform | M samples/s @ bs=1× | ms/iter | Ratio (AMD ÷ NV) | Gap to NV |
-|---|---:|---:|---:|---:|
-| AMD MI350X (this port, post-Phase-14p, 2026-05-14) | **13.07** | 4.23 | **0.496×** | **−50.4 %** |
-| NV B200 (companion `b200/README-b200-1x8.md` May-13 auto+tmpfs) | **26.33** | 2.10 | 1.000× | — |
-
-**AMD reaches 49.6 % of NV B200 throughput at bs=1×** — i.e. NV is
-**2.01× faster**, leaving an **absolute +2.13 ms/iter** gap to close.
-Per the §3.2 trace decomposition below, **72 %** of that 2.13 ms gap
-is RCCL latency (5.3× per-call slowdown × 3.2× more calls), making
-RCCL-side improvements the highest-leverage open work for bs=1×
-(see Part 4 §4.1 for the prioritized plan).
-
-### 3.2 Kernel-category breakdown @ MLPerf-spec batch (bs=1×, 55 296)
-
-This is the **direct apples-to-apples** comparison vs NV's b200/README
-§8.2d bs=1× decomposition (no extrapolation needed). Captured fresh
-`rocprofv3 --hip-trace --kernel-trace` of our post-Phase-13 bs1x run
-(200 iters, 55-iter steady window). Trace dir: `rocprof_bs1x_phase13/`.
-
-| Component | AMD profile (raw) | AMD real (×0.167) | AMD % | NV real (§8.2d) | NV % | AMD/NV |
-|---|---:|---:|---:|---:|---:|---:|
-| **RCCL (15.9 calls/iter)** | **14.42 ms** | **2.41 ms** | **49 %** | **0.84 ms** | 43 % | **2.87×** |
-| MLP GEMMs (hipBLASLt) | 6.70 ms | 1.12 ms | 23 % | 0.30 ms | 16 % | 3.74× |
-| Embedding ops | 4.94 ms | 0.83 ms | 17 % | 0.32 ms | 16 % | 2.58× |
-| Fused FMA / convert / concat | 2.37 ms | 0.40 ms | 8 % | 0.20 ms | 10 % | 1.98× |
-| Memcpy / fillBuffer | 0.51 ms | 0.09 ms | 2 % | 0 ms | 0 % | ∞ |
-| Other (sort / label_count / etc) | 0.30 ms | 0.05 ms | 1 % | 0.28 ms | 14 % | 0.18× |
-| **Sum (kernel-time across streams)** | **29.24 ms** | **4.90 ms** | 100 % | **1.94 ms** | 100 % | **2.52×** |
-| **Iter wall (real, unprofiled)** | — | **4.29 ms** | — | **2.10 ms** | — | **2.04×** |
-
-Notes:
-- **AMD profile column** is the raw `rocprofv3` kernel-time sum
-  across all 8 streams (15.9× rcclDevKernel calls, 183× GEMM calls,
-  etc.). Profile distortion inflates the wall from 4.29 → 43.36 ms
-  (~10×) and inflates kernel-internal time too.
-- **AMD real column** scales the profile sum by `4.0 / 23.89` =
-  0.167 (real GPU-busy ms / profile GPU-busy ms, assuming AMD's
-  busy fraction matches NV's 93 % at bs=1×). This is an estimate;
-  the true scaling could be ±20 %.
-- **NV real column** is the direct §8.2d measurement (bs=1×
-  post-May-13, no extrapolation).
-- **AMD/NV ratio** is conservative under the profile-scaling
-  uncertainty.
-
-#### Where the AMD/NV gap actually lives @ bs=1×
-
-Top absolute kernel-time deltas (AMD minus NV, real-time estimates):
-
-| Component | AMD − NV (ms / iter) | Gap as % of total iter gap |
-|---|---:|---:|
-| **RCCL** | **+1.57 ms** | **72 %** |
-| MLP GEMMs | +0.82 ms | 38 % |
-| Embedding ops | +0.51 ms | 23 % |
-| Fused FMA / convert / concat | +0.20 ms | 9 % |
-
-(Iter-gap sum is +2.19 ms; categories overlap because of stream
-concurrency.)
-
-→ **At bs=1× the dominant gap is RCCL, not GEMMs** — the opposite of
-the bs=8× regime where GEMMs dominate (the unfused InnerProduct path
-at bs=8× fires ~70 kernels/iter — 5–6 per FC layer × 7 FC layers × 2
-fwd+bwd — vs NV's single fused `cutlass3x_sm100` per FC layer). This
-matches NV's own §8.2d signature: at small batch RCCL latency
-dominates total iter time; at large batch GPU compute amortizes.
-
-#### Two distinct RCCL gaps
-
-| Sub-metric | AMD bs=1× | NV bs=1× | AMD/NV |
-|---|---:|---:|---:|
-| RCCL kernels per iter | **15.9** | **5** (4 SendRecv + 1 AllReduce) | **3.2× more** |
-| Per-call ncclDevKernel p50 | **815 µs** | 155 µs (SendRecv), 217 µs (AllReduce) | **5.3× slower** |
-| Per-call mean | 873 µs | ~169 µs (weighted) | 5.2× slower |
-
-The **3.2× call-count multiplier** is potentially actionable
-(suggests RCCL is splitting each logical SendRecv/AllReduce into
-chunks because the buffer is larger than `NCCL_BUFFSIZE=8 MiB`;
-embedding output at bs=1× = 6 912 batch × 26 tables × 128 ev_size
-× 2 B = 46 MB / 8 MB ≈ 6 chunks per logical SendRecv). The **5.3×
-per-call latency** is partly platform-fundamental (no
-xGMI multicast / NVLS equivalent on AMD).
-
-## Linear fit of host overhead (`t_iter = c + α·batch`)
-
-Both AMD and NV exhibit a constant-host + linear-GPU model. Fit on
-{bs0.5x, bs1x}, validated on bs8x:
-
-| Platform | Host const `c` (ms) | Per-sample GPU work `α` (ns/sample) | bs8x prediction error |
-|---|---:|---:|---:|
-| AMD MI350X (this port) | 1.29 | 63.3 | -0.4 % |
-| NV B200 (b200/README §8.2b) | 0.995 | 50.5 | -1.3 % |
-
-Implications for the remaining ~13–18 % gap:
-- Match NV's `c=0.995` (host overhead): would save 0.30 ms/iter at bs1x → 12.92 → 13.7 M sps (+6 %)
-- Match NV's `α=50.5` (per-sample GPU work): would save 0.71 ms/iter at bs1x → 12.92 → 14.2 M sps (+10 %)
-- Match BOTH: 0.995 + 55296·50.5e-9 = 3.79 ms/iter = **14.59 M sps at bs1x** (matches NV-on-HF reference of 13.57)
-
-## Part 4 — Open work (bs=1× focus)
-
-### 4.1 Promising items, prioritized by estimated bs=1× win
-
-Re-ranked **2026-05-14 (Phase 14r)** based on a fresh apples-to-apples 8-GPU
-trace comparison at iter 1000 against the NV B200 reference trace
-(`~/traces/hctr/iter_steady_all8gpus.json` vs
-`~/traces/hctr/nsys_bs1x_5iter_8gpu.all8gpu.iter1000-1005.json`). Per-iter
-sum across 8 GPUs:
-
-| Category | AMD µs | NV µs | AMD−NV | % of total gap | Cause |
-|---|---:|---:|---:|---:|---|
-| **rccl** (40 vs 48 calls) | 25,148 | 5,784 | **+19,364** | **60 %** | RCCL ~4.35 × slower per call (628.7 vs ~120 µs) |
-| **mlp_fwd** (133 vs 200 calls) | 11,380 | 3,930 | **+7,450** | **23 %** | NV: single fused `cutlass3x_*_f16_f16_f32` MFMA (GEMM+bias+ReLU+mask). AMD: `hipBLASLt::gemm_fwd` 93 µs/call + separate `add_bias_per_row` |
-| **mlp_bwd_dgrad** (272 vs 40 calls!) | 8,390 | 1,082 | **+7,308** | **22 %** | NV: single fused `cutlass3x_*bgrada_*` 27 µs/call. AMD: 1,122 `hipBLASLt::gemm_dgrad` + 120 `bgrada_v5` + 120 `bgrad_finalize_v5` per 5 iters |
-| sparse_prep | 5,540 | 4,177 | +1,363 | 4 % | rocprim vs cub — minor |
-| memset (AMD only) | 1,003 | 0 | +1,003 | 3 % | NV doesn't do per-iter scratch memsets |
-| mlp_bwd_wgrad | 3,328 | 6,781 | **−3,453** | (AMD wins) | V5 bgrada is faster than NV's `nvjet_hsh_*` for these shapes |
-| memcpy / interaction | 897 | 3,283 | **−2,386** | (AMD wins) | Less data movement on AMD |
-| **TOTAL gap per iter** | **66,723** | **34,173** | **+32,550** | **100 %** | AMD 1.95 × slower / 1.36 × more kernels |
-
-Stream lanes per GPU: **AMD 4 non-trivial / NV 8 non-trivial** (same data —
-re-confirmed on the new trace).
-
-**Root-cause finding (Phase 14r)**: 45 % of the gap (mlp_fwd + mlp_bwd_dgrad
-combined +14.7 ms) traces to a single **port-policy** decision in
-[`fused_gemm_functors.cu`](hugectr_rocm_port/hugectr_hip/HugeCTR/src/layers/functors/fused_gemm_functors.cu)
-lines 678-686 (fwd) and 785-791 (bwd) — the AMD port forces ALL
-`RELU_AUX_BIAS`, `DRELU_BGRAD`, `BGRADA` epilogues through a `hipblasGemmEx`
-+ custom-V5 fallback path because hipBLASLt 1.2 / gfx950 was found to
-either lack a kernel or accumulate in FP16 for these shapes. This was a
-correctness-conservative call early in the port; the trace data now shows
-it costs us the single largest CODE-level perf lever. Re-litigatable.
-
-| Rank | Item | Est. bs=1× win | Effort | Notes |
-|---:|---|---:|---|---|
-| 1 | **ROCm 7.11+ / 7.12 preview container upgrade for HIP Graph Segmented Execution** | **3–8 %** (revised down post Phase 14q trial) | 1–3 days | Phase 14q built + ran HCTR against ROCm 7.12.0rc1 successfully (12.80 M sps vs 7.2.1's 13.07 — within noise). Trace re-comparison (this Phase 14r data) confirms 7.12's Segmented Execution **does** spread work across more stream IDs, but **hipBLASLt + RCCL still pin to a few logical lanes** (4 vs NV's 8). The 7.12 upgrade is necessary infrastructure for items #5 (WarpSpeed) and any future RCCL-internal multi-stream work, but is **NOT the primary lever** any more — items #2, #3 deliver larger immediate gains. |
-| **2** | **Restore native hipBLASLt fused MLP epilogues** (`RELU_AUX_BIAS` fwd, `DRELU_BGRAD` bwd, `BGRADA` wgrad) | **10–15 %** | 3–5 days | **Biggest single CODE-level lever** per Phase 14r trace. Step (a): standalone capability survey (`scripts/hipblaslt_epilogue_survey.cpp`) — for each of the 8 distinct DLRM-DCNv2 MLP shapes, query `hipblasLtMatmulAlgoGetHeuristic` with each fused epilogue + `HIPBLAS_COMPUTE_32F` and record which combinations have a kernel in hipBLASLt 1.2. Step (b): conditional re-enable in `fused_gemm_functors.cu:678-686`/`:785-791` — gate `saved_epilogue_is_plain` on the per-shape capability table; add `HCTR_HIPBLASLT_FUSED_EPILOGUES=1` env knob (default OFF). Step (c): A/B vs baseline at bs=1× and bs=8× with loss validation (must match 0.291 ± FP16 noise). Closes most of the +14.7 ms (mlp_fwd + mlp_bwd_dgrad) gap if hipBLASLt has the kernels for our shapes. |
-| **3** | **CK-Tile fwd layout fix + multi-tile dispatch** | **5–8 %** | 5–7 days | Fallback / parallel path to Item 2 if hipBLASLt doesn't expose enough fused epilogues. CK-Tile fwd is COMPILED + INTEGRATED today (`mlp_layer.cu:134-149`) but produces loss 0.605 vs baseline 0.283 due to weight-layout mismatch (Phase 14n.2 weight pre-transpose path is the documented fix; Phase 14p.1 already validated CK-Tile API works against ROCm 7.12 KernelBiasRelu / KernelBias). Step (a): land the layout fix + enable by default at bs ≥ 4× (where CK-Tile +19% was measured Phase 14n.8). Step (b): replace fixed 128×128×32 tile with per-shape dispatch from a 3-tile pool (the bs=8x −25% dgrad regression in Phase 14p.2 stems from one fixed tile being wrong for half the shapes). Self-contained in `cktile_mlp_kernel.cu`. |
-| 4 | **Custom RCCL chunking patches (RCCL source-level)** | 5–15 % | 10+ days, RCCL expert | Fundamental gap per Phase 14r trace: RCCL contributes **60 % of total gap** (+19.4 ms/iter sum across 8 GPUs). RCCL emits 4.35 × more time per call than NCCL despite emitting fewer call-count (40 vs 48). RCCL chunks every primitive call internally based on `NCCL_PROTO` + message size; host-side `NCCL_BUFFSIZE` / native `ncclAllToAll` API swaps were both flat (see §4.2). Real fix is RCCL source patches — outside this repo's scope. |
-| 5 | **int4-vectorized embedding ops** (`update4_kernel` + `multi_to_one_reduce_vec4_v2`) | 3–5 % | 3–5 days | Phase 14r trace puts emb_fwd + emb_reduce + emb_scatter + opt_emb at +1.4 ms (combined small share of gap). Self-contained in `embedding_storage/ragged_static_embedding.cu`; same bounds-check rewrite pattern as Phase 12 concat. |
-| **6** | **HCTR fwd/bwd compute-stream split** | **3–5 %** | 3–5 days | New from Phase 14r stream-lane analysis: AMD's "default" stream carries MLP fwd + bwd + interaction + loss + memcpy + dtype_cast = ~12.8 ms (= 25 % of iter). NV splits these across more lanes, getting better embedding-vs-MLP overlap. Add `fwd_compute` and `bwd_compute` named streams in `gpu_resource.hpp`/`pipeline.cpp`/`model_pipeline.cpp` (HCTR currently has `default`, `dp`, `mp`, `prefetch`). Risk: dependencies between fwd and bwd require correct `wait_event`/`record_done` plumbing; doable since NV does this same split. |
-| 7 | **mscclpp xGMI-multicast custom AllReduce** | 1–3 % | 5–10 days | mscclpp source at `/home/muabdulj/mscclpp/`. Only attacks AllReduce (14 % of exposed RCCL); embedding all-to-all still uses RCCL → bounded upside. |
-| 8 | **WarpSpeed via ROCm 7.11+ RCCL** (`RCCL_WARP_SPEED_AUTO=1`) | 1–2 % | 0 days dev (lands free with item #1) | RCCL 2.28+ ships WarpSpeed (PR #2073) which halves CU usage for AllReduce / AllGather / ReduceScatter on gfx950. AllReduce is only 14 % of exposed-RCCL → max +1-2 % even when engaged. |
-| **9** | **AMD-only memset elimination** | 1–2 % | 1–2 days | New from Phase 14r trace: AMD has 1,003 µs of `__amd_rocclr_fillBufferAligned` per iter; NV has 0 µs. Audit V5 bgrad scratch (`fused_gemm_functors.cu:556-586`) and embedding bucket-scratch zero-inits — convert to compile-time uninitialised buffers where the consumer kernel overwrites all bytes. Pure win (no convergence risk if scoped correctly). |
-| 10 | **BF16 mixed precision path** | 1–2 % | medium | NV submission uses BF16 mixed; we use FP16. Need `enable_bf16_compute` flag + `hip_bfloat16` template instantiations across `HugeCTR/src/layers/`. Eliminates loss-scaler stalls. |
-| 11 | **Per-GPU NCCL stream affinity tuning** | < 1 % | 2 days HCTR core | `Send` / `Recv` on different streams could expose more concurrency; current HCTR uses single RCCL stream. Limited upside since RCCL kernels are CU-saturating. |
-| 12 | **CPX / NPS4 GPU partition A/B** | unknown | invasive | Per [RCCL usage tips](https://rocm.docs.amd.com/projects/rccl/en/develop/how-to/rccl-usage-tips.html), CPX+NPS4 boosts single-OAM AllReduce ~170 → 340 GB/s. Not directly applicable to our 8-GPU/single-OAM topology — worth A/B if remaining gap is AllReduce-bound. |
-
-**Sequence (Phase 14r):**
-- **Items #2, #3 in parallel** (different code areas; either alone is the single largest deliverable code change). Item #2 is the lower-risk first attempt (it's a re-enable of an upstream library code path); #3 is the AMD-controlled fallback if hipBLASLt doesn't have the kernels.
-- Item #1 in parallel on a separate node (infrastructure for items #5/#8 + future RCCL work).
-- Items #4 (RCCL chunking) and #7 (mscclpp) are vendor-deep multi-week efforts.
-- Items #6 (compute-stream split) and #9 (memset elimination) and #5 (int4 emb) are HCTR-internal and stack-additive with #2/#3.
-
-**Cumulative target**: items #1+#2+#3+#5+#6+#9 land us at **~70 % of NV B200 throughput at bs=1×** (16-18 M sps from current 13.07 M sps). The further 22 % gap to NV is RCCL-upstream-dependent (item #4).
-
-### 4.2 Hard blockers and things tried (negative results)
-
-Impact column = potential bs=1× throughput gain *if the blocker were fully
-resolved* (rough magnitude, not committed estimate). **H** = ≥ 5 %, **M**
-= 1–5 %, **L** = < 1 % or already at ceiling. Numbers refreshed against
-the Phase 14r 8-GPU trace at `~/traces/hctr/iter_steady_all8gpus.json`.
-
-| Blocker / hypothesis | Impact if resolved | What we tried | Outcome | Owner / next step |
-|---|:---:|---|---|---|
-| **AMD port deliberately routes hipBLASLt fused epilogues through hipblasGemmEx fallback** (RELU_AUX_BIAS / DRELU_BGRAD / BGRADA — see [`fused_gemm_functors.cu:678-686`](hugectr_rocm_port/hugectr_hip/HugeCTR/src/layers/functors/fused_gemm_functors.cu) + `:785-791`) | **H** (10–15 %, single largest CODE-level lever) | Forced fallback during port enablement to keep FP32 accumulation (hipBLASLt 1.2 / gfx950 either lacked a kernel or accumulated in FP16 for these shapes — original concern was numerical correctness) | **Phase 14r trace evidence**: this fallback is responsible for **45 % of the bs=1× gap to NV** (mlp_fwd +7.45 ms + mlp_bwd_dgrad +7.31 ms = +14.7 ms/iter, sum across 8 GPUs). NV uses a single fused `cutlass3x_*_f16_f16_f32` MFMA call per FC layer; AMD emits 1–3 GEMM calls + 1–2 V5 epilogue kernels. Not a vendor wall — **re-litigatable port policy**. | **TRACTABLE: §4.1 Item #2** — per-shape capability survey + conditional re-enable + loss validation (3-5 days) |
-| **HIP graph capture flattens multi-stream dispatch onto the launch stream (hipBLAS pinning is the most-visible symptom)** | **M-H** (3–8 %, revised down post Phase 14q) | hipblasSetStream-per-call workaround (Phase 14n.6); GraphScheduleable cross-graph pipeline split (Phase 14n.5); restored `hipEventWaitExternal` in `pipeline.cpp` + `async_data_reader.cpp` (Phase 14p); built + ran HCTR against ROCm 7.12.0rc1 (Phase 14q) | Phase 14q proved 7.12's HIP Graph Segmented Execution **does** spread captured graph dispatch across more stream IDs in the runtime (8 distinct vs 7.2.1's 579 ephemeral) — but the **HCTR-level work distribution is unchanged**: same 4 non-trivial lanes per GPU on 7.12 as on 7.2.1 because hipBLASLt + RCCL still pin internally. Phase 14r 8-GPU trace re-confirms: AMD 4 lanes vs NV 8 lanes. End-to-end 12.80 vs 13.07 M sps (within noise) on 7.12. The graph-runtime upgrade is necessary but **not the primary lever** any more. | §4.1 Item #1 (still recommended for WarpSpeed + future RCCL gains, just lower-priority than #2/#3) |
-| **RCCL per-call latency floor (628.7 µs/call AMD vs ~120 µs/call NV, 5.2 ×) + 4.35 × total RCCL time** | **H** (up to +37 % at theoretical max) | 15 RCCL knobs swept (`NCCL_P2P_*`, `NCCL_GDR_*`, `NCCL_SHM_*`, `NCCL_ALGO`, `NCCL_CHUNK_SIZE`, `NCCL_*_NCHANNELS`); CU-mask via `hipExtStreamCreateWithCUMask` (Phase 14g) | All within ±0.6 % of baseline. Phase 14r refines the gap: RCCL is **60 % of total bs=1× gap to NV** (+19.4 ms/iter sum across 8 GPUs). Per-call floor is platform-fundamental: no NVLS-equivalent on xGMI in ROCm 7.2 RCCL. | AMD vendor (NVLS-equivalent unannounced for MI400+); §4.1 Item #4 = RCCL upstream chunking patches |
-| **RCCL emits 4.35 × more device-kernel time per logical collective than NCCL even though call count is comparable** | **H** | Bumped `NCCL_BUFFSIZE` 8 / 16 / 24 / 32 / 64 / 128 MiB; replaced looped `ncclSend` / `ncclRecv` with native `ncclAllToAll` / `ncclAllToAllv` API (Phase 14e, `HCTR_USE_NCCL_ALLTOALL=1`) | All flat at bs=1×. **Phase 14r trace correction**: AMD = 40 calls/iter total, NV = 48 calls/iter — call counts are comparable, the gap is purely **per-call latency** (above row). RCCL chunks every primitive call internally based on `NCCL_PROTO` + message size; host-side levers don't change kernel count. | RCCL upstream (§4.1 Item #4 = real fix) |
-| **AMD-only per-iter memsets** (`__amd_rocclr_fillBufferAligned` 1,003 µs/iter, NV has 0) | **L-M** (1–2 %) | Phase 14n.5 V5 BGRADA scratch zero-fold | Reduced 3 memsets/iter but the 1,003 µs steady-state floor remains in V5 bgrad scratch + embedding bucket-scratch zero-inits | **TRACTABLE: §4.1 Item #9** — 1-2 day audit to convert remaining zero-init scratches to compile-time uninitialised where consumer overwrites all bytes |
-| **`hipGraphLaunch` host overhead 5.97 ms p50 vs NV 555 µs virtualized (11 ×)** | **M** (+6 % per linear-fit) | 14 `DEBUG_HIP_GRAPH_*` and `DEBUG_CLR_*` knobs swept at bs=8× | All within ±0.3 % of baseline. ROCm runtime kernel-launch path. | AMD vendor (ROCm 7.3+ retest, possibly partially resolved by §4.1 Item #1 segmented execution) |
-| **Per-shape hipBLASLt offline tuning at bs=1×** | **M** | `HIPBLASLT_TUNING_OVERRIDE_FILE` deployed | HCTR's `hipblasGemmEx` wrapper bypasses the override path → tunings never apply. Would need direct `hipblasLtMatmul` refactor — same code paths as §4.1 Item #2 (the fused-epilogue work would naturally route through `hipblasLtMatmul` and pick up the overrides). | Folded into §4.1 Item #2 |
-| **CK-Tile MLP backward dgrad as bs=1× win (fixed 128×128×32 tile)** | **L** standalone, **M** with multi-tile dispatch | Implemented end-to-end CK-Tile dgrad path (Phase 14p.2) | bs=1× **+0.3 % (noise)**; bs=8× **−24.9 % regression** (fixed tile is wrong shape vs hipBLASLt's per-shape picks at large M) | **TRACTABLE: §4.1 Item #3** — multi-tile dispatch fixes the regression and unlocks +5-8 % at bs=1× |
-| **CK-Tile MLP fwd weight layout mismatch** | **M-H** (5-8 % combined with Item #3) | Phase 14n.x: kernel COMPILES + INTEGRATES + RUNS but loss diverges (0.605 vs baseline 0.283) due to row-major weight tensor (K×N row-major = N×K col-major in HCTR) vs CK-Tile's expected col-major B with stride K. Currently gated behind `HCTR_CK_TILE_FORCE=1` env knob, default OFF | Phase 14n.2 weight pre-transpose path is the documented fix; Phase 14p.1 already validated CK-Tile API works against ROCm 7.12 KernelBiasRelu / KernelBias. | **TRACTABLE: §4.1 Item #3** |
-| **MSCCLPP custom AllReduce (HCTR-internal)** | **L** | Built RCCL 2.27.7 with `-DENABLE_MSCCLPP=ON` (Phase 14h, commit [`2dc79d6`](https://github.com/chriscai-amd/training_results_v5.1/commit/2dc79d6)) | **−2.5 % regression**. MSCCLPP only optimizes AllReduce (14 % of exposed RCCL); setup overhead exceeds savings → bounded by AllReduce share even if successful | (use mainline RCCL; §4.1 Item #7 if revisited) |
-| **GPU clock pinning / boost** | **L** | `rocm-smi --showclocks` audit during steady state | Already at 2 100 MHz GFX boost during run — no headroom | (n/a) |
-
-## Vendored upstream content
-
-- `runtime_test/nvidia_frontend/train.py`, `mlperf_logger/`, `sharding/` —
-  vendored from NV submission in this repo
-  (`NVIDIA/benchmarks/dlrm_dcnv2/implementations/hugectr/`) with edits
-  gated on env vars (`HCTR_USE_SUBSAMPLED_CRITEO`, `HCTR_USE_REAL_TABLE_SIZES`,
-  `HCTR_USE_INNERPRODUCT_INSTEAD`, etc.).
-- `mlperf_common_stub.py`, `mpi4py_stub.py`, `mlperf_common/` package —
-  minimal shims; replace with real `mlperf_common` for production.
 
 ## License
 

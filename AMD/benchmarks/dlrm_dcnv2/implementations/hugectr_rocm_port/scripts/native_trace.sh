@@ -105,6 +105,7 @@ docker run --rm --network=host \
     -e HCTR_DEDICATED_RCCL_STREAM='${HCTR_DEDICATED_RCCL_STREAM:-0}' \
     -e HCTR_STAGE_TRAIN_GB='${HCTR_STAGE_TRAIN_GB:-}' \
     -e HCTR_STAGE_VAL_GB='${HCTR_STAGE_VAL_GB:-}' \
+    -e HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP='${HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP:-0}' \
     -w /workspace $IMG \
     bash /workspace/scripts/_native_trace_inner.sh
 " > "$LOG" 2>&1

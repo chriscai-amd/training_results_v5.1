@@ -678,13 +678,13 @@ void CublasDesc<T>::set_fprop_attr(std::vector<size_t> dims_a, std::vector<size_
   // ROCm port: route BIAS / RELU_AUX[+BIAS] through our fallback. hipBLASLt
   // 1.2 / gfx950 either has no kernel or accumulates in FP16 for these
   // shapes; gemmEx + manual post-pass keeps everything in FP32 accumulation.
-  // Phase 14s (perf-push, lever 2): HCTR_HIPBLASLT_FUSED_EPILOGUES=1
+  // Phase 14s (perf-push, lever 2): HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP=1
   // bypasses the fallback for fused fprop epilogues so we can survey
   // hipBLASLt 1.2/1.3 kernel availability + correctness on our 8 DLRM-
   // DCNv2 shapes. Default OFF for safety; if survey shows wins, gate
   // per-shape via capability table.
   static const bool kFusedEpiloguesEnabled = []() {
-    const char* env = std::getenv("HCTR_HIPBLASLT_FUSED_EPILOGUES");
+    const char* env = std::getenv("HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP");
     return env != nullptr && env[0] == '1';
   }();
   if (kFusedEpiloguesEnabled) {
@@ -797,10 +797,11 @@ void CublasDesc<T>::set_bprop_attr(std::vector<size_t> dims_a, std::vector<size_
   saved_ldc = static_cast<int64_t>(cublas_rows_c);
   // ROCm port: route BGRADA / DRELU / DRELU_BGRAD through our fallback for
   // the same reasons as the fprop side. Phase 14s: see fprop comment for the
-  // HCTR_HIPBLASLT_FUSED_EPILOGUES=1 toggle (default OFF).
+  // HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP=1 toggle (default OFF).
   static const bool kFusedEpiloguesBprop = []() {
-    const char* env = std::getenv("HCTR_HIPBLASLT_FUSED_EPILOGUES");
-    return env != nullptr && env[0] == '1';
+    const char* env = std::getenv("HCTR_HIPBLASLT_FUSED_EPILOGUES_FPROP");
+    const char* env_bprop = std::getenv("HCTR_HIPBLASLT_FUSED_EPILOGUES_BPROP");
+    return env != nullptr && env[0] == '1' && env_bprop != nullptr && env_bprop[0] == '1';
   }();
   if (kFusedEpiloguesBprop) {
     saved_epilogue_is_plain = (epilogue == HIPBLASLT_EPILOGUE_DEFAULT);
